@@ -15,15 +15,12 @@
 //! about it on zulip.
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::canonical::{Canonical, CanonicalVarValues};
-use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_infer::traits::query::NoSolution;
 use rustc_middle::infer::canonical::CanonicalVarInfos;
 use rustc_middle::traits::solve::{
-    CanonicalResponse, Certainty, ExternalConstraintsData, Goal, GoalSource, IsNormalizesToHack,
-    QueryResult, Response,
+    CanonicalResponse, Certainty, ExternalConstraintsData, Goal, GoalSource, QueryResult, Response,
 };
-use rustc_middle::traits::Reveal;
-use rustc_middle::ty::{self, OpaqueTypeKey, Ty, TyCtxt, UniverseIndex};
+use rustc_middle::ty::{self, AliasRelationDirection, Ty, TyCtxt, UniverseIndex};
 use rustc_middle::ty::{
     CoercePredicate, RegionOutlivesPredicate, SubtypePredicate, TypeOutlivesPredicate,
 };
@@ -44,6 +41,17 @@ pub use fulfill::FulfillmentCtxt;
 pub(crate) use normalize::deeply_normalize_for_diagnostics;
 pub use normalize::{deeply_normalize, deeply_normalize_with_skipped_universes};
 
+/// How many fixpoint iterations we should attempt inside of the solver before bailing
+/// with overflow.
+///
+/// We previously used  `tcx.recursion_limit().0.checked_ilog2().unwrap_or(0)` for this.
+/// However, it feels unlikely that uncreasing the recursion limit by a power of two
+/// to get one more itereation is every useful or desirable. We now instead used a constant
+/// here. If there ever ends up some use-cases where a bigger number of fixpoint iterations
+/// is required, we can add a new attribute for that or revert this to be dependant on the
+/// recursion limit again. However, this feels very unlikely.
+const FIXPOINT_STEP_LIMIT: usize = 8;
+
 #[derive(Debug, Clone, Copy)]
 enum SolverMode {
     /// Ordinary trait solving, using everywhere except for coherence.
@@ -60,14 +68,11 @@ enum SolverMode {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum GoalEvaluationKind {
     Root,
-    Nested { is_normalizes_to_hack: IsNormalizesToHack },
+    Nested,
 }
 
-trait CanonicalResponseExt {
-    fn has_no_inference_or_external_constraints(&self) -> bool;
-}
-
-impl<'tcx> CanonicalResponseExt for Canonical<'tcx, Response<'tcx>> {
+#[extension(trait CanonicalResponseExt)]
+impl<'tcx> Canonical<'tcx, Response<'tcx>> {
     fn has_no_inference_or_external_constraints(&self) -> bool {
         self.value.external_constraints.region_constraints.is_empty()
             && self.value.var_values.is_identity()
@@ -196,12 +201,9 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
 
 impl<'tcx> EvalCtxt<'_, 'tcx> {
     #[instrument(level = "debug", skip(self))]
-    fn set_normalizes_to_hack_goal(&mut self, goal: Goal<'tcx, ty::NormalizesTo<'tcx>>) {
-        assert!(
-            self.nested_goals.normalizes_to_hack_goal.is_none(),
-            "attempted to set the projection eq hack goal when one already exists"
-        );
-        self.nested_goals.normalizes_to_hack_goal = Some(goal);
+    fn add_normalizes_to_goal(&mut self, goal: Goal<'tcx, ty::NormalizesTo<'tcx>>) {
+        inspect::ProofTreeBuilder::add_normalizes_to_goal(self, goal);
+        self.nested_goals.normalizes_to_goals.push(goal);
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -267,71 +269,33 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
         Ok(self.make_ambiguous_response_no_constraints(maybe_cause))
     }
 
-    /// Normalize a type when it is structually matched on.
+    /// Normalize a type for when it is structurally matched on.
     ///
-    /// In nearly all cases this function must be used before matching on a type.
+    /// This function is necessary in nearly all cases before matching on a type.
     /// Not doing so is likely to be incomplete and therefore unsound during
     /// coherence.
-    #[instrument(level = "debug", skip(self), ret)]
-    fn try_normalize_ty(
+    #[instrument(level = "debug", skip(self, param_env), ret)]
+    fn structurally_normalize_ty(
         &mut self,
         param_env: ty::ParamEnv<'tcx>,
         ty: Ty<'tcx>,
-    ) -> Option<Ty<'tcx>> {
-        self.try_normalize_ty_recur(param_env, DefineOpaqueTypes::Yes, 0, ty)
-    }
-
-    fn try_normalize_ty_recur(
-        &mut self,
-        param_env: ty::ParamEnv<'tcx>,
-        define_opaque_types: DefineOpaqueTypes,
-        depth: usize,
-        ty: Ty<'tcx>,
-    ) -> Option<Ty<'tcx>> {
-        if !self.tcx().recursion_limit().value_within_limit(depth) {
-            return None;
-        }
-
-        let ty::Alias(kind, alias) = *ty.kind() else {
-            return Some(ty);
-        };
-
-        // We do no always define opaque types eagerly to allow non-defining uses
-        // in the defining scope. However, if we can unify this opaque to an existing
-        // opaque, then we should attempt to eagerly reveal the opaque, and we fall
-        // through.
-        if let DefineOpaqueTypes::No = define_opaque_types
-            && let Reveal::UserFacing = param_env.reveal()
-            && let ty::Opaque = kind
-            && let Some(def_id) = alias.def_id.as_local()
-            && self.can_define_opaque_ty(def_id)
-        {
-            if self
-                .unify_existing_opaque_tys(
-                    param_env,
-                    OpaqueTypeKey { def_id, args: alias.args },
-                    self.next_ty_infer(),
-                )
-                .is_empty()
-            {
-                return Some(ty);
-            }
-        }
-
-        match self.commit_if_ok(|this| {
-            let normalized_ty = this.next_ty_infer();
-            let normalizes_to_goal = Goal::new(
-                this.tcx(),
+    ) -> Result<Ty<'tcx>, NoSolution> {
+        if let ty::Alias(..) = ty.kind() {
+            let normalized_ty = self.next_ty_infer();
+            let alias_relate_goal = Goal::new(
+                self.tcx(),
                 param_env,
-                ty::NormalizesTo { alias, term: normalized_ty.into() },
+                ty::PredicateKind::AliasRelate(
+                    ty.into(),
+                    normalized_ty.into(),
+                    AliasRelationDirection::Equate,
+                ),
             );
-            this.add_goal(GoalSource::Misc, normalizes_to_goal);
-            this.try_evaluate_added_goals()?;
-            let ty = this.resolve_vars_if_possible(normalized_ty);
-            Ok(this.try_normalize_ty_recur(param_env, define_opaque_types, depth + 1, ty))
-        }) {
-            Ok(ty) => ty,
-            Err(NoSolution) => Some(ty),
+            self.add_goal(GoalSource::Misc, alias_relate_goal);
+            self.try_evaluate_added_goals()?;
+            Ok(self.resolve_vars_if_possible(normalized_ty))
+        } else {
+            Ok(ty)
         }
     }
 }

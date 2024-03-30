@@ -139,9 +139,11 @@ impl<'data> BorrowedBuf<'data> {
     }
 }
 
-/// A writeable view of the unfilled portion of a [`BorrowedBuf`](BorrowedBuf).
+/// A writeable view of the unfilled portion of a [`BorrowedBuf`].
 ///
-/// Provides access to the initialized and uninitialized parts of the underlying `BorrowedBuf`.
+/// The unfilled portion consists of an initialized and an uninitialized part; see [`BorrowedBuf`]
+/// for details.
+///
 /// Data can be written directly to the cursor by using [`append`](BorrowedCursor::append) or
 /// indirectly by getting a slice of part or all of the cursor and writing into the slice. In the
 /// indirect case, the caller must call [`advance`](BorrowedCursor::advance) after writing to inform
@@ -239,12 +241,32 @@ impl<'a> BorrowedCursor<'a> {
     /// accessed via the underlying buffer. I.e., the buffer's filled portion grows by `n` elements
     /// and its unfilled portion (and the capacity of this cursor) shrinks by `n` elements.
     ///
+    /// If less than `n` bytes initialized (by the cursor's point of view), `set_init` should be
+    /// called first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are less than `n` bytes initialized.
+    #[inline]
+    pub fn advance(&mut self, n: usize) -> &mut Self {
+        assert!(self.buf.init >= self.buf.filled + n);
+
+        self.buf.filled += n;
+        self
+    }
+
+    /// Advance the cursor by asserting that `n` bytes have been filled.
+    ///
+    /// After advancing, the `n` bytes are no longer accessible via the cursor and can only be
+    /// accessed via the underlying buffer. I.e., the buffer's filled portion grows by `n` elements
+    /// and its unfilled portion (and the capacity of this cursor) shrinks by `n` elements.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that the first `n` bytes of the cursor have been properly
     /// initialised.
     #[inline]
-    pub unsafe fn advance(&mut self, n: usize) -> &mut Self {
+    pub unsafe fn advance_unchecked(&mut self, n: usize) -> &mut Self {
         self.buf.filled += n;
         self.buf.init = cmp::max(self.buf.init, self.buf.filled);
         self
@@ -289,7 +311,7 @@ impl<'a> BorrowedCursor<'a> {
 
         // SAFETY: we do not de-initialize any of the elements of the slice
         unsafe {
-            MaybeUninit::write_slice(&mut self.as_mut()[..buf.len()], buf);
+            MaybeUninit::copy_from_slice(&mut self.as_mut()[..buf.len()], buf);
         }
 
         // SAFETY: We just added the entire contents of buf to the filled section.

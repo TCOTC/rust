@@ -2,8 +2,9 @@
 // entry point. It must match C's `int main(int, char **)`.
 
 // This test is for targets with 32bit c_int only.
-// ignore-msp430
-// ignore-avr
+//@ ignore-msp430
+//@ ignore-avr
+//@ ignore-wasi wasi codegens the main symbol differently
 
 fn main() {
 }

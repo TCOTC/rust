@@ -7,9 +7,6 @@ use std::path::PathBuf;
 use std::task::Poll;
 use std::thread;
 
-use log::info;
-use rustc_middle::ty::Ty;
-
 use crate::concurrency::thread::TlsAllocAction;
 use crate::diagnostics::report_leaks;
 use rustc_data_structures::fx::FxHashSet;
@@ -18,7 +15,7 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     self,
     layout::{LayoutCx, LayoutOf},
-    TyCtxt,
+    Ty, TyCtxt,
 };
 use rustc_target::spec::abi::Abi;
 
@@ -97,8 +94,6 @@ pub struct MiriConfig {
     pub unique_is_unique: bool,
     /// Controls alignment checking.
     pub check_alignment: AlignmentCheck,
-    /// Controls function [ABI](Abi) checking.
-    pub check_abi: bool,
     /// Action for an op requiring communication with the host.
     pub isolated_op: IsolatedOp,
     /// Determines if memory leaks should be ignored.
@@ -115,6 +110,8 @@ pub struct MiriConfig {
     pub tracked_call_ids: FxHashSet<CallId>,
     /// The allocation ids to report about.
     pub tracked_alloc_ids: FxHashSet<AllocId>,
+    /// For the tracked alloc ids, also report read/write accesses.
+    pub track_alloc_accesses: bool,
     /// Determine if data race detection should be enabled
     pub data_race_detector: bool,
     /// Determine if weak memory emulation should be enabled. Requires data race detection to be enabled
@@ -163,7 +160,6 @@ impl Default for MiriConfig {
             borrow_tracker: Some(BorrowTrackerMethod::StackedBorrows),
             unique_is_unique: false,
             check_alignment: AlignmentCheck::Int,
-            check_abi: true,
             isolated_op: IsolatedOp::Reject(RejectOpWith::Abort),
             ignore_leaks: false,
             forwarded_env_vars: vec![],
@@ -172,6 +168,7 @@ impl Default for MiriConfig {
             tracked_pointer_tags: FxHashSet::default(),
             tracked_call_ids: FxHashSet::default(),
             tracked_alloc_ids: FxHashSet::default(),
+            track_alloc_accesses: false,
             data_race_detector: true,
             weak_memory_emulation: true,
             track_outdated_loads: false,
@@ -394,7 +391,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
                     argv,
                     Scalar::from_u8(sigpipe).into(),
                 ],
-                Some(&ret_place.into()),
+                Some(&ret_place),
                 StackPopCleanup::Root { cleanup: true },
             )?;
         }
@@ -403,7 +400,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
                 entry_instance,
                 Abi::Rust,
                 &[argc.into(), argv],
-                Some(&ret_place.into()),
+                Some(&ret_place),
                 StackPopCleanup::Root { cleanup: true },
             )?;
         }

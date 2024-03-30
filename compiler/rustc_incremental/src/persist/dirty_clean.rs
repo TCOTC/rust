@@ -63,9 +63,9 @@ const BASE_HIR: &[&str] = &[
 
 /// `impl` implementation of struct/trait
 const BASE_IMPL: &[&str] =
-    &[label_strs::associated_item_def_ids, label_strs::generics_of, label_strs::impl_trait_ref];
+    &[label_strs::associated_item_def_ids, label_strs::generics_of, label_strs::impl_trait_header];
 
-/// DepNodes for mir_built/Optimized, which is relevant in "executable"
+/// DepNodes for exported mir bodies, which is relevant in "executable"
 /// code, i.e., functions+methods
 const BASE_MIR: &[&str] = &[label_strs::optimized_mir, label_strs::promoted_mir];
 
@@ -148,7 +148,7 @@ pub fn check_dirty_clean_annotations(tcx: TyCtxt<'_>) {
 
         let crate_items = tcx.hir_crate_items(());
 
-        for id in crate_items.items() {
+        for id in crate_items.free_items() {
             dirty_clean_visitor.check_item(id.owner_id.def_id);
         }
 
@@ -395,7 +395,7 @@ impl<'tcx> DirtyCleanVisitor<'tcx> {
 /// a cfg flag called `foo`.
 fn check_config(tcx: TyCtxt<'_>, attr: &Attribute) -> bool {
     debug!("check_config(attr={:?})", attr);
-    let config = &tcx.sess.parse_sess.config;
+    let config = &tcx.sess.psess.config;
     debug!("check_config: config={:?}", config);
     let mut cfg = None;
     for item in attr.meta_item_list().unwrap_or_else(ThinVec::new) {

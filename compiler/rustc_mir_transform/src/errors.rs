@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
 use rustc_errors::{
-    codes::*, Applicability, DecorateLint, DiagCtxt, DiagnosticArgValue, DiagnosticBuilder,
-    DiagnosticMessage, EmissionGuarantee, IntoDiagnostic, Level,
+    codes::*, Applicability, Diag, DiagArgValue, DiagCtxt, DiagMessage, Diagnostic,
+    EmissionGuarantee, Level, LintDiagnostic,
 };
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_middle::mir::{AssertKind, UnsafetyViolationDetails};
@@ -62,10 +62,10 @@ pub(crate) struct RequiresUnsafe {
 // so we need to eagerly translate the label here, which isn't supported by the derive API
 // We could also exhaustively list out the primary messages for all unsafe violations,
 // but this would result in a lot of duplication.
-impl<'a, G: EmissionGuarantee> IntoDiagnostic<'a, G> for RequiresUnsafe {
+impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for RequiresUnsafe {
     #[track_caller]
-    fn into_diagnostic(self, dcx: &'a DiagCtxt, level: Level) -> DiagnosticBuilder<'a, G> {
-        let mut diag = DiagnosticBuilder::new(dcx, level, fluent::mir_transform_requires_unsafe);
+    fn into_diag(self, dcx: &'a DiagCtxt, level: Level) -> Diag<'a, G> {
+        let mut diag = Diag::new(dcx, level, fluent::mir_transform_requires_unsafe);
         diag.code(E0133);
         diag.span(self.span);
         diag.span_label(self.span, self.details.label());
@@ -87,7 +87,10 @@ pub(crate) struct RequiresUnsafeDetail {
 }
 
 impl RequiresUnsafeDetail {
-    fn add_subdiagnostics<G: EmissionGuarantee>(&self, diag: &mut DiagnosticBuilder<'_, G>) {
+    // FIXME: make this translatable
+    #[allow(rustc::diagnostic_outside_of_impl)]
+    #[allow(rustc::untranslatable_diagnostic)]
+    fn add_subdiagnostics<G: EmissionGuarantee>(&self, diag: &mut Diag<'_, G>) {
         use UnsafetyViolationDetails::*;
         match self.violation {
             CallToUnsafeFunction => {
@@ -124,7 +127,7 @@ impl RequiresUnsafeDetail {
                 diag.help(fluent::mir_transform_target_feature_call_help);
                 diag.arg(
                     "missing_target_features",
-                    DiagnosticArgValue::StrListSepByAnd(
+                    DiagArgValue::StrListSepByAnd(
                         missing.iter().map(|feature| Cow::from(feature.to_string())).collect(),
                     ),
                 );
@@ -133,7 +136,7 @@ impl RequiresUnsafeDetail {
                     diag.note(fluent::mir_transform_target_feature_call_note);
                     diag.arg(
                         "build_target_features",
-                        DiagnosticArgValue::StrListSepByAnd(
+                        DiagArgValue::StrListSepByAnd(
                             build_enabled
                                 .iter()
                                 .map(|feature| Cow::from(feature.to_string()))
@@ -146,7 +149,7 @@ impl RequiresUnsafeDetail {
         }
     }
 
-    fn label(&self) -> DiagnosticMessage {
+    fn label(&self) -> DiagMessage {
         use UnsafetyViolationDetails::*;
         match self.violation {
             CallToUnsafeFunction => fluent::mir_transform_call_to_unsafe_label,
@@ -178,9 +181,9 @@ pub(crate) struct UnsafeOpInUnsafeFn {
     pub suggest_unsafe_block: Option<(Span, Span, Span)>,
 }
 
-impl<'a> DecorateLint<'a, ()> for UnsafeOpInUnsafeFn {
+impl<'a> LintDiagnostic<'a, ()> for UnsafeOpInUnsafeFn {
     #[track_caller]
-    fn decorate_lint<'b>(self, diag: &'b mut DiagnosticBuilder<'a, ()>) {
+    fn decorate_lint<'b>(self, diag: &'b mut Diag<'a, ()>) {
         let desc = diag.dcx.eagerly_translate_to_string(self.details.label(), [].into_iter());
         diag.arg("details", desc);
         diag.span_label(self.details.span, self.details.label());
@@ -196,7 +199,7 @@ impl<'a> DecorateLint<'a, ()> for UnsafeOpInUnsafeFn {
         }
     }
 
-    fn msg(&self) -> DiagnosticMessage {
+    fn msg(&self) -> DiagMessage {
         fluent::mir_transform_unsafe_op_in_unsafe_fn
     }
 }
@@ -212,8 +215,8 @@ pub(crate) enum AssertLintKind {
     UnconditionalPanic,
 }
 
-impl<'a, P: std::fmt::Debug> DecorateLint<'a, ()> for AssertLint<P> {
-    fn decorate_lint<'b>(self, diag: &'b mut DiagnosticBuilder<'a, ()>) {
+impl<'a, P: std::fmt::Debug> LintDiagnostic<'a, ()> for AssertLint<P> {
+    fn decorate_lint<'b>(self, diag: &'b mut Diag<'a, ()>) {
         let message = self.assert_kind.diagnostic_message();
         self.assert_kind.add_args(&mut |name, value| {
             diag.arg(name, value);
@@ -221,7 +224,7 @@ impl<'a, P: std::fmt::Debug> DecorateLint<'a, ()> for AssertLint<P> {
         diag.span_label(self.span, message);
     }
 
-    fn msg(&self) -> DiagnosticMessage {
+    fn msg(&self) -> DiagMessage {
         match self.lint_kind {
             AssertLintKind::ArithmeticOverflow => fluent::mir_transform_arithmetic_overflow,
             AssertLintKind::UnconditionalPanic => fluent::mir_transform_operation_will_panic,
@@ -266,11 +269,11 @@ pub(crate) struct MustNotSupend<'tcx, 'a> {
 }
 
 // Needed for def_path_str
-impl<'a> DecorateLint<'a, ()> for MustNotSupend<'_, '_> {
-    fn decorate_lint<'b>(self, diag: &'b mut rustc_errors::DiagnosticBuilder<'a, ()>) {
+impl<'a> LintDiagnostic<'a, ()> for MustNotSupend<'_, '_> {
+    fn decorate_lint<'b>(self, diag: &'b mut rustc_errors::Diag<'a, ()>) {
         diag.span_label(self.yield_sp, fluent::_subdiag::label);
         if let Some(reason) = self.reason {
-            diag.subdiagnostic(reason);
+            diag.subdiagnostic(diag.dcx, reason);
         }
         diag.span_help(self.src_sp, fluent::_subdiag::help);
         diag.arg("pre", self.pre);
@@ -278,7 +281,7 @@ impl<'a> DecorateLint<'a, ()> for MustNotSupend<'_, '_> {
         diag.arg("post", self.post);
     }
 
-    fn msg(&self) -> rustc_errors::DiagnosticMessage {
+    fn msg(&self) -> rustc_errors::DiagMessage {
         fluent::mir_transform_must_not_suspend
     }
 }

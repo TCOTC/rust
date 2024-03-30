@@ -206,16 +206,18 @@ impl IntoArgs for (CrateNum, SimplifiedType) {
 
 provide! { tcx, def_id, other, cdata,
     explicit_item_bounds => { cdata.get_explicit_item_bounds(def_id.index, tcx) }
+    explicit_item_super_predicates => { cdata.get_explicit_item_super_predicates(def_id.index, tcx) }
     explicit_predicates_of => { table }
     generics_of => { table }
     inferred_outlives_of => { table_defaulted_array }
     super_predicates_of => { table }
+    implied_predicates_of => { table }
     type_of => { table }
     type_alias_is_lazy => { cdata.root.tables.type_alias_is_lazy.get(cdata, def_id.index) }
     variances_of => { table }
     fn_sig => { table }
     codegen_fn_attrs => { table }
-    impl_trait_ref => { table }
+    impl_trait_header => { table }
     const_param_default => { table }
     object_lifetime_default => { table }
     thir_abstract_const => { table }
@@ -234,7 +236,6 @@ provide! { tcx, def_id, other, cdata,
     unused_generic_params => { cdata.root.tables.unused_generic_params.get(cdata, def_id.index) }
     def_kind => { cdata.def_kind(def_id.index) }
     impl_parent => { table }
-    impl_polarity => { table_direct }
     defaultness => { table_direct }
     constness => { table_direct }
     coerce_unsized_info => {
@@ -250,6 +251,16 @@ provide! { tcx, def_id, other, cdata,
     asyncness => { table_direct }
     fn_arg_names => { table }
     coroutine_kind => { table_direct }
+    coroutine_for_closure => { table }
+    eval_static_initializer => {
+        Ok(cdata
+            .root
+            .tables
+            .eval_static_initializer
+            .get(cdata, def_id.index)
+            .map(|lazy| lazy.decode((cdata, tcx)))
+            .unwrap_or_else(|| panic!("{def_id:?} does not have eval_static_initializer")))
+    }
     trait_def => { table }
     deduced_param_attrs => { table }
     is_type_alias_impl_trait => {
@@ -265,18 +276,6 @@ provide! { tcx, def_id, other, cdata,
             .get(cdata, def_id.index)
             .map(|lazy| lazy.decode((cdata, tcx)))
             .process_decoded(tcx, || panic!("{def_id:?} does not have trait_impl_trait_tys")))
-    }
-    implied_predicates_of => {
-        cdata
-            .root
-            .tables
-            .implied_predicates_of
-            .get(cdata, def_id.index)
-            .map(|lazy| lazy.decode((cdata, tcx)))
-            .unwrap_or_else(|| {
-                debug_assert_eq!(tcx.def_kind(def_id), DefKind::Trait);
-                tcx.super_predicates_of(def_id)
-            })
     }
 
     associated_types_for_impl_traits_in_associated_fn => { table_defaulted_array }
@@ -347,7 +346,7 @@ provide! { tcx, def_id, other, cdata,
         cdata.get_stability_implications(tcx).iter().copied().collect()
     }
     stripped_cfg_items => { cdata.get_stripped_cfg_items(cdata.cnum, tcx) }
-    is_intrinsic => { cdata.get_is_intrinsic(def_id.index) }
+    intrinsic_raw => { cdata.get_intrinsic(def_id.index) }
     defined_lang_items => { cdata.get_lang_items(tcx) }
     diagnostic_items => { cdata.get_diagnostic_items() }
     missing_lang_items => { cdata.get_missing_lang_items(tcx) }
@@ -509,6 +508,16 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
             // so make sure cstore is not mutably accessed from here on.
             tcx.untracked().cstore.freeze();
             tcx.arena.alloc_from_iter(CStore::from_tcx(tcx).iter_crate_data().map(|(cnum, _)| cnum))
+        },
+        used_crates: |tcx, ()| {
+            // The list of loaded crates is now frozen in query cache,
+            // so make sure cstore is not mutably accessed from here on.
+            tcx.untracked().cstore.freeze();
+            tcx.arena.alloc_from_iter(
+                CStore::from_tcx(tcx)
+                    .iter_crate_data()
+                    .filter_map(|(cnum, data)| data.used().then_some(cnum)),
+            )
         },
         ..providers.queries
     };

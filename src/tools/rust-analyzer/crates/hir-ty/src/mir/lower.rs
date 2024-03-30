@@ -25,19 +25,25 @@ use triomphe::Arc;
 
 use crate::{
     consteval::ConstEvalError,
-    db::HirDatabase,
+    db::{HirDatabase, InternedClosure},
     display::HirDisplay,
     infer::{CaptureKind, CapturedItem, TypeMismatch},
     inhabitedness::is_ty_uninhabited_from,
     layout::LayoutError,
     mapping::ToChalk,
+    mir::{
+        intern_const_scalar, return_slot, AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp,
+        BorrowKind, CastKind, ClosureId, ConstScalar, Either, Expr, FieldId, Idx, InferenceResult,
+        Interner, Local, LocalId, MemoryMap, MirBody, MirSpan, Mutability, Operand, Place,
+        PlaceElem, PointerCast, ProjectionElem, ProjectionStore, RawIdx, Rvalue, Statement,
+        StatementKind, Substitution, SwitchTargets, Terminator, TerminatorKind, TupleFieldId, Ty,
+        UnOp, VariantId,
+    },
     static_lifetime,
     traits::FnTrait,
     utils::{generics, ClosureSubst},
     Adjust, Adjustment, AutoBorrow, CallableDefId, TyBuilder, TyExt,
 };
-
-use super::*;
 
 mod as_place;
 mod pattern_matching;
@@ -124,6 +130,10 @@ impl DropScopeToken {
         std::mem::forget(self);
         ctx.pop_drop_scope_assume_dropped_internal();
     }
+}
+
+impl Drop for DropScopeToken {
+    fn drop(&mut self) {}
 }
 
 // Uncomment this to make `DropScopeToken` a drop bomb. Unfortunately we can't do this in release, since
@@ -771,6 +781,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 self.set_terminator(current, TerminatorKind::Return, expr_id.into());
                 Ok(None)
             }
+            Expr::Become { .. } => not_supported!("tail-calls"),
             Expr::Yield { .. } => not_supported!("yield"),
             Expr::RecordLit { fields, path, spread, ellipsis: _, is_assignee_expr: _ } => {
                 let spread_place = match spread {
@@ -1242,7 +1253,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
             }
-            Expr::Underscore => not_supported!("underscore"),
+            Expr::Underscore => Ok(Some(current)),
         }
     }
 
@@ -1353,10 +1364,16 @@ impl<'ctx> MirLowerCtx<'ctx> {
         match loc {
             LiteralOrConst::Literal(l) => self.lower_literal_to_operand(ty, l),
             LiteralOrConst::Const(c) => {
-                let unresolved_name = || MirLowerError::unresolved_path(self.db, c);
+                let c = match &self.body.pats[*c] {
+                    Pat::Path(p) => p,
+                    _ => not_supported!(
+                        "only `char` and numeric types are allowed in range patterns"
+                    ),
+                };
+                let unresolved_name = || MirLowerError::unresolved_path(self.db, c.as_ref());
                 let resolver = self.owner.resolver(self.db.upcast());
                 let pr = resolver
-                    .resolve_path_in_value_ns(self.db.upcast(), c)
+                    .resolve_path_in_value_ns(self.db.upcast(), c.as_ref())
                     .ok_or_else(unresolved_name)?;
                 match pr {
                     ResolveValueResult::ValueNs(v, _) => {
@@ -1630,7 +1647,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
         self.set_goto(prev_block, begin, span);
         f(self, begin)?;
         let my = mem::replace(&mut self.current_loop_blocks, prev).ok_or(
-            MirLowerError::ImplementationError("current_loop_blocks is corrupt".to_string()),
+            MirLowerError::ImplementationError("current_loop_blocks is corrupt".to_owned()),
         )?;
         if let Some(prev) = prev_label {
             self.labeled_loop_blocks.insert(label.unwrap(), prev);
@@ -1665,7 +1682,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
             .current_loop_blocks
             .as_mut()
             .ok_or(MirLowerError::ImplementationError(
-                "Current loop access out of loop".to_string(),
+                "Current loop access out of loop".to_owned(),
             ))?
             .end
         {
@@ -1675,7 +1692,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 self.current_loop_blocks
                     .as_mut()
                     .ok_or(MirLowerError::ImplementationError(
-                        "Current loop access out of loop".to_string(),
+                        "Current loop access out of loop".to_owned(),
                     ))?
                     .end = Some(s);
                 s
@@ -1776,6 +1793,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     self.push_fake_read(c, p, expr.into());
                     current = scope2.pop_and_drop(self, c, expr.into());
                 }
+                hir_def::hir::Statement::Item => (),
             }
         }
         if let Some(tail) = tail {
@@ -1792,9 +1810,20 @@ impl<'ctx> MirLowerCtx<'ctx> {
     fn lower_params_and_bindings(
         &mut self,
         params: impl Iterator<Item = (PatId, Ty)> + Clone,
+        self_binding: Option<(BindingId, Ty)>,
         pick_binding: impl Fn(BindingId) -> bool,
     ) -> Result<BasicBlockId> {
         let base_param_count = self.result.param_locals.len();
+        let self_binding = match self_binding {
+            Some((self_binding, ty)) => {
+                let local_id = self.result.locals.alloc(Local { ty });
+                self.drop_scopes.last_mut().unwrap().locals.push(local_id);
+                self.result.binding_locals.insert(self_binding, local_id);
+                self.result.param_locals.push(local_id);
+                Some(self_binding)
+            }
+            None => None,
+        };
         self.result.param_locals.extend(params.clone().map(|(it, ty)| {
             let local_id = self.result.locals.alloc(Local { ty });
             self.drop_scopes.last_mut().unwrap().locals.push(local_id);
@@ -1820,9 +1849,23 @@ impl<'ctx> MirLowerCtx<'ctx> {
             }
         }
         let mut current = self.result.start_block;
-        for ((param, _), local) in
-            params.zip(self.result.param_locals.clone().into_iter().skip(base_param_count))
-        {
+        if let Some(self_binding) = self_binding {
+            let local = self.result.param_locals.clone()[base_param_count];
+            if local != self.binding_local(self_binding)? {
+                let r = self.match_self_param(self_binding, current, local)?;
+                if let Some(b) = r.1 {
+                    self.set_terminator(b, TerminatorKind::Unreachable, MirSpan::SelfParam);
+                }
+                current = r.0;
+            }
+        }
+        let local_params = self
+            .result
+            .param_locals
+            .clone()
+            .into_iter()
+            .skip(base_param_count + self_binding.is_some() as usize);
+        for ((param, _), local) in params.zip(local_params) {
             if let Pat::Bind { id, .. } = self.body[param] {
                 if local == self.binding_local(id)? {
                     continue;
@@ -1973,7 +2016,7 @@ pub fn mir_body_for_closure_query(
     db: &dyn HirDatabase,
     closure: ClosureId,
 ) -> Result<Arc<MirBody>> {
-    let (owner, expr) = db.lookup_intern_closure(closure.into());
+    let InternedClosure(owner, expr) = db.lookup_intern_closure(closure.into());
     let body = db.body(owner);
     let infer = db.infer(owner);
     let Expr::Closure { args, body: root, .. } = &body[expr] else {
@@ -2001,6 +2044,7 @@ pub fn mir_body_for_closure_query(
     };
     let current = ctx.lower_params_and_bindings(
         args.iter().zip(sig.params().iter()).map(|(it, y)| (*it, y.clone())),
+        None,
         |_| true,
     )?;
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
@@ -2131,16 +2175,16 @@ pub fn lower_to_mir(
                 let substs = TyBuilder::placeholder_subst(db, fid);
                 let callable_sig =
                     db.callable_item_signature(fid.into()).substitute(Interner, &substs);
+                let mut params = callable_sig.params().iter();
+                let self_param = body.self_param.and_then(|id| Some((id, params.next()?.clone())));
                 break 'b ctx.lower_params_and_bindings(
-                    body.params
-                        .iter()
-                        .zip(callable_sig.params().iter())
-                        .map(|(it, y)| (*it, y.clone())),
+                    body.params.iter().zip(params).map(|(it, y)| (*it, y.clone())),
+                    self_param,
                     binding_picker,
                 )?;
             }
         }
-        ctx.lower_params_and_bindings([].into_iter(), binding_picker)?
+        ctx.lower_params_and_bindings([].into_iter(), None, binding_picker)?
     };
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;

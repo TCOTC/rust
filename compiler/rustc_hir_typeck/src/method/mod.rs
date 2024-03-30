@@ -11,7 +11,7 @@ pub use self::suggest::SelfSource;
 pub use self::MethodError::*;
 
 use crate::FnCtxt;
-use rustc_errors::{Applicability, Diagnostic, SubdiagnosticMessage};
+use rustc_errors::{Applicability, Diag, SubdiagMessage};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Namespace};
 use rustc_hir::def_id::DefId;
@@ -38,7 +38,7 @@ pub struct MethodCallee<'tcx> {
     pub args: GenericArgsRef<'tcx>,
 
     /// Instantiated method signature, i.e., it has been
-    /// substituted, normalized, and has had late-bound
+    /// instantiated, normalized, and has had late-bound
     /// lifetimes replaced with inference variables.
     pub sig: ty::FnSig<'tcx>,
 }
@@ -81,7 +81,7 @@ pub struct NoMatchData<'tcx> {
 
 // A pared down enum describing just the places from which a method
 // candidate can arise. Used for error reporting only.
-#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CandidateSource {
     Impl(DefId),
     Trait(DefId /* trait id */),
@@ -126,8 +126,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     #[instrument(level = "debug", skip(self, err, call_expr))]
     pub(crate) fn suggest_method_call(
         &self,
-        err: &mut Diagnostic,
-        msg: impl Into<SubdiagnosticMessage> + std::fmt::Debug,
+        err: &mut Diag<'_>,
+        msg: impl Into<SubdiagMessage> + std::fmt::Debug,
         method_name: Ident,
         self_ty: Ty<'tcx>,
         call_expr: &hir::Expr<'tcx>,
@@ -200,11 +200,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if let Some(span) = result.illegal_sized_bound {
             let mut needs_mut = false;
             if let ty::Ref(region, t_type, mutability) = self_ty.kind() {
-                let trait_type = Ty::new_ref(
-                    self.tcx,
-                    *region,
-                    ty::TypeAndMut { ty: *t_type, mutbl: mutability.invert() },
-                );
+                let trait_type = Ty::new_ref(self.tcx, *region, *t_type, mutability.invert());
                 // We probe again to see if there might be a borrow mutability discrepancy.
                 match self.lookup_probe(
                     segment.ident,
@@ -395,7 +391,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         debug!("lookup_in_trait_adjusted: method_item={:?}", method_item);
         let mut obligations = vec![];
 
-        // Instantiate late-bound regions and substitute the trait
+        // Instantiate late-bound regions and instantiate the trait
         // parameters into the method type to get the actual method type.
         //
         // N.B., instantiate late-bound regions before normalizing the

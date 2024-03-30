@@ -131,7 +131,7 @@ fn extract_primty(ty_kind: &hir::TyKind<'_>) -> Option<hir::PrimTy> {
 }
 
 impl LateLintPass<'_> for RedundantTypeAnnotations {
-    fn check_local<'tcx>(&mut self, cx: &LateContext<'tcx>, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn check_local<'tcx>(&mut self, cx: &LateContext<'tcx>, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         if !is_lint_allowed(cx, REDUNDANT_TYPE_ANNOTATIONS, local.hir_id)
             // type annotation part
             && !local.span.from_expansion()
@@ -188,7 +188,6 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                     match init_lit.node {
                         // In these cases the annotation is redundant
                         LitKind::Str(..)
-                        | LitKind::ByteStr(..)
                         | LitKind::Byte(..)
                         | LitKind::Char(..)
                         | LitKind::Bool(..)
@@ -201,7 +200,17 @@ impl LateLintPass<'_> for RedundantTypeAnnotations {
                                 span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
                             }
                         },
-                        LitKind::Err => (),
+                        LitKind::Err(_) => (),
+                        LitKind::ByteStr(..) => {
+                            // We only lint if the type annotation is an array type (e.g. &[u8; 4]).
+                            // If instead it is a slice (e.g. &[u8]) it may not be redundant, so we
+                            // don't lint.
+                            if let hir::TyKind::Ref(_, mut_ty) = ty.kind
+                                && matches!(mut_ty.ty.kind, hir::TyKind::Array(..))
+                            {
+                                span_lint(cx, REDUNDANT_TYPE_ANNOTATIONS, local.span, "redundant type annotation");
+                            }
+                        },
                     }
                 },
                 _ => (),

@@ -264,7 +264,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
         hir_visit::walk_foreign_item(self, i)
     }
 
-    fn visit_local(&mut self, l: &'v hir::Local<'v>) {
+    fn visit_local(&mut self, l: &'v hir::LetStmt<'v>) {
         self.record("Local", Id::Node(l.hir_id), l);
         hir_visit::walk_local(self, l)
     }
@@ -277,7 +277,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_stmt(&mut self, s: &'v hir::Stmt<'v>) {
         record_variants!(
             (self, s, s.kind, Id::Node(s.hir_id), hir, Stmt, StmtKind),
-            [Local, Item, Expr, Semi]
+            [Let, Item, Expr, Semi]
         );
         hir_visit::walk_stmt(self, s)
     }
@@ -300,6 +300,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
                 Path,
                 Tuple,
                 Box,
+                Deref,
                 Ref,
                 Lit,
                 Range,
@@ -345,6 +346,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
                 BareFn,
                 Never,
                 Tup,
+                AnonAdt,
                 Path,
                 OpaqueDef,
                 TraitObject,
@@ -538,7 +540,7 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_stmt(&mut self, s: &'v ast::Stmt) {
         record_variants!(
             (self, s, s.kind, Id::None, ast, Stmt, StmtKind),
-            [Local, Item, Expr, Semi, Empty, MacCall]
+            [Let, Item, Expr, Semi, Empty, MacCall]
         );
         ast_visit::walk_stmt(self, s)
     }
@@ -565,6 +567,7 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 Path,
                 Tuple,
                 Box,
+                Deref,
                 Ref,
                 Lit,
                 Range,
@@ -588,7 +591,7 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 If, While, ForLoop, Loop, Match, Closure, Block, Await, TryBlock, Assign,
                 AssignOp, Field, Index, Range, Underscore, Path, AddrOf, Break, Continue, Ret,
                 InlineAsm, FormatArgs, OffsetOf, MacCall, Struct, Repeat, Paren, Try, Yield, Yeet,
-                Become, IncludedBytes, Gen, Err
+                Become, IncludedBytes, Gen, Err, Dummy
             ]
         );
         ast_visit::walk_expr(self, e)
@@ -615,8 +618,9 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 Infer,
                 ImplicitSelf,
                 MacCall,
-                Err,
-                CVarArgs
+                CVarArgs,
+                Dummy,
+                Err
             ]
         );
 

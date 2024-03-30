@@ -29,9 +29,10 @@ impl DeclarativeMacroExpander {
         db: &dyn ExpandDatabase,
         tt: tt::Subtree,
         call_id: MacroCallId,
+        span: Span,
     ) -> ExpandResult<tt::Subtree> {
         let loc = db.lookup_intern_macro_call(call_id);
-        let toolchain = &db.crate_graph()[loc.def.krate].toolchain;
+        let toolchain = db.toolchain(loc.def.krate);
         let new_meta_vars = toolchain.as_ref().map_or(false, |version| {
             REQUIREMENT.get_or_init(|| VersionReq::parse(">=1.76").unwrap()).matches(
                 &base_db::Version {
@@ -44,9 +45,9 @@ impl DeclarativeMacroExpander {
             )
         });
         match self.mac.err() {
-            Some(e) => ExpandResult::new(
-                tt::Subtree::empty(tt::DelimSpan { open: loc.call_site, close: loc.call_site }),
-                ExpandError::other(format!("invalid macro definition: {e}")),
+            Some(_) => ExpandResult::new(
+                tt::Subtree::empty(tt::DelimSpan { open: span, close: span }),
+                ExpandError::MacroDefinition,
             ),
             None => self
                 .mac
@@ -54,7 +55,7 @@ impl DeclarativeMacroExpander {
                     &tt,
                     |s| s.ctx = apply_mark(db, s.ctx, call_id, self.transparency),
                     new_meta_vars,
-                    loc.call_site,
+                    span,
                 )
                 .map_err(Into::into),
         }
@@ -67,7 +68,7 @@ impl DeclarativeMacroExpander {
         krate: CrateId,
         call_site: Span,
     ) -> ExpandResult<tt::Subtree> {
-        let toolchain = &db.crate_graph()[krate].toolchain;
+        let toolchain = db.toolchain(krate);
         let new_meta_vars = toolchain.as_ref().map_or(false, |version| {
             REQUIREMENT.get_or_init(|| VersionReq::parse(">=1.76").unwrap()).matches(
                 &base_db::Version {
@@ -80,9 +81,9 @@ impl DeclarativeMacroExpander {
             )
         });
         match self.mac.err() {
-            Some(e) => ExpandResult::new(
+            Some(_) => ExpandResult::new(
                 tt::Subtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
-                ExpandError::other(format!("invalid macro definition: {e}")),
+                ExpandError::MacroDefinition,
             ),
             None => self.mac.expand(&tt, |_| (), new_meta_vars, call_site).map_err(Into::into),
         }
@@ -119,7 +120,7 @@ impl DeclarativeMacroExpander {
                 _ => None,
             }
         };
-        let toolchain = crate_data.toolchain.as_ref();
+        let toolchain = db.toolchain(def_crate);
         let new_meta_vars = toolchain.as_ref().map_or(false, |version| {
             REQUIREMENT.get_or_init(|| VersionReq::parse(">=1.76").unwrap()).matches(
                 &base_db::Version {

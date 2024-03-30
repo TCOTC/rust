@@ -36,6 +36,7 @@
 //! cost by `MAX_COST`.
 
 use rustc_arena::DroplessArena;
+use rustc_const_eval::const_eval::DummyMachine;
 use rustc_const_eval::interpret::{ImmTy, Immediate, InterpCx, OpTy, Projectable};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_index::bit_set::BitSet;
@@ -50,7 +51,6 @@ use rustc_span::DUMMY_SP;
 use rustc_target::abi::{TagEncoding, Variants};
 
 use crate::cost_checker::CostChecker;
-use crate::dataflow_const_prop::DummyMachine;
 
 pub struct JumpThreading;
 
@@ -60,13 +60,19 @@ const MAX_PLACES: usize = 100;
 
 impl<'tcx> MirPass<'tcx> for JumpThreading {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 4
+        sess.mir_opt_level() >= 2
     }
 
     #[instrument(skip_all level = "debug")]
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let def_id = body.source.def_id();
         debug!(?def_id);
+
+        // Optimizing coroutines creates query cycles.
+        if tcx.is_coroutine(def_id) {
+            trace!("Skipped for coroutine {:?}", def_id);
+            return;
+        }
 
         let param_env = tcx.param_env_reveal_all_normalized(def_id);
         let map = Map::new(tcx, body, Some(MAX_PLACES));
@@ -410,7 +416,8 @@ impl<'tcx, 'a> TOFinder<'tcx, 'a> {
         match rhs {
             // If we expect `lhs ?= A`, we have an opportunity if we assume `constant == A`.
             Operand::Constant(constant) => {
-                let constant = self.ecx.eval_mir_constant(&constant.const_, None, None).ok()?;
+                let constant =
+                    self.ecx.eval_mir_constant(&constant.const_, constant.span, None).ok()?;
                 self.process_constant(bb, lhs, constant, state);
             }
             // Transfer the conditions on the copied rhs.

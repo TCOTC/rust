@@ -24,6 +24,9 @@ session_feature_diagnostic_for_issue =
 session_feature_diagnostic_help =
     add `#![feature({$feature})]` to the crate attributes to enable
 
+session_feature_diagnostic_suggestion =
+    add `#![feature({$feature})]` to the crate attributes to enable
+
 session_feature_suggest_upgrade_compiler =
     this compiler was built on {$date}; consider upgrading it if it is out of date
 
@@ -110,5 +113,8 @@ session_unleashed_feature_help_named = skipping check for `{$gate}` feature
 session_unleashed_feature_help_unnamed = skipping check that does not even have a feature gate
 
 session_unstable_virtual_function_elimination = `-Zvirtual-function-elimination` requires `-Clto`
+
+session_unsupported_crate_type_for_target =
+    dropping unsupported crate type `{$crate_type}` for target `{$target_triple}`
 
 session_unsupported_dwarf_version = requested DWARF version {$dwarf_version} is greater than 5

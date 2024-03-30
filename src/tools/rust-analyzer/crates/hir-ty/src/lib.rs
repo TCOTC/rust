@@ -51,6 +51,7 @@ use std::{
     hash::{BuildHasherDefault, Hash},
 };
 
+use base_db::salsa::impl_intern_value_trivial;
 use chalk_ir::{
     fold::{Shift, TypeFoldable},
     interner::HasInterner,
@@ -78,8 +79,8 @@ pub use builder::{ParamKind, TyBuilder};
 pub use chalk_ext::*;
 pub use infer::{
     closure::{CaptureKind, CapturedItem},
-    could_coerce, could_unify, Adjust, Adjustment, AutoBorrow, BindingMode, InferenceDiagnostic,
-    InferenceResult, OverloadedDeref, PointerCast,
+    could_coerce, could_unify, could_unify_deeply, Adjust, Adjustment, AutoBorrow, BindingMode,
+    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast,
 };
 pub use interner::Interner;
 pub use lower::{
@@ -228,7 +229,7 @@ impl MemoryMap {
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError>,
     ) -> Result<FxHashMap<usize, usize>, MirEvalError> {
-        let mut transform = |(addr, val): (&usize, &Box<[u8]>)| {
+        let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
             let align = if addr == 0 { 64 } else { (addr - (addr & (addr - 1))).min(64) };
             f(val, align).map(|it| (addr, it))
@@ -240,7 +241,9 @@ impl MemoryMap {
                 map.insert(addr, val);
                 map
             }),
-            MemoryMap::Complex(cm) => cm.memory.iter().map(transform).collect(),
+            MemoryMap::Complex(cm) => {
+                cm.memory.iter().map(|(addr, val)| transform((addr, val))).collect()
+            }
         }
     }
 
@@ -584,6 +587,7 @@ pub enum ImplTraitId {
     ReturnTypeImplTrait(hir_def::FunctionId, RpitId),
     AsyncBlockTypeImplTrait(hir_def::DefWithBodyId, ExprId),
 }
+impl_intern_value_trivial!(ImplTraitId);
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct ReturnTypeImplTraits {

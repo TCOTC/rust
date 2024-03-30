@@ -19,7 +19,7 @@ use crate::core::build_steps::{check, clean, compile, dist, doc, install, run, s
 use crate::core::config::flags::{Color, Subcommand};
 use crate::core::config::{DryRun, SplitDebuginfo, TargetSelection};
 use crate::prepare_behaviour_dump_dir;
-use crate::utils::cache::{Cache, Interned, INTERNER};
+use crate::utils::cache::Cache;
 use crate::utils::helpers::{self, add_dylib_path, add_link_lib_path, exe, linker_args};
 use crate::utils::helpers::{check_cfg_arg, libdir, linker_flags, output, t, LldThreads};
 use crate::EXTRA_CHECK_CFGS;
@@ -102,7 +102,7 @@ impl RunConfig<'_> {
 
     /// Return a list of crate names selected by `run.paths`.
     #[track_caller]
-    pub fn cargo_crates_in_set(&self) -> Interned<Vec<String>> {
+    pub fn cargo_crates_in_set(&self) -> Vec<String> {
         let mut crates = Vec::new();
         for krate in &self.paths {
             let path = krate.assert_single_path();
@@ -111,7 +111,7 @@ impl RunConfig<'_> {
             };
             crates.push(crate_name.to_string());
         }
-        INTERNER.intern_list(crates)
+        crates
     }
 
     /// Given an `alias` selected by the `Step` and the paths passed on the command line,
@@ -120,7 +120,7 @@ impl RunConfig<'_> {
     /// Normally, people will pass *just* `library` if they pass it.
     /// But it's possible (although strange) to pass something like `library std core`.
     /// Build all crates anyway, as if they hadn't passed the other args.
-    pub fn make_run_crates(&self, alias: Alias) -> Interned<Vec<String>> {
+    pub fn make_run_crates(&self, alias: Alias) -> Vec<String> {
         let has_alias =
             self.paths.iter().any(|set| set.assert_single_path().path.ends_with(alias.as_str()));
         if !has_alias {
@@ -133,7 +133,7 @@ impl RunConfig<'_> {
         };
 
         let crate_names = crates.into_iter().map(|krate| krate.name.to_string()).collect();
-        INTERNER.intern_list(crate_names)
+        crate_names
     }
 }
 
@@ -288,16 +288,61 @@ impl PathSet {
     }
 }
 
-const PATH_REMAP: &[(&str, &str)] = &[("rust-analyzer-proc-macro-srv", "proc-macro-srv-cli")];
+const PATH_REMAP: &[(&str, &[&str])] = &[
+    // config.toml uses `rust-analyzer-proc-macro-srv`, but the
+    // actual path is `proc-macro-srv-cli`
+    ("rust-analyzer-proc-macro-srv", &["src/tools/rust-analyzer/crates/proc-macro-srv-cli"]),
+    // Make `x test tests` function the same as `x t tests/*`
+    (
+        "tests",
+        &[
+            "tests/assembly",
+            "tests/codegen",
+            "tests/codegen-units",
+            "tests/coverage",
+            "tests/coverage-run-rustdoc",
+            "tests/debuginfo",
+            "tests/incremental",
+            "tests/mir-opt",
+            "tests/pretty",
+            "tests/run-make",
+            "tests/run-make-fulldeps",
+            "tests/run-pass-valgrind",
+            "tests/rustdoc",
+            "tests/rustdoc-gui",
+            "tests/rustdoc-js",
+            "tests/rustdoc-js-std",
+            "tests/rustdoc-json",
+            "tests/rustdoc-ui",
+            "tests/ui",
+            "tests/ui-fulldeps",
+        ],
+    ),
+];
 
 fn remap_paths(paths: &mut Vec<&Path>) {
-    for path in paths.iter_mut() {
+    let mut remove = vec![];
+    let mut add = vec![];
+    for (i, path) in paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, path)| if let Some(s) = path.to_str() { Some((i, s)) } else { None })
+    {
         for &(search, replace) in PATH_REMAP {
-            if path.to_str() == Some(search) {
-                *path = Path::new(replace)
+            // Remove leading and trailing slashes so `tests/` and `tests` are equivalent
+            if path.trim_matches(std::path::is_separator) == search {
+                remove.push(i);
+                add.extend(replace.into_iter().map(Path::new));
+                break;
             }
         }
     }
+    remove.sort();
+    remove.dedup();
+    for idx in remove.into_iter().rev() {
+        paths.remove(idx);
+    }
+    paths.append(&mut add);
 }
 
 impl StepDescription {
@@ -329,7 +374,7 @@ impl StepDescription {
     }
 
     fn is_excluded(&self, builder: &Builder<'_>, pathset: &PathSet) -> bool {
-        if builder.config.skip.iter().any(|e| pathset.has(&e, builder.kind)) {
+        if builder.config.skip.iter().any(|e| pathset.has(e, builder.kind)) {
             if !matches!(builder.config.dry_run, DryRun::SelfCheck) {
                 println!("Skipping {pathset:?} because it is excluded");
             }
@@ -337,10 +382,12 @@ impl StepDescription {
         }
 
         if !builder.config.skip.is_empty() && !matches!(builder.config.dry_run, DryRun::SelfCheck) {
-            builder.verbose(&format!(
-                "{:?} not skipped for {:?} -- not in {:?}",
-                pathset, self.name, builder.config.skip
-            ));
+            builder.verbose(|| {
+                println!(
+                    "{:?} not skipped for {:?} -- not in {:?}",
+                    pathset, self.name, builder.config.skip
+                )
+            });
         }
         false
     }
@@ -369,8 +416,7 @@ impl StepDescription {
         }
 
         // strip CurDir prefix if present
-        let mut paths: Vec<_> =
-            paths.into_iter().map(|p| p.strip_prefix(".").unwrap_or(p)).collect();
+        let mut paths: Vec<_> = paths.iter().map(|p| p.strip_prefix(".").unwrap_or(p)).collect();
 
         remap_paths(&mut paths);
 
@@ -378,7 +424,7 @@ impl StepDescription {
         // (This is separate from the loop below to avoid having to handle multiple paths in `is_suite_path` somehow.)
         paths.retain(|path| {
             for (desc, should_run) in v.iter().zip(&should_runs) {
-                if let Some(suite) = should_run.is_suite_path(&path) {
+                if let Some(suite) = should_run.is_suite_path(path) {
                     desc.maybe_run(builder, vec![suite.clone()]);
                     return false;
                 }
@@ -537,7 +583,7 @@ impl<'a> ShouldRun<'a> {
                 .iter()
                 .map(|p| {
                     // assert only if `p` isn't submodule
-                    if submodules_paths.iter().find(|sm_p| p.contains(*sm_p)).is_none() {
+                    if !submodules_paths.iter().any(|sm_p| p.contains(sm_p)) {
                         assert!(
                             self.builder.src.join(p).exists(),
                             "`should_run.paths` should correspond to real on-disk paths - use `alias` if there is no relevant path: {}",
@@ -598,22 +644,22 @@ impl<'a> ShouldRun<'a> {
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum Kind {
-    #[clap(alias = "b")]
+    #[value(alias = "b")]
     Build,
-    #[clap(alias = "c")]
+    #[value(alias = "c")]
     Check,
     Clippy,
     Fix,
     Format,
-    #[clap(alias = "t")]
+    #[value(alias = "t")]
     Test,
     Bench,
-    #[clap(alias = "d")]
+    #[value(alias = "d")]
     Doc,
     Clean,
     Dist,
     Install,
-    #[clap(alias = "r")]
+    #[value(alias = "r")]
     Run,
     Setup,
     Suggest,
@@ -719,6 +765,7 @@ impl<'a> Builder<'a> {
                 tool::RustdocGUITest,
                 tool::OptimizedDist,
                 tool::CoverageDump,
+                tool::LlvmBitcodeLinker
             ),
             Kind::Check | Kind::Clippy | Kind::Fix => describe!(
                 check::Std,
@@ -858,6 +905,11 @@ impl<'a> Builder<'a> {
             Kind::Install => describe!(
                 install::Docs,
                 install::Std,
+                // During the Rust compiler (rustc) installation process, we copy the entire sysroot binary
+                // path (build/host/stage2/bin). Since the building tools also make their copy in the sysroot
+                // binary path, we must install rustc before the tools. Otherwise, the rust-installer will
+                // install the same binaries twice for each tool, leaving backup files (*.old) as a result.
+                install::Rustc,
                 install::Cargo,
                 install::RustAnalyzer,
                 install::Rustfmt,
@@ -866,7 +918,6 @@ impl<'a> Builder<'a> {
                 install::Miri,
                 install::LlvmTools,
                 install::Src,
-                install::Rustc,
             ),
             Kind::Run => describe!(
                 run::ExpandYamlAnchors,
@@ -1014,26 +1065,26 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub fn sysroot(&self, compiler: Compiler) -> Interned<PathBuf> {
+    pub fn sysroot(&self, compiler: Compiler) -> PathBuf {
         self.ensure(compile::Sysroot::new(compiler))
     }
 
     /// Returns the libdir where the standard library and other artifacts are
     /// found for a compiler's sysroot.
-    pub fn sysroot_libdir(&self, compiler: Compiler, target: TargetSelection) -> Interned<PathBuf> {
-        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+    pub fn sysroot_libdir(&self, compiler: Compiler, target: TargetSelection) -> PathBuf {
+        #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         struct Libdir {
             compiler: Compiler,
             target: TargetSelection,
         }
         impl Step for Libdir {
-            type Output = Interned<PathBuf>;
+            type Output = PathBuf;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
                 run.never()
             }
 
-            fn run(self, builder: &Builder<'_>) -> Interned<PathBuf> {
+            fn run(self, builder: &Builder<'_>) -> PathBuf {
                 let lib = builder.sysroot_libdir_relative(self.compiler);
                 let sysroot = builder
                     .sysroot(self.compiler)
@@ -1044,10 +1095,9 @@ impl<'a> Builder<'a> {
                 // Avoid deleting the rustlib/ directory we just copied
                 // (in `impl Step for Sysroot`).
                 if !builder.download_rustc() {
-                    builder.verbose(&format!(
-                        "Removing sysroot {} to avoid caching bugs",
-                        sysroot.display()
-                    ));
+                    builder.verbose(|| {
+                        println!("Removing sysroot {} to avoid caching bugs", sysroot.display())
+                    });
                     let _ = fs::remove_dir_all(&sysroot);
                     t!(fs::create_dir_all(&sysroot));
                 }
@@ -1062,7 +1112,7 @@ impl<'a> Builder<'a> {
                     );
                 }
 
-                INTERNER.intern_path(sysroot)
+                sysroot
             }
         }
         self.ensure(Libdir { compiler, target })
@@ -1204,7 +1254,7 @@ impl<'a> Builder<'a> {
     }
 
     pub fn rustdoc_cmd(&self, compiler: Compiler) -> Command {
-        let mut cmd = Command::new(&self.bootstrap_out.join("rustdoc"));
+        let mut cmd = Command::new(self.bootstrap_out.join("rustdoc"));
         cmd.env("RUSTC_STAGE", compiler.stage.to_string())
             .env("RUSTC_SYSROOT", self.sysroot(compiler))
             // Note that this is *not* the sysroot_libdir because rustdoc must be linked
@@ -1229,7 +1279,7 @@ impl<'a> Builder<'a> {
     /// Note that this returns `None` if LLVM is disabled, or if we're in a
     /// check build or dry-run, where there's no need to build all of LLVM.
     fn llvm_config(&self, target: TargetSelection) -> Option<PathBuf> {
-        if self.config.llvm_enabled() && self.kind != Kind::Check && !self.config.dry_run() {
+        if self.config.llvm_enabled(target) && self.kind != Kind::Check && !self.config.dry_run() {
             let llvm::LlvmResult { llvm_config, .. } = self.ensure(llvm::Llvm { target });
             if llvm_config.is_file() {
                 return Some(llvm_config);
@@ -1299,14 +1349,12 @@ impl<'a> Builder<'a> {
         cargo
     }
 
-    /// Prepares an invocation of `cargo` to be run.
-    ///
     /// This will create a `Command` that represents a pending execution of
     /// Cargo. This cargo will be configured to use `compiler` as the actual
     /// rustc compiler, its output will be scoped by `mode`'s output directory,
     /// it will pass the `--target` flag for the specified `target`, and will be
     /// executing the Cargo command `cmd`.
-    pub fn cargo(
+    fn cargo(
         &self,
         compiler: Compiler,
         mode: Mode,
@@ -1349,7 +1397,7 @@ impl<'a> Builder<'a> {
 
         // See comment in rustc_llvm/build.rs for why this is necessary, largely llvm-config
         // needs to not accidentally link to libLLVM in stage0/lib.
-        cargo.env("REAL_LIBRARY_PATH_VAR", &helpers::dylib_path_var());
+        cargo.env("REAL_LIBRARY_PATH_VAR", helpers::dylib_path_var());
         if let Some(e) = env::var_os(helpers::dylib_path_var()) {
             cargo.env("REAL_LIBRARY_PATH", e);
         }
@@ -1389,7 +1437,7 @@ impl<'a> Builder<'a> {
 
         let sysroot_str = sysroot.as_os_str().to_str().expect("sysroot should be UTF-8");
         if !matches!(self.config.dry_run, DryRun::SelfCheck) {
-            self.verbose_than(0, &format!("using sysroot {sysroot_str}"));
+            self.verbose_than(0, || println!("using sysroot {sysroot_str}"));
         }
 
         let mut rustflags = Rustflags::new(target);
@@ -1618,8 +1666,8 @@ impl<'a> Builder<'a> {
             .env("RUSTBUILD_NATIVE_DIR", self.native_dir(target))
             .env("RUSTC_REAL", self.rustc(compiler))
             .env("RUSTC_STAGE", stage.to_string())
-            .env("RUSTC_SYSROOT", &sysroot)
-            .env("RUSTC_LIBDIR", &libdir)
+            .env("RUSTC_SYSROOT", sysroot)
+            .env("RUSTC_LIBDIR", libdir)
             .env("RUSTDOC", self.bootstrap_out.join("rustdoc"))
             .env(
                 "RUSTDOC_REAL",
@@ -1684,15 +1732,16 @@ impl<'a> Builder<'a> {
             },
         );
 
+        let split_debuginfo = self.config.split_debuginfo(target);
         let split_debuginfo_is_stable = target.contains("linux")
             || target.contains("apple")
-            || (target.is_msvc() && self.config.rust_split_debuginfo == SplitDebuginfo::Packed)
-            || (target.is_windows() && self.config.rust_split_debuginfo == SplitDebuginfo::Off);
+            || (target.is_msvc() && split_debuginfo == SplitDebuginfo::Packed)
+            || (target.is_windows() && split_debuginfo == SplitDebuginfo::Off);
 
         if !split_debuginfo_is_stable {
             rustflags.arg("-Zunstable-options");
         }
-        match self.config.rust_split_debuginfo {
+        match split_debuginfo {
             SplitDebuginfo::Packed => rustflags.arg("-Csplit-debuginfo=packed"),
             SplitDebuginfo::Unpacked => rustflags.arg("-Csplit-debuginfo=unpacked"),
             SplitDebuginfo::Off => rustflags.arg("-Csplit-debuginfo=off"),
@@ -1752,7 +1801,7 @@ impl<'a> Builder<'a> {
         cargo.env("RUSTC_BOOTSTRAP", "1");
 
         if self.config.dump_bootstrap_shims {
-            prepare_behaviour_dump_dir(&self.build);
+            prepare_behaviour_dump_dir(self.build);
 
             cargo
                 .env("DUMP_BOOTSTRAP_SHIMS", self.build.out.join("bootstrap-shims-dump"))
@@ -1791,7 +1840,7 @@ impl<'a> Builder<'a> {
         // platform-specific environment variable as a workaround.
         if mode == Mode::ToolRustc || mode == Mode::Codegen {
             if let Some(llvm_config) = self.llvm_config(target) {
-                let llvm_libdir = output(Command::new(&llvm_config).arg("--libdir"));
+                let llvm_libdir = output(Command::new(llvm_config).arg("--libdir"));
                 add_link_lib_path(vec![llvm_libdir.trim().into()], &mut cargo);
             }
         }
@@ -1872,15 +1921,8 @@ impl<'a> Builder<'a> {
             rustflags.arg("-Wrustc::internal");
         }
 
-        if cmd != "check" {
-            self.configure_linker(
-                compiler,
-                target,
-                &mut cargo,
-                &mut rustflags,
-                &mut rustdocflags,
-                &mut hostflags,
-            );
+        if self.config.rust_frame_pointers {
+            rustflags.arg("-Cforce-frame-pointers=true");
         }
 
         // If Control Flow Guard is enabled, pass the `control-flow-guard` flag to rustc
@@ -2004,7 +2046,8 @@ impl<'a> Builder<'a> {
             };
 
             if let Some(limit) = limit {
-                if stage == 0 || self.config.default_codegen_backend().unwrap_or_default() == "llvm"
+                if stage == 0
+                    || self.config.default_codegen_backend(target).unwrap_or_default() == "llvm"
                 {
                     rustflags.arg(&format!("-Cllvm-args=-import-instr-limit={limit}"));
                 }
@@ -2031,136 +2074,14 @@ impl<'a> Builder<'a> {
             cargo.env("RUSTFLAGS", &rustc_args.join(" "));
         }
 
-        Cargo { command: cargo, rustflags, rustdocflags, hostflags, allow_features }
-    }
-
-    fn configure_linker(
-        &self,
-        compiler: Compiler,
-        target: TargetSelection,
-        cargo: &mut Command,
-        rustflags: &mut Rustflags,
-        rustdocflags: &mut Rustflags,
-        hostflags: &mut HostFlags,
-    ) {
-        // Dealing with rpath here is a little special, so let's go into some
-        // detail. First off, `-rpath` is a linker option on Unix platforms
-        // which adds to the runtime dynamic loader path when looking for
-        // dynamic libraries. We use this by default on Unix platforms to ensure
-        // that our nightlies behave the same on Windows, that is they work out
-        // of the box. This can be disabled by setting `rpath = false` in `[rust]`
-        // table of `config.toml`
-        //
-        // Ok, so the astute might be wondering "why isn't `-C rpath` used
-        // here?" and that is indeed a good question to ask. This codegen
-        // option is the compiler's current interface to generating an rpath.
-        // Unfortunately it doesn't quite suffice for us. The flag currently
-        // takes no value as an argument, so the compiler calculates what it
-        // should pass to the linker as `-rpath`. This unfortunately is based on
-        // the **compile time** directory structure which when building with
-        // Cargo will be very different than the runtime directory structure.
-        //
-        // All that's a really long winded way of saying that if we use
-        // `-Crpath` then the executables generated have the wrong rpath of
-        // something like `$ORIGIN/deps` when in fact the way we distribute
-        // rustc requires the rpath to be `$ORIGIN/../lib`.
-        //
-        // So, all in all, to set up the correct rpath we pass the linker
-        // argument manually via `-C link-args=-Wl,-rpath,...`. Plus isn't it
-        // fun to pass a flag to a tool to pass a flag to pass a flag to a tool
-        // to change a flag in a binary?
-        if self.config.rpath_enabled(target) && helpers::use_host_linker(target) {
-            let libdir = self.sysroot_libdir_relative(compiler).to_str().unwrap();
-            let rpath = if target.contains("apple") {
-                // Note that we need to take one extra step on macOS to also pass
-                // `-Wl,-instal_name,@rpath/...` to get things to work right. To
-                // do that we pass a weird flag to the compiler to get it to do
-                // so. Note that this is definitely a hack, and we should likely
-                // flesh out rpath support more fully in the future.
-                rustflags.arg("-Zosx-rpath-install-name");
-                Some(format!("-Wl,-rpath,@loader_path/../{libdir}"))
-            } else if !target.is_windows() && !target.contains("aix") && !target.contains("xous") {
-                rustflags.arg("-Clink-args=-Wl,-z,origin");
-                Some(format!("-Wl,-rpath,$ORIGIN/../{libdir}"))
-            } else {
-                None
-            };
-            if let Some(rpath) = rpath {
-                rustflags.arg(&format!("-Clink-args={rpath}"));
-            }
-        }
-
-        for arg in linker_args(self, compiler.host, LldThreads::Yes) {
-            hostflags.arg(&arg);
-        }
-
-        if let Some(target_linker) = self.linker(target) {
-            let target = crate::envify(&target.triple);
-            cargo.env(&format!("CARGO_TARGET_{target}_LINKER"), target_linker);
-        }
-        // We want to set -Clinker using Cargo, therefore we only call `linker_flags` and not
-        // `linker_args` here.
-        for flag in linker_flags(self, target, LldThreads::Yes) {
-            rustflags.arg(&flag);
-        }
-        for arg in linker_args(self, target, LldThreads::Yes) {
-            rustdocflags.arg(&arg);
-        }
-
-        if !self.config.dry_run() && self.cc.borrow()[&target].args().iter().any(|arg| arg == "-gz")
-        {
-            rustflags.arg("-Clink-arg=-gz");
-        }
-
-        // Throughout the build Cargo can execute a number of build scripts
-        // compiling C/C++ code and we need to pass compilers, archivers, flags, etc
-        // obtained previously to those build scripts.
-        // Build scripts use either the `cc` crate or `configure/make` so we pass
-        // the options through environment variables that are fetched and understood by both.
-        //
-        // FIXME: the guard against msvc shouldn't need to be here
-        if target.is_msvc() {
-            if let Some(ref cl) = self.config.llvm_clang_cl {
-                cargo.env("CC", cl).env("CXX", cl);
-            }
-        } else {
-            let ccache = self.config.ccache.as_ref();
-            let ccacheify = |s: &Path| {
-                let ccache = match ccache {
-                    Some(ref s) => s,
-                    None => return s.display().to_string(),
-                };
-                // FIXME: the cc-rs crate only recognizes the literal strings
-                // `ccache` and `sccache` when doing caching compilations, so we
-                // mirror that here. It should probably be fixed upstream to
-                // accept a new env var or otherwise work with custom ccache
-                // vars.
-                match &ccache[..] {
-                    "ccache" | "sccache" => format!("{} {}", ccache, s.display()),
-                    _ => s.display().to_string(),
-                }
-            };
-            let triple_underscored = target.triple.replace("-", "_");
-            let cc = ccacheify(&self.cc(target));
-            cargo.env(format!("CC_{triple_underscored}"), &cc);
-
-            let cflags = self.cflags(target, GitRepo::Rustc, CLang::C).join(" ");
-            cargo.env(format!("CFLAGS_{triple_underscored}"), &cflags);
-
-            if let Some(ar) = self.ar(target) {
-                let ranlib = format!("{} s", ar.display());
-                cargo
-                    .env(format!("AR_{triple_underscored}"), ar)
-                    .env(format!("RANLIB_{triple_underscored}"), ranlib);
-            }
-
-            if let Ok(cxx) = self.cxx(target) {
-                let cxx = ccacheify(&cxx);
-                let cxxflags = self.cflags(target, GitRepo::Rustc, CLang::Cxx).join(" ");
-                cargo
-                    .env(format!("CXX_{triple_underscored}"), &cxx)
-                    .env(format!("CXXFLAGS_{triple_underscored}"), cxxflags);
-            }
+        Cargo {
+            command: cargo,
+            compiler,
+            target,
+            rustflags,
+            rustdocflags,
+            hostflags,
+            allow_features,
         }
     }
 
@@ -2183,11 +2104,11 @@ impl<'a> Builder<'a> {
                 panic!("{}", out);
             }
             if let Some(out) = self.cache.get(&step) {
-                self.verbose_than(1, &format!("{}c {:?}", "  ".repeat(stack.len()), step));
+                self.verbose_than(1, || println!("{}c {:?}", "  ".repeat(stack.len()), step));
 
                 return out;
             }
-            self.verbose_than(1, &format!("{}> {:?}", "  ".repeat(stack.len()), step));
+            self.verbose_than(1, || println!("{}> {:?}", "  ".repeat(stack.len()), step));
             stack.push(Box::new(step.clone()));
         }
 
@@ -2206,7 +2127,7 @@ impl<'a> Builder<'a> {
 
         if self.config.print_step_timings && !self.config.dry_run() {
             let step_string = format!("{step:?}");
-            let brace_index = step_string.find("{").unwrap_or(0);
+            let brace_index = step_string.find('{').unwrap_or(0);
             let type_string = type_name::<S>();
             println!(
                 "[TIMING] {} {} -- {}.{:03}",
@@ -2225,7 +2146,7 @@ impl<'a> Builder<'a> {
             let cur_step = stack.pop().expect("step stack empty");
             assert_eq!(cur_step.downcast_ref(), Some(&step));
         }
-        self.verbose_than(1, &format!("{}< {:?}", "  ".repeat(self.stack.borrow().len()), step));
+        self.verbose_than(1, || println!("{}< {:?}", "  ".repeat(self.stack.borrow().len()), step));
         self.cache.put(step, out.clone());
         out
     }
@@ -2363,6 +2284,8 @@ impl HostFlags {
 #[derive(Debug)]
 pub struct Cargo {
     command: Command,
+    compiler: Compiler,
+    target: TargetSelection,
     rustflags: Rustflags,
     rustdocflags: Rustflags,
     hostflags: HostFlags,
@@ -2370,10 +2293,37 @@ pub struct Cargo {
 }
 
 impl Cargo {
+    /// Calls `Builder::cargo` and `Cargo::configure_linker` to prepare an invocation of `cargo` to be run.
+    pub fn new(
+        builder: &Builder<'_>,
+        compiler: Compiler,
+        mode: Mode,
+        source_type: SourceType,
+        target: TargetSelection,
+        cmd: &str,
+    ) -> Cargo {
+        let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd);
+        cargo.configure_linker(builder);
+        cargo
+    }
+
+    /// Same as `Cargo::new` except this one doesn't configure the linker with `Cargo::configure_linker`
+    pub fn new_for_mir_opt_tests(
+        builder: &Builder<'_>,
+        compiler: Compiler,
+        mode: Mode,
+        source_type: SourceType,
+        target: TargetSelection,
+        cmd: &str,
+    ) -> Cargo {
+        builder.cargo(compiler, mode, source_type, target, cmd)
+    }
+
     pub fn rustdocflag(&mut self, arg: &str) -> &mut Cargo {
         self.rustdocflags.arg(arg);
         self
     }
+
     pub fn rustflag(&mut self, arg: &str) -> &mut Cargo {
         self.rustflags.arg(arg);
         self
@@ -2403,8 +2353,8 @@ impl Cargo {
         self
     }
 
-    pub fn add_rustc_lib_path(&mut self, builder: &Builder<'_>, compiler: Compiler) {
-        builder.add_rustc_lib_path(compiler, &mut self.command);
+    pub fn add_rustc_lib_path(&mut self, builder: &Builder<'_>) {
+        builder.add_rustc_lib_path(self.compiler, &mut self.command);
     }
 
     pub fn current_dir(&mut self, dir: &Path) -> &mut Cargo {
@@ -2421,6 +2371,134 @@ impl Cargo {
             self.allow_features.push(',');
         }
         self.allow_features.push_str(features);
+        self
+    }
+
+    fn configure_linker(&mut self, builder: &Builder<'_>) -> &mut Cargo {
+        let target = self.target;
+        let compiler = self.compiler;
+
+        // Dealing with rpath here is a little special, so let's go into some
+        // detail. First off, `-rpath` is a linker option on Unix platforms
+        // which adds to the runtime dynamic loader path when looking for
+        // dynamic libraries. We use this by default on Unix platforms to ensure
+        // that our nightlies behave the same on Windows, that is they work out
+        // of the box. This can be disabled by setting `rpath = false` in `[rust]`
+        // table of `config.toml`
+        //
+        // Ok, so the astute might be wondering "why isn't `-C rpath` used
+        // here?" and that is indeed a good question to ask. This codegen
+        // option is the compiler's current interface to generating an rpath.
+        // Unfortunately it doesn't quite suffice for us. The flag currently
+        // takes no value as an argument, so the compiler calculates what it
+        // should pass to the linker as `-rpath`. This unfortunately is based on
+        // the **compile time** directory structure which when building with
+        // Cargo will be very different than the runtime directory structure.
+        //
+        // All that's a really long winded way of saying that if we use
+        // `-Crpath` then the executables generated have the wrong rpath of
+        // something like `$ORIGIN/deps` when in fact the way we distribute
+        // rustc requires the rpath to be `$ORIGIN/../lib`.
+        //
+        // So, all in all, to set up the correct rpath we pass the linker
+        // argument manually via `-C link-args=-Wl,-rpath,...`. Plus isn't it
+        // fun to pass a flag to a tool to pass a flag to pass a flag to a tool
+        // to change a flag in a binary?
+        if builder.config.rpath_enabled(target) && helpers::use_host_linker(target) {
+            let libdir = builder.sysroot_libdir_relative(compiler).to_str().unwrap();
+            let rpath = if target.contains("apple") {
+                // Note that we need to take one extra step on macOS to also pass
+                // `-Wl,-instal_name,@rpath/...` to get things to work right. To
+                // do that we pass a weird flag to the compiler to get it to do
+                // so. Note that this is definitely a hack, and we should likely
+                // flesh out rpath support more fully in the future.
+                self.rustflags.arg("-Zosx-rpath-install-name");
+                Some(format!("-Wl,-rpath,@loader_path/../{libdir}"))
+            } else if !target.is_windows() && !target.contains("aix") && !target.contains("xous") {
+                self.rustflags.arg("-Clink-args=-Wl,-z,origin");
+                Some(format!("-Wl,-rpath,$ORIGIN/../{libdir}"))
+            } else {
+                None
+            };
+            if let Some(rpath) = rpath {
+                self.rustflags.arg(&format!("-Clink-args={rpath}"));
+            }
+        }
+
+        for arg in linker_args(builder, compiler.host, LldThreads::Yes) {
+            self.hostflags.arg(&arg);
+        }
+
+        if let Some(target_linker) = builder.linker(target) {
+            let target = crate::envify(&target.triple);
+            self.command.env(&format!("CARGO_TARGET_{target}_LINKER"), target_linker);
+        }
+        // We want to set -Clinker using Cargo, therefore we only call `linker_flags` and not
+        // `linker_args` here.
+        for flag in linker_flags(builder, target, LldThreads::Yes) {
+            self.rustflags.arg(&flag);
+        }
+        for arg in linker_args(builder, target, LldThreads::Yes) {
+            self.rustdocflags.arg(&arg);
+        }
+
+        if !builder.config.dry_run()
+            && builder.cc.borrow()[&target].args().iter().any(|arg| arg == "-gz")
+        {
+            self.rustflags.arg("-Clink-arg=-gz");
+        }
+
+        // Throughout the build Cargo can execute a number of build scripts
+        // compiling C/C++ code and we need to pass compilers, archivers, flags, etc
+        // obtained previously to those build scripts.
+        // Build scripts use either the `cc` crate or `configure/make` so we pass
+        // the options through environment variables that are fetched and understood by both.
+        //
+        // FIXME: the guard against msvc shouldn't need to be here
+        if target.is_msvc() {
+            if let Some(ref cl) = builder.config.llvm_clang_cl {
+                self.command.env("CC", cl).env("CXX", cl);
+            }
+        } else {
+            let ccache = builder.config.ccache.as_ref();
+            let ccacheify = |s: &Path| {
+                let ccache = match ccache {
+                    Some(ref s) => s,
+                    None => return s.display().to_string(),
+                };
+                // FIXME: the cc-rs crate only recognizes the literal strings
+                // `ccache` and `sccache` when doing caching compilations, so we
+                // mirror that here. It should probably be fixed upstream to
+                // accept a new env var or otherwise work with custom ccache
+                // vars.
+                match &ccache[..] {
+                    "ccache" | "sccache" => format!("{} {}", ccache, s.display()),
+                    _ => s.display().to_string(),
+                }
+            };
+            let triple_underscored = target.triple.replace('-', "_");
+            let cc = ccacheify(&builder.cc(target));
+            self.command.env(format!("CC_{triple_underscored}"), &cc);
+
+            let cflags = builder.cflags(target, GitRepo::Rustc, CLang::C).join(" ");
+            self.command.env(format!("CFLAGS_{triple_underscored}"), &cflags);
+
+            if let Some(ar) = builder.ar(target) {
+                let ranlib = format!("{} s", ar.display());
+                self.command
+                    .env(format!("AR_{triple_underscored}"), ar)
+                    .env(format!("RANLIB_{triple_underscored}"), ranlib);
+            }
+
+            if let Ok(cxx) = builder.cxx(target) {
+                let cxx = ccacheify(&cxx);
+                let cxxflags = builder.cflags(target, GitRepo::Rustc, CLang::Cxx).join(" ");
+                self.command
+                    .env(format!("CXX_{triple_underscored}"), &cxx)
+                    .env(format!("CXXFLAGS_{triple_underscored}"), cxxflags);
+            }
+        }
+
         self
     }
 }

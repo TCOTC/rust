@@ -1,6 +1,6 @@
 //! Interpret intrinsics, lang items and `extern "C"` wellknown functions which their implementation
 //! is not available.
-
+//!
 use std::cmp;
 
 use chalk_ir::TyKind;
@@ -8,9 +8,13 @@ use hir_def::{
     builtin_type::{BuiltinInt, BuiltinUint},
     resolver::HasResolver,
 };
-use hir_expand::mod_path::ModPath;
 
-use super::*;
+use crate::mir::eval::{
+    name, pad16, static_lifetime, Address, AdtId, Arc, BuiltinType, Evaluator, FunctionId,
+    HasModule, HirDisplay, Interned, InternedClosure, Interner, Interval, IntervalAndTy,
+    IntervalOrOwned, ItemContainerId, LangItem, Layout, Locals, Lookup, MirEvalError, MirSpan,
+    ModPath, Mutability, Result, Substitution, Ty, TyBuilder, TyExt,
+};
 
 mod simd;
 
@@ -178,7 +182,7 @@ impl Evaluator<'_> {
                     not_supported!("wrong arg count for clone");
                 };
                 let addr = Address::from_bytes(arg.get(self)?)?;
-                let (closure_owner, _) = self.db.lookup_intern_closure((*id).into());
+                let InternedClosure(closure_owner, _) = self.db.lookup_intern_closure((*id).into());
                 let infer = self.db.infer(closure_owner);
                 let (captures, _) = infer.closure_info(id);
                 let layout = self.layout(&self_ty)?;
@@ -304,7 +308,7 @@ impl Evaluator<'_> {
         use LangItem::*;
         let mut args = args.iter();
         match it {
-            BeginPanic => Err(MirEvalError::Panic("<unknown-panic-payload>".to_string())),
+            BeginPanic => Err(MirEvalError::Panic("<unknown-panic-payload>".to_owned())),
             PanicFmt => {
                 let message = (|| {
                     let resolver = self

@@ -23,7 +23,7 @@ pub use valtree::*;
 pub type ConstKind<'tcx> = IrConstKind<TyCtxt<'tcx>>;
 
 /// Use this rather than `ConstData`, whenever possible.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, HashStable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable)]
 #[rustc_pass_by_value]
 pub struct Const<'tcx>(pub(super) Interned<'tcx, WithCachedTypeInfo<ConstData<'tcx>>>);
 
@@ -35,6 +35,16 @@ impl<'tcx> IntoKind for Const<'tcx> {
     }
 }
 
+impl<'tcx> rustc_type_ir::visit::Flags for Const<'tcx> {
+    fn flags(&self) -> TypeFlags {
+        self.0.flags
+    }
+
+    fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
+        self.0.outer_exclusive_binder
+    }
+}
+
 impl<'tcx> ConstTy<TyCtxt<'tcx>> for Const<'tcx> {
     fn ty(self) -> Ty<'tcx> {
         self.ty()
@@ -42,7 +52,7 @@ impl<'tcx> ConstTy<TyCtxt<'tcx>> for Const<'tcx> {
 }
 
 /// Typed constant value.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[derive(HashStable, TyEncodable, TyDecodable)]
 pub struct ConstData<'tcx> {
     pub ty: Ty<'tcx>,
@@ -63,11 +73,13 @@ impl<'tcx> Const<'tcx> {
         self.0.kind
     }
 
+    // FIXME(compiler-errors): Think about removing this.
     #[inline]
     pub fn flags(self) -> TypeFlags {
         self.0.flags
     }
 
+    // FIXME(compiler-errors): Think about removing this.
     #[inline]
     pub fn outer_exclusive_binder(self) -> ty::DebruijnIndex {
         self.0.outer_exclusive_binder
@@ -163,7 +175,20 @@ impl<'tcx> Const<'tcx> {
         let reported = tcx.dcx().span_delayed_bug(span, msg);
         Const::new_error(tcx, reported, ty)
     }
+}
 
+impl<'tcx> rustc_type_ir::new::Const<TyCtxt<'tcx>> for Const<'tcx> {
+    fn new_anon_bound(
+        tcx: TyCtxt<'tcx>,
+        debruijn: ty::DebruijnIndex,
+        var: ty::BoundVar,
+        ty: Ty<'tcx>,
+    ) -> Self {
+        Const::new_bound(tcx, debruijn, var, ty)
+    }
+}
+
+impl<'tcx> Const<'tcx> {
     /// Literals and const generic parameters are eagerly converted to a constant, everything else
     /// becomes `Unevaluated`.
     #[instrument(skip(tcx), level = "debug")]
@@ -235,7 +260,7 @@ impl<'tcx> Const<'tcx> {
         // FIXME(const_generics): We currently have to special case parameters because `min_const_generics`
         // does not provide the parents generics to anonymous constants. We still allow generic const
         // parameters by themselves however, e.g. `N`. These constants would cause an ICE if we were to
-        // ever try to substitute the generic parameters in their bodies.
+        // ever try to instantiate the generic parameters in their bodies.
         match expr.kind {
             hir::ExprKind::Path(hir::QPath::Resolved(
                 _,
@@ -310,7 +335,7 @@ impl<'tcx> Const<'tcx> {
         self,
         tcx: TyCtxt<'tcx>,
         param_env: ParamEnv<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> Result<ValTree<'tcx>, ErrorHandled> {
         assert!(!self.has_escaping_bound_vars(), "escaping vars in {self:?}");
         match self.kind() {
@@ -324,7 +349,7 @@ impl<'tcx> Const<'tcx> {
                 else {
                     // This can happen when we run on ill-typed code.
                     let e = tcx.dcx().span_delayed_bug(
-                        span.unwrap_or(DUMMY_SP),
+                        span,
                         "`ty::Const::eval` called on a non-valtree-compatible type",
                     );
                     return Err(e.into());
@@ -337,14 +362,14 @@ impl<'tcx> Const<'tcx> {
             | ConstKind::Infer(_)
             | ConstKind::Bound(_, _)
             | ConstKind::Placeholder(_)
-            | ConstKind::Expr(_) => Err(ErrorHandled::TooGeneric(span.unwrap_or(DUMMY_SP))),
+            | ConstKind::Expr(_) => Err(ErrorHandled::TooGeneric(span)),
         }
     }
 
     /// Normalizes the constant to a value or an error if possible.
     #[inline]
     pub fn normalize(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Self {
-        match self.eval(tcx, param_env, None) {
+        match self.eval(tcx, param_env, DUMMY_SP) {
             Ok(val) => Self::new_value(tcx, val, self.ty()),
             Err(ErrorHandled::Reported(r, _span)) => Self::new_error(tcx, r.into(), self.ty()),
             Err(ErrorHandled::TooGeneric(_span)) => self,
@@ -357,7 +382,7 @@ impl<'tcx> Const<'tcx> {
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
     ) -> Option<Scalar> {
-        self.eval(tcx, param_env, None).ok()?.try_to_scalar()
+        self.eval(tcx, param_env, DUMMY_SP).ok()?.try_to_scalar()
     }
 
     #[inline]

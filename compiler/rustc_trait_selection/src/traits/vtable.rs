@@ -124,7 +124,7 @@ fn prepare_vtable_segments_inner<'tcx, T>(
                 .predicates
                 .into_iter()
                 .filter_map(move |(pred, _)| {
-                    pred.subst_supertrait(tcx, &inner_most_trait_ref).as_trait_clause()
+                    pred.instantiate_supertrait(tcx, &inner_most_trait_ref).as_trait_clause()
                 });
 
             // Find an unvisited supertrait
@@ -320,6 +320,7 @@ fn vtable_entries<'tcx>(
 }
 
 /// Find slot base for trait methods within vtable entries of another trait
+// FIXME(@lcnr): This isn't a query, so why does it take a tuple as its argument.
 pub(super) fn vtable_trait_first_method_offset<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: (

@@ -94,8 +94,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
 
                 if let OperandValue::Immediate(v) = cg_elem.val {
-                    let zero = bx.const_usize(0);
-                    let start = dest.project_index(bx, zero).llval;
+                    let start = dest.llval;
                     let size = bx.const_usize(dest.layout.size.bytes());
 
                     // Use llvm.memset.p0i8.* to initialize all zero arrays
@@ -303,15 +302,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         self.assume_scalar_range(bx, imm, from_scalar, from_backend_ty);
 
         imm = match (from_scalar.primitive(), to_scalar.primitive()) {
-            (Int(..) | F32 | F64, Int(..) | F32 | F64) => bx.bitcast(imm, to_backend_ty),
-            (Pointer(..), Pointer(..)) => bx.pointercast(imm, to_backend_ty),
-            (Int(..), Pointer(..)) => bx.inttoptr(imm, to_backend_ty),
-            (Pointer(..), Int(..)) => bx.ptrtoint(imm, to_backend_ty),
-            (F32 | F64, Pointer(..)) => {
-                let int_imm = bx.bitcast(imm, bx.cx().type_isize());
-                bx.inttoptr(int_imm, to_backend_ty)
+            (Int(..) | F16 | F32 | F64 | F128, Int(..) | F16 | F32 | F64 | F128) => {
+                bx.bitcast(imm, to_backend_ty)
             }
-            (Pointer(..), F32 | F64) => {
+            (Pointer(..), Pointer(..)) => bx.pointercast(imm, to_backend_ty),
+            (Int(..), Pointer(..)) => bx.ptradd(bx.const_null(bx.type_ptr()), imm),
+            (Pointer(..), Int(..)) => bx.ptrtoint(imm, to_backend_ty),
+            (F16 | F32 | F64 | F128, Pointer(..)) => {
+                let int_imm = bx.bitcast(imm, bx.cx().type_isize());
+                bx.ptradd(bx.const_null(bx.type_ptr()), int_imm)
+            }
+            (Pointer(..), F16 | F32 | F64 | F128) => {
                 let int_imm = bx.ptrtoint(imm, bx.cx().type_isize());
                 bx.bitcast(int_imm, to_backend_ty)
             }
@@ -571,20 +572,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
             mir::Rvalue::Ref(_, bk, place) => {
                 let mk_ref = move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| {
-                    Ty::new_ref(
-                        tcx,
-                        tcx.lifetimes.re_erased,
-                        ty::TypeAndMut { ty, mutbl: bk.to_mutbl_lossy() },
-                    )
+                    Ty::new_ref(tcx, tcx.lifetimes.re_erased, ty, bk.to_mutbl_lossy())
                 };
                 self.codegen_place_to_pointer(bx, place, mk_ref)
             }
 
             mir::Rvalue::CopyForDeref(place) => self.codegen_operand(bx, &Operand::Copy(place)),
             mir::Rvalue::AddressOf(mutability, place) => {
-                let mk_ptr = move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| {
-                    Ty::new_ptr(tcx, ty::TypeAndMut { ty, mutbl: mutability })
-                };
+                let mk_ptr =
+                    move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| Ty::new_ptr(tcx, ty, mutability);
                 self.codegen_place_to_pointer(bx, place, mk_ptr)
             }
 
@@ -672,17 +668,23 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let val = match null_op {
                     mir::NullOp::SizeOf => {
                         assert!(bx.cx().type_is_sized(ty));
-                        layout.size.bytes()
+                        let val = layout.size.bytes();
+                        bx.cx().const_usize(val)
                     }
                     mir::NullOp::AlignOf => {
                         assert!(bx.cx().type_is_sized(ty));
-                        layout.align.abi.bytes()
+                        let val = layout.align.abi.bytes();
+                        bx.cx().const_usize(val)
                     }
                     mir::NullOp::OffsetOf(fields) => {
-                        layout.offset_of_subfield(bx.cx(), fields.iter()).bytes()
+                        let val = layout.offset_of_subfield(bx.cx(), fields.iter()).bytes();
+                        bx.cx().const_usize(val)
+                    }
+                    mir::NullOp::UbChecks => {
+                        let val = bx.tcx().sess.opts.debug_assertions;
+                        bx.cx().const_bool(val)
                     }
                 };
-                let val = bx.cx().const_usize(val);
                 let tcx = self.cx.tcx();
                 OperandRef {
                     val: OperandValue::Immediate(val),
@@ -707,7 +709,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     } else {
                         None
                     };
-                    bx.call(fn_ty, fn_attrs, Some(fn_abi), fn_ptr, &[], None)
+                    bx.call(fn_ty, fn_attrs, Some(fn_abi), fn_ptr, &[], None, Some(instance))
                 } else {
                     bx.get_static(def_id)
                 };

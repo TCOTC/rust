@@ -6,7 +6,7 @@
 
 use crate::borrow::{Borrow, BorrowMut};
 use crate::cmp::Ordering;
-use crate::convert::{Infallible, TryFrom};
+use crate::convert::Infallible;
 use crate::error::Error;
 use crate::fmt;
 use crate::hash::{self, Hash};
@@ -360,6 +360,7 @@ where
     }
 }
 
+/// Implements comparison of arrays [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: PartialOrd, const N: usize> PartialOrd for [T; N] {
     #[inline]
@@ -511,7 +512,7 @@ impl<T, const N: usize> [T; N] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(array_try_map)]
+    /// #![feature(array_try_map, generic_nonzero)]
     /// let a = ["1", "2", "3"];
     /// let b = a.try_map(|v| v.parse::<u32>()).unwrap().map(|v| v + 1);
     /// assert_eq!(b, [2, 3, 4]);
@@ -520,12 +521,12 @@ impl<T, const N: usize> [T; N] {
     /// let b = a.try_map(|v| v.parse::<u32>());
     /// assert!(b.is_err());
     ///
-    /// use std::num::NonZeroU32;
+    /// use std::num::NonZero;
     /// let z = [1, 2, 0, 3, 4];
-    /// assert_eq!(z.try_map(NonZeroU32::new), None);
+    /// assert_eq!(z.try_map(NonZero::new), None);
     /// let a = [1, 2, 3];
-    /// let b = a.try_map(NonZeroU32::new);
-    /// let c = b.map(|x| x.map(NonZeroU32::get));
+    /// let b = a.try_map(NonZero::new);
+    /// let c = b.map(|x| x.map(NonZero::get));
     /// assert_eq!(c, Some(a));
     /// ```
     #[unstable(feature = "array_try_map", issue = "79711")]
@@ -576,7 +577,7 @@ impl<T, const N: usize> [T; N] {
     /// // We can still access the original array: it has not been moved.
     /// assert_eq!(strings.len(), 3);
     /// ```
-    #[stable(feature = "array_methods", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "array_methods", since = "1.77.0")]
     pub fn each_ref(&self) -> [&T; N] {
         from_trusted_iterator(self.iter())
     }
@@ -595,7 +596,7 @@ impl<T, const N: usize> [T; N] {
     /// assert_eq!(float_refs, [&mut 0.0, &mut 2.7, &mut -1.0]);
     /// assert_eq!(floats, [0.0, 2.7, -1.0]);
     /// ```
-    #[stable(feature = "array_methods", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "array_methods", since = "1.77.0")]
     pub fn each_mut(&mut self) -> [&mut T; N] {
         from_trusted_iterator(self.iter_mut())
     }

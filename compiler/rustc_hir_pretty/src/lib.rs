@@ -2,8 +2,6 @@
 //! the definitions in this file have equivalents in `rustc_ast_pretty`.
 
 #![recursion_limit = "256"]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 
 use rustc_ast as ast;
 use rustc_ast::util::parser::{self, AssocOp, Fixity};
@@ -115,7 +113,7 @@ impl<'a> State<'a> {
             // `hir_map` to reconstruct their full structure for pretty
             // printing.
             Node::Ctor(..) => panic!("cannot print isolated Ctor"),
-            Node::Local(a) => self.print_local_decl(a),
+            Node::LetStmt(a) => self.print_local_decl(a),
             Node::Crate(..) => panic!("cannot print Crate"),
             Node::WhereBoundPredicate(pred) => {
                 self.print_formal_generic_params(pred.bound_generic_params);
@@ -123,6 +121,7 @@ impl<'a> State<'a> {
                 self.print_bounds(":", pred.bounds);
             }
             Node::ArrayLenInfer(_) => self.word("_"),
+            Node::Synthetic => unreachable!(),
             Node::Err(_) => self.word("/*ERROR*/"),
         }
     }
@@ -330,6 +329,7 @@ impl<'a> State<'a> {
             hir::TyKind::Infer | hir::TyKind::InferDelegation(..) => {
                 self.word("_");
             }
+            hir::TyKind::AnonAdt(..) => self.word("/* anonymous adt */"),
         }
         self.end()
     }
@@ -730,26 +730,30 @@ impl<'a> State<'a> {
             }
             hir::VariantData::Struct { .. } => {
                 self.print_where_clause(generics);
-                self.nbsp();
-                self.bopen();
-                self.hardbreak_if_not_bol();
-
-                for field in struct_def.fields() {
-                    self.hardbreak_if_not_bol();
-                    self.maybe_print_comment(field.span.lo());
-                    self.print_outer_attributes(self.attrs(field.hir_id));
-                    self.print_ident(field.ident);
-                    self.word_nbsp(":");
-                    self.print_type(field.ty);
-                    self.word(",");
-                }
-
-                self.bclose(span)
+                self.print_variant_struct(span, struct_def.fields())
             }
         }
     }
 
-    fn print_variant(&mut self, v: &hir::Variant<'_>) {
+    fn print_variant_struct(&mut self, span: rustc_span::Span, fields: &[hir::FieldDef<'_>]) {
+        self.nbsp();
+        self.bopen();
+        self.hardbreak_if_not_bol();
+
+        for field in fields {
+            self.hardbreak_if_not_bol();
+            self.maybe_print_comment(field.span.lo());
+            self.print_outer_attributes(self.attrs(field.hir_id));
+            self.print_ident(field.ident);
+            self.word_nbsp(":");
+            self.print_type(field.ty);
+            self.word(",");
+        }
+
+        self.bclose(span)
+    }
+
+    pub fn print_variant(&mut self, v: &hir::Variant<'_>) {
         self.head("");
         let generics = hir::Generics::empty();
         self.print_struct(&v.data, generics, v.ident.name, v.span, false);
@@ -860,7 +864,7 @@ impl<'a> State<'a> {
     fn print_stmt(&mut self, st: &hir::Stmt<'_>) {
         self.maybe_print_comment(st.span.lo());
         match st.kind {
-            hir::StmtKind::Local(loc) => {
+            hir::StmtKind::Let(loc) => {
                 self.print_local(loc.init, loc.els, |this| this.print_local_decl(loc));
             }
             hir::StmtKind::Item(item) => self.ann.nested(self, Nested::Item(item)),
@@ -1262,6 +1266,10 @@ impl<'a> State<'a> {
                     s.space();
                     s.print_qpath(path, true);
                 }
+                hir::InlineAsmOperand::Label { block } => {
+                    s.head("label");
+                    s.print_block(block);
+                }
             },
             AsmArg::Options(opts) => {
                 s.word("options");
@@ -1379,7 +1387,7 @@ impl<'a> State<'a> {
                 // Print `}`:
                 self.bclose_maybe_open(expr.span, true);
             }
-            hir::ExprKind::Let(&hir::Let { pat, ty, init, .. }) => {
+            hir::ExprKind::Let(&hir::LetExpr { pat, ty, init, .. }) => {
                 self.print_let(pat, ty, init);
             }
             hir::ExprKind::If(test, blk, elseopt) => {
@@ -1536,7 +1544,7 @@ impl<'a> State<'a> {
         self.end()
     }
 
-    fn print_local_decl(&mut self, loc: &hir::Local<'_>) {
+    fn print_local_decl(&mut self, loc: &hir::LetStmt<'_>) {
         self.print_pat(loc.pat);
         if let Some(ty) = loc.ty {
             self.word_space(":");
@@ -1713,11 +1721,14 @@ impl<'a> State<'a> {
             PatKind::Wild => self.word("_"),
             PatKind::Never => self.word("!"),
             PatKind::Binding(BindingAnnotation(by_ref, mutbl), _, ident, sub) => {
-                if by_ref == ByRef::Yes {
-                    self.word_nbsp("ref");
-                }
                 if mutbl.is_mut() {
                     self.word_nbsp("mut");
+                }
+                if let ByRef::Yes(rmutbl) = by_ref {
+                    self.word_nbsp("ref");
+                    if rmutbl.is_mut() {
+                        self.word_nbsp("mut");
+                    }
                 }
                 self.print_ident(ident);
                 if let Some(p) = sub {
@@ -1799,6 +1810,12 @@ impl<'a> State<'a> {
                 if is_range_inner {
                     self.pclose();
                 }
+            }
+            PatKind::Deref(inner) => {
+                self.word("deref!");
+                self.popen();
+                self.print_pat(inner);
+                self.pclose();
             }
             PatKind::Ref(inner, mutbl) => {
                 let is_range_inner = matches!(inner.kind, PatKind::Range(..));
@@ -2299,7 +2316,7 @@ fn expr_requires_semi_to_be_stmt(e: &hir::Expr<'_>) -> bool {
 /// seen the semicolon, and thus don't need another.
 fn stmt_ends_with_semi(stmt: &hir::StmtKind<'_>) -> bool {
     match *stmt {
-        hir::StmtKind::Local(_) => true,
+        hir::StmtKind::Let(_) => true,
         hir::StmtKind::Item(_) => false,
         hir::StmtKind::Expr(e) => expr_requires_semi_to_be_stmt(e),
         hir::StmtKind::Semi(..) => false,

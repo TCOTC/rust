@@ -22,12 +22,19 @@ expand_collapse_debuginfo_illegal =
 expand_count_repetition_misplaced =
     `count` can not be placed inside the inner-most repetition
 
+expand_custom_attribute_panicked =
+    custom attribute panicked
+    .help = message: {$message}
+
 expand_duplicate_matcher_binding = duplicate matcher binding
     .label = duplicate binding
     .label2 = previous binding
 
 expand_expected_comma_in_list =
     expected token: `,`
+
+expand_expected_paren_or_brace =
+    expected `(` or `{"{"}`, found `{$token}`
 
 expand_explain_doc_comment_inner =
     inner doc comments expand to `#![doc = "..."]`, which is what this macro attempted to match
@@ -61,6 +68,11 @@ expand_invalid_cfg_multiple_predicates = multiple `cfg` predicates are specified
 expand_invalid_cfg_no_parens = `cfg` is not followed by parentheses
 expand_invalid_cfg_no_predicate = `cfg` predicate is not specified
 expand_invalid_cfg_predicate_literal = `cfg` predicate key cannot be a literal
+
+expand_invalid_fragment_specifier =
+    invalid fragment specifier `{$fragment}`
+    .help = {$help}
+
 expand_macro_body_stability =
     macros cannot have body stability attributes
     .label = invalid body stability attribute
@@ -109,6 +121,10 @@ expand_only_one_argument =
 
 expand_only_one_word =
     must only be one word
+
+expand_proc_macro_derive_panicked =
+    proc-macro derive panicked
+    .help = message: {$message}
 
 expand_proc_macro_derive_tokens =
     proc-macro derive produced unparsable tokens

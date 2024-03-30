@@ -5,7 +5,7 @@ use crate::errors::CannotDetermineMacroResolution;
 use crate::errors::{self, AddAsNonDerive, CannotFindIdentInThisScope};
 use crate::errors::{MacroExpectedFound, RemoveSurroundingDerive};
 use crate::Namespace::*;
-use crate::{BuiltinMacroState, Determinacy, MacroData};
+use crate::{BuiltinMacroState, Determinacy, MacroData, Used};
 use crate::{DeriveData, Finalize, ParentScope, ResolutionError, Resolver, ScopeSet};
 use crate::{ModuleKind, ModuleOrUniformRoot, NameBinding, PathResult, Segment, ToNameBinding};
 use rustc_ast::expand::StrippedCfgItem;
@@ -19,7 +19,7 @@ use rustc_expand::base::{Annotatable, DeriveResolutions, Indeterminate, Resolver
 use rustc_expand::base::{SyntaxExtension, SyntaxExtensionKind};
 use rustc_expand::compile_declarative_macro;
 use rustc_expand::expand::{AstFragment, Invocation, InvocationKind, SupportsMacroExpansion};
-use rustc_hir::def::{self, DefKind, NonMacroAttrKind};
+use rustc_hir::def::{self, DefKind, Namespace, NonMacroAttrKind};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_middle::middle::stability;
 use rustc_middle::ty::RegisteredTools;
@@ -27,7 +27,7 @@ use rustc_middle::ty::{TyCtxt, Visibility};
 use rustc_session::lint::builtin::UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES;
 use rustc_session::lint::builtin::{LEGACY_DERIVE_HELPERS, SOFT_UNSTABLE};
 use rustc_session::lint::builtin::{UNUSED_MACROS, UNUSED_MACRO_RULES};
-use rustc_session::lint::BuiltinLintDiagnostics;
+use rustc_session::lint::BuiltinLintDiag;
 use rustc_session::parse::feature_err;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{self, ExpnData, ExpnKind, LocalExpnId};
@@ -431,40 +431,15 @@ impl<'a, 'tcx> ResolverExpand for Resolver<'a, 'tcx> {
         expn_id: LocalExpnId,
         path: &ast::Path,
     ) -> Result<bool, Indeterminate> {
-        let span = path.span;
-        let path = &Segment::from_path(path);
-        let parent_scope = self.invocation_parent_scopes[&expn_id];
+        self.path_accessible(expn_id, path, &[TypeNS, ValueNS, MacroNS])
+    }
 
-        let mut indeterminate = false;
-        for ns in [TypeNS, ValueNS, MacroNS].iter().copied() {
-            match self.maybe_resolve_path(path, Some(ns), &parent_scope) {
-                PathResult::Module(ModuleOrUniformRoot::Module(_)) => return Ok(true),
-                PathResult::NonModule(partial_res) if partial_res.unresolved_segments() == 0 => {
-                    return Ok(true);
-                }
-                PathResult::NonModule(..) |
-                // HACK(Urgau): This shouldn't be necessary
-                PathResult::Failed { is_error_from_last_segment: false, .. } => {
-                    self.dcx()
-                        .emit_err(errors::CfgAccessibleUnsure { span });
-
-                    // If we get a partially resolved NonModule in one namespace, we should get the
-                    // same result in any other namespaces, so we can return early.
-                    return Ok(false);
-                }
-                PathResult::Indeterminate => indeterminate = true,
-                // We can only be sure that a path doesn't exist after having tested all the
-                // possibilities, only at that time we can return false.
-                PathResult::Failed { .. } => {}
-                PathResult::Module(_) => panic!("unexpected path resolution"),
-            }
-        }
-
-        if indeterminate {
-            return Err(Indeterminate);
-        }
-
-        Ok(false)
+    fn macro_accessible(
+        &mut self,
+        expn_id: LocalExpnId,
+        path: &ast::Path,
+    ) -> Result<bool, Indeterminate> {
+        self.path_accessible(expn_id, path, &[MacroNS])
     }
 
     fn get_proc_macro_quoted_span(&self, krate: CrateNum, id: usize) -> Span {
@@ -562,7 +537,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 expected,
                 found: res.descr(),
                 macro_path: &path_str,
-                ..Default::default() // Subdiagnostics default to None
+                remove_surrounding_derive: None,
+                add_as_non_derive: None,
             };
 
             // Suggest moving the macro out of the derive() if the macro isn't Derive
@@ -590,7 +566,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 _ => unreachable!(),
             };
             if soft_custom_inner_attributes_gate {
-                self.tcx.sess.parse_sess.buffer_lint(SOFT_UNSTABLE, path.span, node_id, msg);
+                self.tcx.sess.psess.buffer_lint(SOFT_UNSTABLE, path.span, node_id, msg);
             } else {
                 feature_err(&self.tcx.sess, sym::custom_inner_attributes, path.span, msg).emit();
             }
@@ -601,7 +577,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             && path.segments[0].ident.name == sym::diagnostic
             && path.segments[1].ident.name != sym::on_unimplemented
         {
-            self.tcx.sess.parse_sess.buffer_lint(
+            self.tcx.sess.psess.buffer_lint(
                 UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES,
                 path.segments[1].span(),
                 node_id,
@@ -794,7 +770,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             ) {
                 Ok(binding) => {
                     let initial_res = initial_binding.map(|initial_binding| {
-                        self.record_use(ident, initial_binding, false);
+                        self.record_use(ident, initial_binding, Used::Other);
                         initial_binding.res()
                     });
                     let res = binding.res();
@@ -810,7 +786,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             node_id,
                             ident.span,
                             "derive helper attribute is used before it is introduced",
-                            BuiltinLintDiagnostics::LegacyDeriveHelpers(binding.span),
+                            BuiltinLintDiag::LegacyDeriveHelpers(binding.span),
                         );
                     }
                 }
@@ -958,5 +934,47 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
 
         let ItemKind::MacroDef(def) = &item.kind else { unreachable!() };
         MacroData { ext: Lrc::new(ext), rule_spans, macro_rules: def.macro_rules }
+    }
+
+    fn path_accessible(
+        &mut self,
+        expn_id: LocalExpnId,
+        path: &ast::Path,
+        namespaces: &[Namespace],
+    ) -> Result<bool, Indeterminate> {
+        let span = path.span;
+        let path = &Segment::from_path(path);
+        let parent_scope = self.invocation_parent_scopes[&expn_id];
+
+        let mut indeterminate = false;
+        for ns in namespaces {
+            match self.maybe_resolve_path(path, Some(*ns), &parent_scope) {
+                PathResult::Module(ModuleOrUniformRoot::Module(_)) => return Ok(true),
+                PathResult::NonModule(partial_res) if partial_res.unresolved_segments() == 0 => {
+                    return Ok(true);
+                }
+                PathResult::NonModule(..) |
+                // HACK(Urgau): This shouldn't be necessary
+                PathResult::Failed { is_error_from_last_segment: false, .. } => {
+                    self.dcx()
+                        .emit_err(errors::CfgAccessibleUnsure { span });
+
+                    // If we get a partially resolved NonModule in one namespace, we should get the
+                    // same result in any other namespaces, so we can return early.
+                    return Ok(false);
+                }
+                PathResult::Indeterminate => indeterminate = true,
+                // We can only be sure that a path doesn't exist after having tested all the
+                // possibilities, only at that time we can return false.
+                PathResult::Failed { .. } => {}
+                PathResult::Module(_) => panic!("unexpected path resolution"),
+            }
+        }
+
+        if indeterminate {
+            return Err(Indeterminate);
+        }
+
+        Ok(false)
     }
 }

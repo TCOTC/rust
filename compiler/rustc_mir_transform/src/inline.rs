@@ -2,6 +2,7 @@
 use crate::deref_separator::deref_finder;
 use rustc_attr::InlineAttr;
 use rustc_const_eval::transform::validate::validate_types;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::BitSet;
 use rustc_index::Idx;
@@ -12,6 +13,7 @@ use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, Instance, InstanceDef, ParamEnv, Ty, TyCtxt};
 use rustc_session::config::OptLevel;
 use rustc_span::source_map::Spanned;
+use rustc_span::sym;
 use rustc_target::abi::FieldIdx;
 use rustc_target::spec::abi::Abi;
 
@@ -163,11 +165,18 @@ impl<'tcx> Inliner<'tcx> {
         caller_body: &mut Body<'tcx>,
         callsite: &CallSite<'tcx>,
     ) -> Result<std::ops::Range<BasicBlock>, &'static str> {
-        self.check_mir_is_available(caller_body, &callsite.callee)?;
+        self.check_mir_is_available(caller_body, callsite.callee)?;
 
         let callee_attrs = self.tcx.codegen_fn_attrs(callsite.callee.def_id());
         let cross_crate_inlinable = self.tcx.cross_crate_inlinable(callsite.callee.def_id());
         self.check_codegen_attributes(callsite, callee_attrs, cross_crate_inlinable)?;
+
+        // Intrinsic fallback bodies are automatically made cross-crate inlineable,
+        // but at this stage we don't know whether codegen knows the intrinsic,
+        // so just conservatively don't inline it.
+        if self.tcx.has_attr(callsite.callee.def_id(), sym::rustc_intrinsic) {
+            return Err("Callee is an intrinsic, do not inline fallback bodies");
+        }
 
         let terminator = caller_body[callsite.block].terminator.as_ref().unwrap();
         let TerminatorKind::Call { args, destination, .. } = &terminator.kind else { bug!() };
@@ -204,6 +213,7 @@ impl<'tcx> Inliner<'tcx> {
             MirPhase::Runtime(RuntimePhase::Optimized),
             self.param_env,
             &callee_body,
+            &caller_body,
         )
         .is_empty()
         {
@@ -288,7 +298,7 @@ impl<'tcx> Inliner<'tcx> {
     fn check_mir_is_available(
         &self,
         caller_body: &Body<'tcx>,
-        callee: &Instance<'tcx>,
+        callee: Instance<'tcx>,
     ) -> Result<(), &'static str> {
         let caller_def_id = caller_body.source.def_id();
         let callee_def_id = callee.def_id();
@@ -344,7 +354,7 @@ impl<'tcx> Inliner<'tcx> {
 
             // If we know for sure that the function we're calling will itself try to
             // call us, then we avoid inlining that function.
-            if self.tcx.mir_callgraph_reachable((*callee, caller_def_id.expect_local())) {
+            if self.tcx.mir_callgraph_reachable((callee, caller_def_id.expect_local())) {
                 return Err("caller might be reachable from callee (query cycle avoidance)");
             }
 
@@ -384,6 +394,17 @@ impl<'tcx> Inliner<'tcx> {
                 }
 
                 let fn_sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args);
+
+                // Additionally, check that the body that we're inlining actually agrees
+                // with the ABI of the trait that the item comes from.
+                if let InstanceDef::Item(instance_def_id) = callee.def
+                    && self.tcx.def_kind(instance_def_id) == DefKind::AssocFn
+                    && let instance_fn_sig = self.tcx.fn_sig(instance_def_id).skip_binder()
+                    && instance_fn_sig.abi() != fn_sig.abi()
+                {
+                    return None;
+                }
+
                 let source_info = SourceInfo { span: fn_span, ..terminator.source_info };
 
                 return Some(CallSite { callee, fn_sig, block: bb, source_info });
@@ -401,6 +422,10 @@ impl<'tcx> Inliner<'tcx> {
         callee_attrs: &CodegenFnAttrs,
         cross_crate_inlinable: bool,
     ) -> Result<(), &'static str> {
+        if self.tcx.has_attr(callsite.callee.def_id(), sym::rustc_no_mir_inline) {
+            return Err("#[rustc_no_mir_inline]");
+        }
+
         if let InlineAttr::Never = callee_attrs.inline {
             return Err("never inline hint");
         }
@@ -541,7 +566,8 @@ impl<'tcx> Inliner<'tcx> {
         mut callee_body: Body<'tcx>,
     ) {
         let terminator = caller_body[callsite.block].terminator.take().unwrap();
-        let TerminatorKind::Call { args, destination, unwind, target, .. } = terminator.kind else {
+        let TerminatorKind::Call { func, args, destination, unwind, target, .. } = terminator.kind
+        else {
             bug!("unexpected terminator kind {:?}", terminator.kind);
         };
 
@@ -693,6 +719,24 @@ impl<'tcx> Inliner<'tcx> {
                 Const::Val(..) | Const::Unevaluated(..) => true,
             },
         ));
+        // Now that we incorporated the callee's `required_consts`, we can remove the callee from
+        // `mentioned_items` -- but we have to take their `mentioned_items` in return. This does
+        // some extra work here to save the monomorphization collector work later. It helps a lot,
+        // since monomorphization can avoid a lot of work when the "mentioned items" are similar to
+        // the actually used items. By doing this we can entirely avoid visiting the callee!
+        // We need to reconstruct the `required_item` for the callee so that we can find and
+        // remove it.
+        let callee_item = MentionedItem::Fn(func.ty(caller_body, self.tcx));
+        if let Some(idx) =
+            caller_body.mentioned_items.iter().position(|item| item.node == callee_item)
+        {
+            // We found the callee, so remove it and add its items instead.
+            caller_body.mentioned_items.remove(idx);
+            caller_body.mentioned_items.extend(callee_body.mentioned_items);
+        } else {
+            // If we can't find the callee, there's no point in adding its items.
+            // Probably it already got removed by being inlined elsewhere in the same function.
+        }
     }
 
     fn make_call_args(
@@ -1012,8 +1056,8 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
             {
                 bug!("False unwinds should have been removed before inlining")
             }
-            TerminatorKind::InlineAsm { ref mut destination, ref mut unwind, .. } => {
-                if let Some(ref mut tgt) = *destination {
+            TerminatorKind::InlineAsm { ref mut targets, ref mut unwind, .. } => {
+                for tgt in targets.iter_mut() {
                     *tgt = self.map_block(*tgt);
                 }
                 *unwind = self.map_unwind(*unwind);

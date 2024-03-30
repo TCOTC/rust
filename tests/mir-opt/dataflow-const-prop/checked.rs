@@ -1,5 +1,5 @@
-// unit-test: DataflowConstProp
-// compile-flags: -Coverflow-checks=on
+//@ unit-test: DataflowConstProp
+//@ compile-flags: -Coverflow-checks=on
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
 // EMIT_MIR checked.main.DataflowConstProp.diff
@@ -23,7 +23,7 @@ fn main() {
     // CHECK: [[c]] = const 3_i32;
     let c = a + b;
 
-    // CHECK: [[d]] = const _;
+    // CHECK: [[d]] = const core::num::<impl i32>::MAX;
     let d = i32::MAX;
 
     // CHECK: assert(!const true,

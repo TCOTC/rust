@@ -29,7 +29,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     pub(super) fn check_signature_annotation(&mut self, body: &Body<'tcx>) {
         let mir_def_id = body.source.def_id().expect_local();
 
-        if !self.tcx().is_closure_or_coroutine(mir_def_id.to_def_id()) {
+        if !self.tcx().is_closure_like(mir_def_id.to_def_id()) {
             return;
         }
 
@@ -39,8 +39,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         // (e.g., the `_` in the code above) with fresh variables.
         // Then replace the bound items in the fn sig with fresh variables,
         // so that they represent the view from "inside" the closure.
-        let user_provided_sig = self
-            .instantiate_canonical_with_fresh_inference_vars(body.span, &user_provided_poly_sig);
+        let user_provided_sig = self.instantiate_canonical(body.span, &user_provided_poly_sig);
         let mut user_provided_sig = self.infcx.instantiate_binder_with_fresh_vars(
             body.span,
             BoundRegionConversionTime::FnCall,
@@ -88,7 +87,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     self.tcx(),
                     ty::CoroutineArgsParts {
                         parent_args: args.parent_args(),
-                        kind_ty: Ty::from_closure_kind(self.tcx(), args.kind()),
+                        kind_ty: Ty::from_coroutine_closure_kind(self.tcx(), args.kind()),
                         return_ty: user_provided_sig.output(),
                         tupled_upvars_ty,
                         // For async closures, none of these can be annotated, so just fill
@@ -154,8 +153,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             if argument_index + 1 >= body.local_decls.len() {
                 self.tcx()
                     .dcx()
-                    .span_delayed_bug(body.span, "found more normalized_input_ty than local_decls");
-                break;
+                    .span_bug(body.span, "found more normalized_input_ty than local_decls");
             }
 
             // In MIR, argument N is stored in local N+1.

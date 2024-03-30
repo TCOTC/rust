@@ -7,7 +7,7 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{walk_expr, Visitor};
 use rustc_hir::{self as hir};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::ty::{GenericArgKind, Ty, TypeAndMut};
+use rustc_middle::ty::{GenericArgKind, Ty};
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::Ident;
 use rustc_span::{sym, Span, DUMMY_SP};
@@ -199,7 +199,7 @@ impl<'cx, 'others, 'tcx> AttrChecker<'cx, 'others, 'tcx> {
                 false
             },
             rustc_middle::ty::Array(ty, _)
-            | rustc_middle::ty::RawPtr(TypeAndMut { ty, .. })
+            | rustc_middle::ty::RawPtr(ty, _)
             | rustc_middle::ty::Ref(_, ty, _)
             | rustc_middle::ty::Slice(ty) => self.has_sig_drop_attr(*ty),
             _ => false,
@@ -236,7 +236,7 @@ impl<'ap, 'lc, 'others, 'stmt, 'tcx> StmtsChecker<'ap, 'lc, 'others, 'stmt, 'tcx
     fn manage_has_expensive_expr_after_last_attr(&mut self) {
         let has_expensive_stmt = match self.ap.curr_stmt.kind {
             hir::StmtKind::Expr(expr) if is_inexpensive_expr(expr) => false,
-            hir::StmtKind::Local(local)
+            hir::StmtKind::Let(local)
                 if let Some(expr) = local.init
                     && let hir::ExprKind::Path(_) = expr.kind =>
             {
@@ -290,7 +290,7 @@ impl<'ap, 'lc, 'others, 'stmt, 'tcx> Visitor<'tcx> for StmtsChecker<'ap, 'lc, 'o
         };
         let mut ac = AttrChecker::new(self.cx, self.seen_types, self.type_cache);
         if ac.has_sig_drop_attr(self.cx.typeck_results().expr_ty(expr)) {
-            if let hir::StmtKind::Local(local) = self.ap.curr_stmt.kind
+            if let hir::StmtKind::Let(local) = self.ap.curr_stmt.kind
                 && let hir::PatKind::Binding(_, hir_id, ident, _) = local.pat.kind
                 && !self.ap.apas.contains_key(&hir_id)
                 && {
@@ -326,7 +326,7 @@ impl<'ap, 'lc, 'others, 'stmt, 'tcx> Visitor<'tcx> for StmtsChecker<'ap, 'lc, 'o
                     return;
                 };
                 match self.ap.curr_stmt.kind {
-                    hir::StmtKind::Local(local) => {
+                    hir::StmtKind::Let(local) => {
                         if let hir::PatKind::Binding(_, _, ident, _) = local.pat.kind {
                             apa.last_bind_ident = ident;
                         }

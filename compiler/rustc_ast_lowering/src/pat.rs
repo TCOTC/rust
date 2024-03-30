@@ -91,6 +91,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     PatKind::Box(inner) => {
                         break hir::PatKind::Box(self.lower_pat(inner));
                     }
+                    PatKind::Deref(inner) => {
+                        break hir::PatKind::Deref(self.lower_pat(inner));
+                    }
                     PatKind::Ref(inner, mutbl) => {
                         break hir::PatKind::Ref(self.lower_pat(inner), *mutbl);
                     }
@@ -331,7 +334,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             ExprKind::Lit(..)
             | ExprKind::ConstBlock(..)
             | ExprKind::IncludedBytes(..)
-            | ExprKind::Err => {}
+            | ExprKind::Err(_)
+            | ExprKind::Dummy => {}
             ExprKind::Path(..) if allow_paths => {}
             ExprKind::Unary(UnOp::Neg, inner) if matches!(inner.kind, ExprKind::Lit(_)) => {}
             _ => {

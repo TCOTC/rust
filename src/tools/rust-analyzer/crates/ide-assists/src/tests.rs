@@ -1,6 +1,4 @@
 mod generated;
-#[cfg(not(feature = "in-rust-tree"))]
-mod sourcegen;
 
 use expect_test::expect;
 use hir::Semantics;
@@ -474,7 +472,7 @@ pub fn test_some_range(a: int) -> bool {
             &db,
             &cfg,
             AssistResolveStrategy::Single(SingleResolve {
-                assist_id: "SOMETHING_MISMATCHING".to_string(),
+                assist_id: "SOMETHING_MISMATCHING".to_owned(),
                 assist_kind: AssistKind::RefactorExtract,
             }),
             frange,
@@ -520,7 +518,7 @@ pub fn test_some_range(a: int) -> bool {
             &db,
             &cfg,
             AssistResolveStrategy::Single(SingleResolve {
-                assist_id: "extract_variable".to_string(),
+                assist_id: "extract_variable".to_owned(),
                 assist_kind: AssistKind::RefactorExtract,
             }),
             frange,
@@ -687,12 +685,21 @@ pub fn test_some_range(a: int) -> bool {
                                             delete: 59..60,
                                         },
                                         Indel {
-                                            insert: "\n\nfn $0fun_name() -> i32 {\n    5\n}",
+                                            insert: "\n\nfn fun_name() -> i32 {\n    5\n}",
                                             delete: 110..110,
                                         },
                                     ],
                                 },
-                                None,
+                                Some(
+                                    SnippetEdit(
+                                        [
+                                            (
+                                                0,
+                                                124..124,
+                                            ),
+                                        ],
+                                    ),
+                                ),
                             ),
                         },
                         file_system_edits: [],

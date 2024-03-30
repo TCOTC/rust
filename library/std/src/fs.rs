@@ -97,7 +97,7 @@ use crate::time::SystemTime;
 /// have been opened for asynchronous I/O (e.g. by using `FILE_FLAG_OVERLAPPED`).
 ///
 /// [`BufReader`]: io::BufReader
-/// [`BufWriter`]: io::BufReader
+/// [`BufWriter`]: io::BufWriter
 /// [`sync_all`]: File::sync_all
 /// [`write`]: File::write
 /// [`read`]: File::read
@@ -248,10 +248,10 @@ pub struct DirBuilder {
 ///
 /// ```no_run
 /// use std::fs;
-/// use std::net::SocketAddr;
 ///
 /// fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
-///     let foo: SocketAddr = String::from_utf8_lossy(&fs::read("address.txt")?).parse()?;
+///     let data: Vec<u8> = fs::read("image.jpg")?;
+///     assert_eq!(data[0..3], [0xFF, 0xD8, 0xFF]);
 ///     Ok(())
 /// }
 /// ```
@@ -261,7 +261,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
         let mut file = File::open(path)?;
         let size = file.metadata().map(|m| m.len() as usize).ok();
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size.unwrap_or(0)).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        bytes.try_reserve_exact(size.unwrap_or(0))?;
         io::default_read_to_end(&mut file, &mut bytes, size)?;
         Ok(bytes)
     }
@@ -290,11 +290,11 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 ///
 /// ```no_run
 /// use std::fs;
-/// use std::net::SocketAddr;
 /// use std::error::Error;
 ///
 /// fn main() -> Result<(), Box<dyn Error>> {
-///     let foo: SocketAddr = fs::read_to_string("address.txt")?.parse()?;
+///     let message: String = fs::read_to_string("message.txt")?;
+///     println!("{}", message);
 ///     Ok(())
 /// }
 /// ```
@@ -304,7 +304,7 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
         let mut file = File::open(path)?;
         let size = file.metadata().map(|m| m.len() as usize).ok();
         let mut string = String::new();
-        string.try_reserve_exact(size.unwrap_or(0)).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        string.try_reserve_exact(size.unwrap_or(0))?;
         io::default_read_to_string(&mut file, &mut string, size)?;
         Ok(string)
     }
@@ -385,7 +385,7 @@ impl File {
     /// See the [`OpenOptions::open`] function for more details.
     ///
     /// See also [`std::fs::write()`][self::write] for a simple function to
-    /// create a file with a given data.
+    /// create a file with some given data.
     ///
     /// # Examples
     ///
@@ -428,7 +428,7 @@ impl File {
     ///     Ok(())
     /// }
     /// ```
-    #[stable(feature = "file_create_new", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "file_create_new", since = "1.77.0")]
     pub fn create_new<P: AsRef<Path>>(path: P) -> io::Result<File> {
         OpenOptions::new().read(true).write(true).create_new(true).open(path.as_ref())
     }
@@ -656,6 +656,7 @@ impl File {
     ///
     /// Note that this method alters the permissions of the underlying file,
     /// even though it takes `&self` rather than `&mut self`.
+    #[doc(alias = "fchmod", alias = "SetFileInformationByHandle")]
     #[stable(feature = "set_permissions_atomic", since = "1.16.0")]
     pub fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         self.inner.set_permissions(perm.0)
@@ -776,14 +777,14 @@ impl Read for &File {
     // Reserves space in the buffer based on the file size when available.
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         let size = buffer_capacity_required(self);
-        buf.try_reserve_exact(size.unwrap_or(0)).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        buf.try_reserve(size.unwrap_or(0))?;
         io::default_read_to_end(self, buf, size)
     }
 
     // Reserves space in the buffer based on the file size when available.
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
         let size = buffer_capacity_required(self);
-        buf.try_reserve_exact(size.unwrap_or(0)).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        buf.try_reserve(size.unwrap_or(0))?;
         io::default_read_to_string(self, buf, size)
     }
 }
@@ -1035,7 +1036,7 @@ impl OpenOptions {
     /// [`OpenOptions::append`] access must be used.
     ///
     /// See also [`std::fs::write()`][self::write] for a simple function to
-    /// create a file with a given data.
+    /// create a file with some given data.
     ///
     /// # Examples
     ///
@@ -1314,6 +1315,7 @@ impl Metadata {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(alias = "mtime", alias = "ftLastWriteTime")]
     #[stable(feature = "fs_time", since = "1.10.0")]
     pub fn modified(&self) -> io::Result<SystemTime> {
         self.0.modified().map(FromInner::from_inner)
@@ -1349,6 +1351,7 @@ impl Metadata {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(alias = "atime", alias = "ftLastAccessTime")]
     #[stable(feature = "fs_time", since = "1.10.0")]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         self.0.accessed().map(FromInner::from_inner)
@@ -1381,6 +1384,7 @@ impl Metadata {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(alias = "btime", alias = "birthtime", alias = "ftCreationTime")]
     #[stable(feature = "fs_time", since = "1.10.0")]
     pub fn created(&self) -> io::Result<SystemTime> {
         self.0.created().map(FromInner::from_inner)
@@ -1472,11 +1476,10 @@ impl Permissions {
     /// On Unix-based platforms this checks if *any* of the owner, group or others
     /// write permission bits are set. It does not check if the current
     /// user is in the file's assigned group. It also does not check ACLs.
-    /// Therefore even if this returns true you may not be able to write to the
-    /// file, and vice versa. The [`PermissionsExt`] trait gives direct access
-    /// to the permission bits but also does not read ACLs. If you need to
-    /// accurately know whether or not a file is writable use the `access()`
-    /// function from libc.
+    /// Therefore the return value of this function cannot be relied upon
+    /// to predict whether attempts to read or write the file will actually succeed.
+    /// The [`PermissionsExt`] trait gives direct access to the permission bits but
+    /// also does not read ACLs.
     ///
     /// [`PermissionsExt`]: crate::os::unix::fs::PermissionsExt
     ///
@@ -1879,6 +1882,7 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "rm", alias = "unlink", alias = "DeleteFile")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs_imp::unlink(path.as_ref())
@@ -1917,6 +1921,7 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "stat")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     fs_imp::stat(path.as_ref()).map(Metadata)
@@ -1951,6 +1956,7 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "lstat")]
 #[stable(feature = "symlink_metadata", since = "1.1.0")]
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     fs_imp::lstat(path.as_ref()).map(Metadata)
@@ -1994,6 +2000,7 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "mv", alias = "MoveFile", alias = "MoveFileEx")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     fs_imp::rename(from.as_ref(), to.as_ref())
@@ -2052,6 +2059,9 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "cp")]
+#[doc(alias = "CopyFile", alias = "CopyFileEx")]
+#[doc(alias = "fclonefileat", alias = "fcopyfile")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     fs_imp::copy(from.as_ref(), to.as_ref())
@@ -2096,6 +2106,7 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "CreateHardLink", alias = "linkat")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     fs_imp::link(original.as_ref(), link.as_ref())
@@ -2245,7 +2256,7 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 ///     Ok(())
 /// }
 /// ```
-#[doc(alias = "mkdir")]
+#[doc(alias = "mkdir", alias = "CreateDirectory")]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "fs_create_dir")]
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -2326,7 +2337,7 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///     Ok(())
 /// }
 /// ```
-#[doc(alias = "rmdir")]
+#[doc(alias = "rmdir", alias = "RemoveDirectory")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs_imp::rmdir(path.as_ref())
@@ -2449,6 +2460,7 @@ pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "ls", alias = "opendir", alias = "FindFirstFile", alias = "FindNextFile")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     fs_imp::readdir(path.as_ref()).map(ReadDir)
@@ -2484,6 +2496,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
 ///     Ok(())
 /// }
 /// ```
+#[doc(alias = "chmod", alias = "SetFileAttributes")]
 #[stable(feature = "set_permissions", since = "1.1.0")]
 pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result<()> {
     fs_imp::set_perm(path.as_ref(), perm.0)

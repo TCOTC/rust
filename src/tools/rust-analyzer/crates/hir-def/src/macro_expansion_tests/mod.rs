@@ -58,6 +58,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
             name: "identity_when_valid".into(),
             kind: ProcMacroKind::Attr,
             expander: sync::Arc::new(IdentityWhenValidProcMacroExpander),
+            disabled: false,
         },
     )];
     let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
@@ -224,7 +225,7 @@ fn reindent(indent: IndentLevel, pp: String) -> String {
         return pp;
     }
     let mut lines = pp.split_inclusive('\n');
-    let mut res = lines.next().unwrap().to_string();
+    let mut res = lines.next().unwrap().to_owned();
     for line in lines {
         if line.trim().is_empty() {
             res.push_str(line)

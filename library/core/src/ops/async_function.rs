@@ -8,17 +8,11 @@ use crate::marker::Tuple;
 #[rustc_paren_sugar]
 #[fundamental]
 #[must_use = "async closures are lazy and do nothing unless called"]
-#[cfg_attr(not(bootstrap), lang = "async_fn")]
+#[lang = "async_fn"]
 pub trait AsyncFn<Args: Tuple>: AsyncFnMut<Args> {
-    /// Future returned by [`AsyncFn::async_call`].
-    #[unstable(feature = "async_fn_traits", issue = "none")]
-    type CallFuture<'a>: Future<Output = Self::Output>
-    where
-        Self: 'a;
-
     /// Call the [`AsyncFn`], returning a future which may borrow from the called closure.
     #[unstable(feature = "async_fn_traits", issue = "none")]
-    extern "rust-call" fn async_call(&self, args: Args) -> Self::CallFuture<'_>;
+    extern "rust-call" fn async_call(&self, args: Args) -> Self::CallRefFuture<'_>;
 }
 
 /// An async-aware version of the [`FnMut`](crate::ops::FnMut) trait.
@@ -28,17 +22,17 @@ pub trait AsyncFn<Args: Tuple>: AsyncFnMut<Args> {
 #[rustc_paren_sugar]
 #[fundamental]
 #[must_use = "async closures are lazy and do nothing unless called"]
-#[cfg_attr(not(bootstrap), lang = "async_fn_mut")]
+#[lang = "async_fn_mut"]
 pub trait AsyncFnMut<Args: Tuple>: AsyncFnOnce<Args> {
-    /// Future returned by [`AsyncFnMut::async_call_mut`].
+    /// Future returned by [`AsyncFnMut::async_call_mut`] and [`AsyncFn::async_call`].
     #[unstable(feature = "async_fn_traits", issue = "none")]
-    type CallMutFuture<'a>: Future<Output = Self::Output>
+    type CallRefFuture<'a>: Future<Output = Self::Output>
     where
         Self: 'a;
 
     /// Call the [`AsyncFnMut`], returning a future which may borrow from the called closure.
     #[unstable(feature = "async_fn_traits", issue = "none")]
-    extern "rust-call" fn async_call_mut(&mut self, args: Args) -> Self::CallMutFuture<'_>;
+    extern "rust-call" fn async_call_mut(&mut self, args: Args) -> Self::CallRefFuture<'_>;
 }
 
 /// An async-aware version of the [`FnOnce`](crate::ops::FnOnce) trait.
@@ -48,7 +42,7 @@ pub trait AsyncFnMut<Args: Tuple>: AsyncFnOnce<Args> {
 #[rustc_paren_sugar]
 #[fundamental]
 #[must_use = "async closures are lazy and do nothing unless called"]
-#[cfg_attr(not(bootstrap), lang = "async_fn_once")]
+#[lang = "async_fn_once"]
 pub trait AsyncFnOnce<Args: Tuple> {
     /// Future returned by [`AsyncFnOnce::async_call_once`].
     #[unstable(feature = "async_fn_traits", issue = "none")]
@@ -65,44 +59,65 @@ pub trait AsyncFnOnce<Args: Tuple> {
 
 mod impls {
     use super::{AsyncFn, AsyncFnMut, AsyncFnOnce};
-    use crate::future::Future;
     use crate::marker::Tuple;
 
     #[unstable(feature = "async_fn_traits", issue = "none")]
-    impl<F: Fn<A>, A: Tuple> AsyncFn<A> for F
+    impl<A: Tuple, F: ?Sized> AsyncFn<A> for &F
     where
-        <F as FnOnce<A>>::Output: Future,
+        F: AsyncFn<A>,
     {
-        type CallFuture<'a> = <F as FnOnce<A>>::Output where Self: 'a;
-
-        extern "rust-call" fn async_call(&self, args: A) -> Self::CallFuture<'_> {
-            self.call(args)
+        extern "rust-call" fn async_call(&self, args: A) -> Self::CallRefFuture<'_> {
+            F::async_call(*self, args)
         }
     }
 
     #[unstable(feature = "async_fn_traits", issue = "none")]
-    impl<F: FnMut<A>, A: Tuple> AsyncFnMut<A> for F
+    impl<A: Tuple, F: ?Sized> AsyncFnMut<A> for &F
     where
-        <F as FnOnce<A>>::Output: Future,
+        F: AsyncFn<A>,
     {
-        type CallMutFuture<'a> = <F as FnOnce<A>>::Output where Self: 'a;
+        type CallRefFuture<'a> = F::CallRefFuture<'a> where Self: 'a;
 
-        extern "rust-call" fn async_call_mut(&mut self, args: A) -> Self::CallMutFuture<'_> {
-            self.call_mut(args)
+        extern "rust-call" fn async_call_mut(&mut self, args: A) -> Self::CallRefFuture<'_> {
+            F::async_call(*self, args)
         }
     }
 
     #[unstable(feature = "async_fn_traits", issue = "none")]
-    impl<F: FnOnce<A>, A: Tuple> AsyncFnOnce<A> for F
+    impl<'a, A: Tuple, F: ?Sized> AsyncFnOnce<A> for &'a F
     where
-        <F as FnOnce<A>>::Output: Future,
+        F: AsyncFn<A>,
     {
-        type CallOnceFuture = <F as FnOnce<A>>::Output;
-
-        type Output = <<F as FnOnce<A>>::Output as Future>::Output;
+        type Output = F::Output;
+        type CallOnceFuture = F::CallRefFuture<'a>;
 
         extern "rust-call" fn async_call_once(self, args: A) -> Self::CallOnceFuture {
-            self.call_once(args)
+            F::async_call(self, args)
+        }
+    }
+
+    #[unstable(feature = "async_fn_traits", issue = "none")]
+    impl<A: Tuple, F: ?Sized> AsyncFnMut<A> for &mut F
+    where
+        F: AsyncFnMut<A>,
+    {
+        type CallRefFuture<'a> = F::CallRefFuture<'a> where Self: 'a;
+
+        extern "rust-call" fn async_call_mut(&mut self, args: A) -> Self::CallRefFuture<'_> {
+            F::async_call_mut(*self, args)
+        }
+    }
+
+    #[unstable(feature = "async_fn_traits", issue = "none")]
+    impl<'a, A: Tuple, F: ?Sized> AsyncFnOnce<A> for &'a mut F
+    where
+        F: AsyncFnMut<A>,
+    {
+        type Output = F::Output;
+        type CallOnceFuture = F::CallRefFuture<'a>;
+
+        extern "rust-call" fn async_call_once(self, args: A) -> Self::CallOnceFuture {
+            F::async_call_mut(self, args)
         }
     }
 }
@@ -117,7 +132,7 @@ mod internal_implementation_detail {
     /// and thus either `?0` or `i8`/`i16`/`i32` (see docs for `ClosureKind`
     /// for an explanation of that). The `GoalKind` is also the same type, but
     /// representing the kind of the trait that the closure is being called with.
-    #[cfg_attr(not(bootstrap), lang = "async_fn_kind_helper")]
+    #[lang = "async_fn_kind_helper"]
     trait AsyncFnKindHelper<GoalKind> {
         // Projects a set of closure inputs (arguments), a region, and a set of upvars
         // (by move and by ref) to the upvars that we expect the coroutine to have

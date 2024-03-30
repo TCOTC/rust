@@ -18,10 +18,12 @@ pub(super) fn check<'tcx>(
     from_ty_adjusted: bool,
     to_ty: Ty<'tcx>,
     arg: &'tcx Expr<'_>,
+    const_context: bool,
 ) -> bool {
     use CastKind::{AddrPtrCast, ArrayPtrCast, FnPtrAddrCast, FnPtrPtrCast, PtrAddrCast, PtrPtrCast};
     let mut app = Applicability::MachineApplicable;
     let mut sugg = match check_cast(cx, e, from_ty, to_ty) {
+        Some(FnPtrAddrCast | PtrAddrCast) if const_context => return false,
         Some(PtrPtrCast | AddrPtrCast | ArrayPtrCast | FnPtrPtrCast | FnPtrAddrCast) => {
             Sugg::hir_with_context(cx, arg, e.span.ctxt(), "..", &mut app)
                 .as_ty(to_ty.to_string())
@@ -41,7 +43,7 @@ pub(super) fn check<'tcx>(
         _ => return false,
     };
 
-    if let Node::Expr(parent) = cx.tcx.hir().get_parent(e.hir_id)
+    if let Node::Expr(parent) = cx.tcx.parent_hir_node(e.hir_id)
         && parent.precedence().order() > ExprPrecedence::Cast.order()
     {
         sugg = format!("({sugg})");

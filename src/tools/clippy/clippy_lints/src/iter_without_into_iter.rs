@@ -216,8 +216,8 @@ impl {self_ty_without_ref} {{
     fn check_impl_item(&mut self, cx: &LateContext<'_>, item: &rustc_hir::ImplItem<'_>) {
         let item_did = item.owner_id.to_def_id();
         let (borrow_prefix, expected_implicit_self) = match item.ident.name {
-            sym::iter => ("&", ImplicitSelfKind::ImmRef),
-            sym::iter_mut => ("&mut ", ImplicitSelfKind::MutRef),
+            sym::iter => ("&", ImplicitSelfKind::RefImm),
+            sym::iter_mut => ("&mut ", ImplicitSelfKind::RefMut),
             _ => return,
         };
 
@@ -269,7 +269,7 @@ impl {self_ty_without_ref} {{
                     // }
                     let span_behind_impl = cx
                         .tcx
-                        .def_span(cx.tcx.hir().parent_id(item.hir_id()).owner.def_id)
+                        .def_span(cx.tcx.parent_hir_id(item.hir_id()).owner.def_id)
                         .shrink_to_lo();
 
                     let sugg = format!(

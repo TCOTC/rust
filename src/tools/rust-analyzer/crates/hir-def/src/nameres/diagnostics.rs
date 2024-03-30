@@ -1,5 +1,7 @@
 //! Diagnostics emitted during DefMap construction.
 
+use std::ops::Not;
+
 use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{attrs::AttrId, ErasedAstId, MacroCallKind};
@@ -16,27 +18,16 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum DefDiagnosticKind {
     UnresolvedModule { ast: AstId<ast::Module>, candidates: Box<[String]> },
-
     UnresolvedExternCrate { ast: AstId<ast::ExternCrate> },
-
     UnresolvedImport { id: ItemTreeId<item_tree::Use>, index: Idx<ast::UseTree> },
-
     UnconfiguredCode { ast: ErasedAstId, cfg: CfgExpr, opts: CfgOptions },
-
     UnresolvedProcMacro { ast: MacroCallKind, krate: CrateId },
-
     UnresolvedMacroCall { ast: MacroCallKind, path: ModPath },
-
     MacroError { ast: MacroCallKind, message: String },
-
     MacroExpansionParseError { ast: MacroCallKind, errors: Box<[SyntaxError]> },
-
     UnimplementedBuiltinMacro { ast: AstId<ast::Macro> },
-
     InvalidDeriveTarget { ast: AstId<ast::Item>, id: usize },
-
     MalformedDerive { ast: AstId<ast::Adt>, id: usize },
-
     MacroDefError { ast: AstId<ast::Macro>, message: String },
 }
 
@@ -45,11 +36,12 @@ pub struct DefDiagnostics(Option<triomphe::Arc<Box<[DefDiagnostic]>>>);
 
 impl DefDiagnostics {
     pub fn new(diagnostics: Vec<DefDiagnostic>) -> Self {
-        Self(if diagnostics.is_empty() {
-            None
-        } else {
-            Some(triomphe::Arc::new(diagnostics.into_boxed_slice()))
-        })
+        Self(
+            diagnostics
+                .is_empty()
+                .not()
+                .then(|| triomphe::Arc::new(diagnostics.into_boxed_slice())),
+        )
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &DefDiagnostic> {
@@ -103,6 +95,9 @@ impl DefDiagnostic {
     }
 
     // FIXME: Whats the difference between this and unresolved_macro_call
+    // FIXME: This is used for a lot of things, unresolved proc macros, disabled proc macros, etc
+    // yet the diagnostic handler in ide-diagnostics has to figure out what happened because this
+    // struct loses all that information!
     pub(crate) fn unresolved_proc_macro(
         container: LocalModuleId,
         ast: MacroCallKind,
@@ -122,14 +117,11 @@ impl DefDiagnostic {
     pub(crate) fn macro_expansion_parse_error(
         container: LocalModuleId,
         ast: MacroCallKind,
-        errors: &[SyntaxError],
+        errors: Box<[SyntaxError]>,
     ) -> Self {
         Self {
             in_module: container,
-            kind: DefDiagnosticKind::MacroExpansionParseError {
-                ast,
-                errors: errors.to_vec().into_boxed_slice(),
-            },
+            kind: DefDiagnosticKind::MacroExpansionParseError { ast, errors },
         }
     }
 

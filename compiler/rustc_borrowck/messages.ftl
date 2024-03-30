@@ -16,6 +16,9 @@ borrowck_borrow_due_to_use_closure =
 borrowck_borrow_due_to_use_coroutine =
     borrow occurs due to use in coroutine
 
+borrowck_calling_operator_moves =
+    calling this operator moves the value
+
 borrowck_calling_operator_moves_lhs =
     calling this operator moves the left-hand side
 
@@ -129,6 +132,12 @@ borrowck_moved_due_to_usage_in_operator =
         *[false] operator
     }
 
+borrowck_opaque_type_lifetime_mismatch =
+    opaque type used twice with different lifetimes
+    .label = lifetime `{$arg}` used here
+    .prev_lifetime_label = lifetime `{$prev}` previously used here
+    .note = if all non-lifetime generic parameters are the same, but the lifetime parameters differ, it is not possible to differentiate the opaque types
+
 borrowck_opaque_type_non_generic_param =
     expected generic {$kind} parameter, found `{$ty}`
     .label = {STREQ($ty, "'static") ->
@@ -163,7 +172,13 @@ borrowck_returned_lifetime_wrong =
 borrowck_returned_ref_escaped =
     returns a reference to a captured variable which escapes the closure body
 
-borrowck_simd_shuffle_last_const = last argument of `simd_shuffle` is required to be a `const` item
+borrowck_simd_intrinsic_arg_const =
+    {$arg ->
+        [1] 1st
+        [2] 2nd
+        [3] 3rd
+        *[other] {$arg}th
+    } argument of `{$intrinsic}` is required to be a `const` item
 
 borrowck_suggest_create_freash_reborrow =
     consider reborrowing the `Pin` instead of moving it

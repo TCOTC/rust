@@ -13,7 +13,6 @@ use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
 use crate::core::config::{Config, TargetSelection};
 use crate::utils::helpers::t;
 use crate::utils::tarball::GeneratedTarball;
-use crate::INTERNER;
 use crate::{Compiler, Kind};
 
 #[cfg(target_os = "illumos")]
@@ -24,7 +23,7 @@ const SHELL: &str = "sh";
 // We have to run a few shell scripts, which choke quite a bit on both `\`
 // characters and on `C:\` paths, so normalize both of them away.
 fn sanitize_sh(path: &Path) -> String {
-    let path = path.to_str().unwrap().replace("\\", "/");
+    let path = path.to_str().unwrap().replace('\\', "/");
     return change_drive(unc_to_lfs(&path)).unwrap_or(path);
 
     fn unc_to_lfs(s: &str) -> &str {
@@ -44,7 +43,7 @@ fn sanitize_sh(path: &Path) -> String {
     }
 }
 
-fn is_dir_writable_for_user(dir: &PathBuf) -> bool {
+fn is_dir_writable_for_user(dir: &Path) -> bool {
     let tmp = dir.join(".tmp");
     match fs::create_dir_all(&tmp) {
         Ok(_) => {
@@ -95,7 +94,7 @@ fn install_sh(
     }
 
     let datadir = prefix.join(default_path(&builder.config.datadir, "share"));
-    let docdir = prefix.join(default_path(&builder.config.docdir, "share/doc/rust"));
+    let docdir = prefix.join(default_path(&builder.config.docdir, &format!("share/doc/{package}")));
     let mandir = prefix.join(default_path(&builder.config.mandir, "share/man"));
     let libdir = prefix.join(default_path(&builder.config.libdir, "lib"));
     let bindir = prefix.join(&builder.config.bindir); // Default in config.rs
@@ -159,7 +158,7 @@ macro_rules! install {
        only_hosts: $only_hosts:expr,
        $run_item:block $(, $c:ident)*;)+) => {
         $(
-            #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+            #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         pub struct $name {
             pub compiler: Compiler,
             pub target: TargetSelection,
@@ -291,7 +290,7 @@ install!((self, builder, _config),
     RustcCodegenCranelift, alias = "rustc-codegen-cranelift", Self::should_build(_config), only_hosts: true, {
         if let Some(tarball) = builder.ensure(dist::CodegenBackend {
             compiler: self.compiler,
-            backend: INTERNER.intern_str("cranelift"),
+            backend: "cranelift".to_string(),
         }) {
             install_sh(builder, "rustc-codegen-cranelift", self.compiler.stage, Some(self.target), &tarball);
         } else {
@@ -303,7 +302,7 @@ install!((self, builder, _config),
     };
 );
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Src {
     pub stage: u32,
 }

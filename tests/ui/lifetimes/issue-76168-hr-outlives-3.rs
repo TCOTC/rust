@@ -1,10 +1,12 @@
-// edition:2018
+//@ edition:2018
 
 #![feature(unboxed_closures)]
 use std::future::Future;
 
 async fn wrapper<F>(f: F)
 //~^ ERROR: expected a `FnOnce(&'a mut i32)` closure, found `i32`
+//~| ERROR: expected a `FnOnce(&'a mut i32)` closure, found `i32`
+//~| ERROR: expected a `FnOnce(&'a mut i32)` closure, found `i32`
 //~| ERROR: expected a `FnOnce(&'a mut i32)` closure, found `i32`
 where
 F:,

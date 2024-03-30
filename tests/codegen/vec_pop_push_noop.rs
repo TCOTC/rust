@@ -1,16 +1,14 @@
-// compile-flags: -O
-// ignore-debug
-// (with debug assertions turned on, `assert_unchecked` generates a real assertion)
+//@ compile-flags: -O
 
 #![crate_type = "lib"]
 
 #[no_mangle]
 // CHECK-LABEL: @noop(
 pub fn noop(v: &mut Vec<u8>) {
-    // CHECK-NOT: reserve_for_push
+    // CHECK-NOT: grow_one
     // CHECK-NOT: call
     // CHECK: tail call void @llvm.assume
-    // CHECK-NOT: reserve_for_push
+    // CHECK-NOT: grow_one
     // CHECK-NOT: call
     // CHECK: ret
     if let Some(x) = v.pop() {
@@ -21,6 +19,6 @@ pub fn noop(v: &mut Vec<u8>) {
 #[no_mangle]
 // CHECK-LABEL: @push_byte(
 pub fn push_byte(v: &mut Vec<u8>) {
-    // CHECK: call {{.*}}reserve_for_push
+    // CHECK: call {{.*}}grow_one
     v.push(3);
 }

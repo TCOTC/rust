@@ -1,9 +1,8 @@
-// known-bug: #110395
+//@ known-bug: #110395
 // Broken until we have `&T: const Deref` impl in stdlib
 
 #![allow(incomplete_features)]
 #![feature(
-    associated_type_bounds,
     const_trait_impl,
     effects,
     const_cmp,

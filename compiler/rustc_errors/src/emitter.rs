@@ -1,6 +1,6 @@
 //! The current rustc diagnostics emitter.
 //!
-//! An `Emitter` takes care of generating the output from a `DiagnosticBuilder` struct.
+//! An `Emitter` takes care of generating the output from a `Diag` struct.
 //!
 //! There are various `Emitter` implementations that generate different output formats such as
 //! JSON and human readable output.
@@ -16,16 +16,15 @@ use crate::snippet::{
 use crate::styled_buffer::StyledBuffer;
 use crate::translation::{to_fluent_args, Translate};
 use crate::{
-    diagnostic::DiagnosticLocation, CodeSuggestion, DiagCtxt, Diagnostic, DiagnosticMessage,
-    ErrCode, FluentBundle, LazyFallbackBundle, Level, MultiSpan, SubDiagnostic,
-    SubstitutionHighlight, SuggestionStyle, TerminalUrl,
+    diagnostic::DiagLocation, CodeSuggestion, DiagCtxt, DiagInner, DiagMessage, ErrCode,
+    FluentBundle, LazyFallbackBundle, Level, MultiSpan, Subdiag, SubstitutionHighlight,
+    SuggestionStyle, TerminalUrl,
 };
-use rustc_lint_defs::pluralize;
-
 use derive_setters::Setters;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::{DynSend, IntoDynSyncSend, Lrc};
 use rustc_error_messages::{FluentArgs, SpanLabel};
+use rustc_lint_defs::pluralize;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use std::borrow::Cow;
 use std::cmp::{max, min, Reverse};
@@ -34,7 +33,7 @@ use std::io::prelude::*;
 use std::io::{self, IsTerminal};
 use std::iter;
 use std::path::Path;
-use termcolor::{Ansi, Buffer, BufferWriter, ColorChoice, ColorSpec, StandardStream};
+use termcolor::{Buffer, BufferWriter, ColorChoice, ColorSpec, StandardStream};
 use termcolor::{Color, WriteColor};
 
 /// Default column width, used in tests and when terminal dimensions cannot be determined.
@@ -56,18 +55,6 @@ impl HumanReadableErrorType {
             HumanReadableErrorType::Short(cc) => (true, cc),
             HumanReadableErrorType::AnnotateSnippet(cc) => (false, cc),
         }
-    }
-    pub fn new_emitter(
-        self,
-        mut dst: Box<dyn WriteColor + Send>,
-        fallback_bundle: LazyFallbackBundle,
-    ) -> HumanEmitter {
-        let (short, color_config) = self.unzip();
-        let color = color_config.suggests_using_colors();
-        if !dst.supports_color() && color {
-            dst = Box::new(Ansi::new(dst));
-        }
-        HumanEmitter::new(dst, fallback_bundle).short_message(short)
     }
 }
 
@@ -129,8 +116,8 @@ impl Margin {
     fn was_cut_right(&self, line_len: usize) -> bool {
         let right =
             if self.computed_right == self.span_right || self.computed_right == self.label_right {
-                // Account for the "..." padding given above. Otherwise we end up with code lines that
-                // do fit but end in "..." as if they were trimmed.
+                // Account for the "..." padding given above. Otherwise we end up with code lines
+                // that do fit but end in "..." as if they were trimmed.
                 self.computed_right - 6
             } else {
                 self.computed_right
@@ -193,7 +180,7 @@ pub type DynEmitter = dyn Emitter + DynSend;
 /// Emitter trait for emitting errors.
 pub trait Emitter: Translate {
     /// Emit a structured diagnostic.
-    fn emit_diagnostic(&mut self, diag: Diagnostic);
+    fn emit_diagnostic(&mut self, diag: DiagInner);
 
     /// Emit a notification that an artifact has been output.
     /// Currently only supported for the JSON format.
@@ -201,7 +188,7 @@ pub trait Emitter: Translate {
 
     /// Emit a report about future breakage.
     /// Currently only supported for the JSON format.
-    fn emit_future_breakage_report(&mut self, _diags: Vec<Diagnostic>) {}
+    fn emit_future_breakage_report(&mut self, _diags: Vec<DiagInner>) {}
 
     /// Emit list of unused externs.
     /// Currently only supported for the JSON format.
@@ -228,12 +215,12 @@ pub trait Emitter: Translate {
     ///
     /// There are a lot of conditions to this method, but in short:
     ///
-    /// * If the current `Diagnostic` has only one visible `CodeSuggestion`,
+    /// * If the current `DiagInner` has only one visible `CodeSuggestion`,
     ///   we format the `help` suggestion depending on the content of the
     ///   substitutions. In that case, we modify the span and clear the
     ///   suggestions.
     ///
-    /// * If the current `Diagnostic` has multiple suggestions,
+    /// * If the current `DiagInner` has multiple suggestions,
     ///   we leave `primary_span` and the suggestions untouched.
     fn primary_span_formatted(
         &mut self,
@@ -302,7 +289,7 @@ pub trait Emitter: Translate {
     fn fix_multispans_in_extern_macros_and_render_macro_backtrace(
         &self,
         span: &mut MultiSpan,
-        children: &mut Vec<SubDiagnostic>,
+        children: &mut Vec<Subdiag>,
         level: &Level,
         backtrace: bool,
     ) {
@@ -349,9 +336,9 @@ pub trait Emitter: Translate {
                     (in Nightly builds, run with -Z macro-backtrace for more info)",
                 );
 
-                children.push(SubDiagnostic {
+                children.push(Subdiag {
                     level: Level::Note,
-                    messages: vec![(DiagnosticMessage::from(msg), Style::NoStyle)],
+                    messages: vec![(DiagMessage::from(msg), Style::NoStyle)],
                     span: MultiSpan::new(),
                 });
             }
@@ -361,7 +348,7 @@ pub trait Emitter: Translate {
     fn render_multispans_macro_backtrace(
         &self,
         span: &mut MultiSpan,
-        children: &mut Vec<SubDiagnostic>,
+        children: &mut Vec<Subdiag>,
         backtrace: bool,
     ) {
         for span in iter::once(span).chain(children.iter_mut().map(|child| &mut child.span)) {
@@ -460,11 +447,7 @@ pub trait Emitter: Translate {
     // This does a small "fix" for multispans by looking to see if it can find any that
     // point directly at external macros. Since these are often difficult to read,
     // this will change the span to point at the use site.
-    fn fix_multispans_in_extern_macros(
-        &self,
-        span: &mut MultiSpan,
-        children: &mut Vec<SubDiagnostic>,
-    ) {
+    fn fix_multispans_in_extern_macros(&self, span: &mut MultiSpan, children: &mut Vec<Subdiag>) {
         debug!("fix_multispans_in_extern_macros: before: span={:?} children={:?}", span, children);
         self.fix_multispan_in_extern_macros(span);
         for child in children.iter_mut() {
@@ -517,8 +500,8 @@ impl Emitter for HumanEmitter {
         self.sm.as_ref()
     }
 
-    fn emit_diagnostic(&mut self, mut diag: Diagnostic) {
-        let fluent_args = to_fluent_args(diag.args());
+    fn emit_diagnostic(&mut self, mut diag: DiagInner) {
+        let fluent_args = to_fluent_args(diag.args.iter());
 
         let mut suggestions = diag.suggestions.unwrap_or(vec![]);
         self.primary_span_formatted(&mut diag.span, &mut suggestions, &fluent_args);
@@ -555,8 +538,10 @@ impl Emitter for HumanEmitter {
 /// Fatal diagnostics are forwarded to `fatal_dcx` to avoid silent
 /// failures of rustc, as witnessed e.g. in issue #89358.
 pub struct SilentEmitter {
+    pub fallback_bundle: LazyFallbackBundle,
     pub fatal_dcx: DiagCtxt,
-    pub fatal_note: String,
+    pub fatal_note: Option<String>,
+    pub emit_fatal_diagnostic: bool,
 }
 
 impl Translate for SilentEmitter {
@@ -565,7 +550,9 @@ impl Translate for SilentEmitter {
     }
 
     fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!("silent emitter attempted to translate message")
+        // Ideally this field wouldn't be necessary and the fallback bundle in `fatal_dcx` would be
+        // used but the lock prevents this.
+        &self.fallback_bundle
     }
 }
 
@@ -574,9 +561,11 @@ impl Emitter for SilentEmitter {
         None
     }
 
-    fn emit_diagnostic(&mut self, mut diag: Diagnostic) {
-        if diag.level == Level::Fatal {
-            diag.note(self.fatal_note.clone());
+    fn emit_diagnostic(&mut self, mut diag: DiagInner) {
+        if self.emit_fatal_diagnostic && diag.level == Level::Fatal {
+            if let Some(fatal_note) = &self.fatal_note {
+                diag.sub(Level::Note, fatal_note.clone(), MultiSpan::new());
+            }
             self.fatal_dcx.emit_diagnostic(diag);
         }
     }
@@ -609,12 +598,6 @@ impl ColorConfig {
             ColorConfig::Auto => ColorChoice::Never,
         }
     }
-    fn suggests_using_colors(self) -> bool {
-        match self {
-            ColorConfig::Always | ColorConfig::Auto => true,
-            ColorConfig::Never => false,
-        }
-    }
 }
 
 /// Handles the writing of `HumanReadableErrorType::Default` and `HumanReadableErrorType::Short`
@@ -638,19 +621,14 @@ pub struct HumanEmitter {
 }
 
 #[derive(Debug)]
-pub struct FileWithAnnotatedLines {
-    pub file: Lrc<SourceFile>,
-    pub lines: Vec<Line>,
+pub(crate) struct FileWithAnnotatedLines {
+    pub(crate) file: Lrc<SourceFile>,
+    pub(crate) lines: Vec<Line>,
     multiline_depth: usize,
 }
 
 impl HumanEmitter {
-    pub fn stderr(color_config: ColorConfig, fallback_bundle: LazyFallbackBundle) -> HumanEmitter {
-        let dst = from_stderr(color_config);
-        Self::create(dst, fallback_bundle)
-    }
-
-    fn create(dst: Destination, fallback_bundle: LazyFallbackBundle) -> HumanEmitter {
+    pub fn new(dst: Destination, fallback_bundle: LazyFallbackBundle) -> HumanEmitter {
         HumanEmitter {
             dst: IntoDynSyncSend(dst),
             sm: None,
@@ -665,13 +643,6 @@ impl HumanEmitter {
             track_diagnostics: false,
             terminal_url: TerminalUrl::No,
         }
-    }
-
-    pub fn new(
-        dst: Box<dyn WriteColor + Send>,
-        fallback_bundle: LazyFallbackBundle,
-    ) -> HumanEmitter {
-        Self::create(dst, fallback_bundle)
     }
 
     fn maybe_anonymized(&self, line_num: usize) -> Cow<'static, str> {
@@ -705,8 +676,9 @@ impl HumanEmitter {
             .skip(left)
             .take_while(|ch| {
                 // Make sure that the trimming on the right will fall within the terminal width.
-                // FIXME: `unicode_width` sometimes disagrees with terminals on how wide a `char` is.
-                // For now, just accept that sometimes the code line will be longer than desired.
+                // FIXME: `unicode_width` sometimes disagrees with terminals on how wide a `char`
+                // is. For now, just accept that sometimes the code line will be longer than
+                // desired.
                 let next = unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(1);
                 if taken + next > right - left {
                     return false;
@@ -1212,7 +1184,7 @@ impl HumanEmitter {
         max
     }
 
-    fn get_max_line_num(&mut self, span: &MultiSpan, children: &[SubDiagnostic]) -> usize {
+    fn get_max_line_num(&mut self, span: &MultiSpan, children: &[Subdiag]) -> usize {
         let primary = self.get_multispan_max_line_num(span);
         children
             .iter()
@@ -1227,7 +1199,7 @@ impl HumanEmitter {
     fn msgs_to_buffer(
         &self,
         buffer: &mut StyledBuffer,
-        msgs: &[(DiagnosticMessage, Style)],
+        msgs: &[(DiagMessage, Style)],
         args: &FluentArgs<'_>,
         padding: usize,
         label: &str,
@@ -1302,13 +1274,13 @@ impl HumanEmitter {
     fn emit_messages_default_inner(
         &mut self,
         msp: &MultiSpan,
-        msgs: &[(DiagnosticMessage, Style)],
+        msgs: &[(DiagMessage, Style)],
         args: &FluentArgs<'_>,
         code: &Option<ErrCode>,
         level: &Level,
         max_line_num_len: usize,
         is_secondary: bool,
-        emitted_at: Option<&DiagnosticLocation>,
+        emitted_at: Option<&DiagLocation>,
     ) -> io::Result<()> {
         let mut buffer = StyledBuffer::new();
 
@@ -1635,7 +1607,8 @@ impl HumanEmitter {
                     let mut to_add = FxHashMap::default();
 
                     for (depth, style) in depths {
-                        if multilines.remove(&depth).is_none() {
+                        // FIXME(#120456) - is `swap_remove` correct?
+                        if multilines.swap_remove(&depth).is_none() {
                             to_add.insert(depth, style);
                         }
                     }
@@ -1666,6 +1639,27 @@ impl HumanEmitter {
                                     *style,
                                 );
                             }
+                            if let Some(line) = annotated_file.lines.get(line_idx) {
+                                for ann in &line.annotations {
+                                    if let AnnotationType::MultilineStart(pos) = ann.annotation_type
+                                    {
+                                        // In the case where we have elided the entire start of the
+                                        // multispan because those lines were empty, we still need
+                                        // to draw the `|`s across the `...`.
+                                        draw_multiline_line(
+                                            &mut buffer,
+                                            last_buffer_line_num,
+                                            width_offset,
+                                            pos,
+                                            if ann.is_primary {
+                                                Style::UnderlinePrimary
+                                            } else {
+                                                Style::UnderlineSecondary
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                         } else if line_idx_delta == 2 {
                             let unannotated_line = annotated_file
                                 .file
@@ -1692,6 +1686,24 @@ impl HumanEmitter {
                                     *depth,
                                     *style,
                                 );
+                            }
+                            if let Some(line) = annotated_file.lines.get(line_idx) {
+                                for ann in &line.annotations {
+                                    if let AnnotationType::MultilineStart(pos) = ann.annotation_type
+                                    {
+                                        draw_multiline_line(
+                                            &mut buffer,
+                                            last_buffer_line_num,
+                                            width_offset,
+                                            pos,
+                                            if ann.is_primary {
+                                                Style::UnderlinePrimary
+                                            } else {
+                                                Style::UnderlineSecondary
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1742,9 +1754,17 @@ impl HumanEmitter {
         buffer.append(0, level.to_str(), Style::Level(*level));
         buffer.append(0, ": ", Style::HeaderMsg);
 
+        let mut msg = vec![(suggestion.msg.to_owned(), Style::NoStyle)];
+        if suggestions
+            .iter()
+            .take(MAX_SUGGESTIONS)
+            .any(|(_, _, _, only_capitalization)| *only_capitalization)
+        {
+            msg.push((" (notice the capitalization difference)".into(), Style::NoStyle));
+        }
         self.msgs_to_buffer(
             &mut buffer,
-            &[(suggestion.msg.to_owned(), Style::NoStyle)],
+            &msg,
             args,
             max_line_num_len,
             "suggestion",
@@ -1753,12 +1773,8 @@ impl HumanEmitter {
 
         let mut row_num = 2;
         draw_col_separator_no_space(&mut buffer, 1, max_line_num_len + 1);
-        let mut notice_capitalization = false;
-        for (complete, parts, highlights, only_capitalization) in
-            suggestions.iter().take(MAX_SUGGESTIONS)
-        {
+        for (complete, parts, highlights, _) in suggestions.iter().take(MAX_SUGGESTIONS) {
             debug!(?complete, ?parts, ?highlights);
-            notice_capitalization |= only_capitalization;
 
             let has_deletion = parts.iter().any(|p| p.is_deletion(sm));
             let is_multiline = complete.lines().count() > 1;
@@ -2057,9 +2073,6 @@ impl HumanEmitter {
             let others = suggestions.len() - MAX_SUGGESTIONS;
             let msg = format!("and {} other candidate{}", others, pluralize!(others));
             buffer.puts(row_num, max_line_num_len + 3, &msg, Style::NoStyle);
-        } else if notice_capitalization {
-            let msg = "notice the capitalization difference";
-            buffer.puts(row_num, max_line_num_len + 3, msg, Style::NoStyle);
         }
         emit_to_destination(&buffer.render(), level, &mut self.dst, self.short_message)?;
         Ok(())
@@ -2069,13 +2082,13 @@ impl HumanEmitter {
     fn emit_messages_default(
         &mut self,
         level: &Level,
-        messages: &[(DiagnosticMessage, Style)],
+        messages: &[(DiagMessage, Style)],
         args: &FluentArgs<'_>,
         code: &Option<ErrCode>,
         span: &MultiSpan,
-        children: &[SubDiagnostic],
+        children: &[Subdiag],
         suggestions: &[CodeSuggestion],
-        emitted_at: Option<&DiagnosticLocation>,
+        emitted_at: Option<&DiagLocation>,
     ) {
         let max_line_num_len = if self.ui_testing {
             ANONYMIZED_LINE_NUM.len()
@@ -2113,7 +2126,7 @@ impl HumanEmitter {
                 }
                 if !self.short_message {
                     for child in children {
-                        assert!(child.level.can_be_top_or_sub().1);
+                        assert!(child.level.can_be_subdiag());
                         let span = &child.span;
                         if let Err(err) = self.emit_messages_default_inner(
                             span,
@@ -2207,8 +2220,8 @@ impl HumanEmitter {
                 buffer.puts(*row_num - 1, max_line_num_len + 3, &line, Style::NoStyle);
                 *row_num += 1;
             }
-            // If the last line is exactly equal to the line we need to add, we can skip both of them.
-            // This allows us to avoid output like the following:
+            // If the last line is exactly equal to the line we need to add, we can skip both of
+            // them. This allows us to avoid output like the following:
             // 2 - &
             // 2 + if true { true } else { false }
             // 3 - if true { true } else { false }
@@ -2444,7 +2457,15 @@ impl FileWithAnnotatedLines {
                 // the beginning doesn't have an underline, but the current logic seems to be
                 // working correctly.
                 let middle = min(ann.line_start + 4, ann.line_end);
-                for line in ann.line_start + 1..middle {
+                // We'll show up to 4 lines past the beginning of the multispan start.
+                // We will *not* include the tail of lines that are only whitespace.
+                let until = (ann.line_start..middle)
+                    .rev()
+                    .filter_map(|line| file.get_line(line - 1).map(|s| (line + 1, s)))
+                    .find(|(_, s)| !s.trim().is_empty())
+                    .map(|(line, _)| line)
+                    .unwrap_or(ann.line_start);
+                for line in ann.line_start + 1..until {
                     // Every `|` that joins the beginning of the span (`___^`) to the end (`|__^`).
                     add_annotation_to_file(&mut output, file.clone(), line, ann.as_line());
                 }
@@ -2565,6 +2586,7 @@ fn num_overlap(
     let extra = if inclusive { 1 } else { 0 };
     (b_start..b_end + extra).contains(&a_start) || (a_start..a_end + extra).contains(&b_start)
 }
+
 fn overlaps(a1: &Annotation, a2: &Annotation, padding: usize) -> bool {
     num_overlap(
         a1.start_col.display,
@@ -2611,7 +2633,7 @@ fn emit_to_destination(
     Ok(())
 }
 
-pub type Destination = Box<(dyn WriteColor + Send)>;
+pub type Destination = Box<dyn WriteColor + Send>;
 
 struct Buffy {
     buffer_writer: BufferWriter,
@@ -2653,7 +2675,7 @@ impl WriteColor for Buffy {
     }
 }
 
-fn from_stderr(color: ColorConfig) -> Destination {
+pub fn stderr_destination(color: ColorConfig) -> Destination {
     let choice = color.to_color_choice();
     // On Windows we'll be performing global synchronization on the entire
     // system for emitting rustc errors, so there's no need to buffer

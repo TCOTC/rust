@@ -1,7 +1,11 @@
 //! Dealing with trait goals, i.e. `T: Trait<'a, U>`.
 
+use crate::traits::supertrait_def_ids;
+
+use super::assembly::structural_traits::AsyncCallableRelevantTypes;
 use super::assembly::{self, structural_traits, Candidate};
 use super::{EvalCtxt, GoalSource, SolverMode};
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{LangItem, Movability};
 use rustc_infer::traits::query::NoSolution;
@@ -39,31 +43,40 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
     ) -> Result<Candidate<'tcx>, NoSolution> {
         let tcx = ecx.tcx();
 
-        let impl_trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
+        let impl_trait_header = tcx.impl_trait_header(impl_def_id).unwrap();
         let drcx = DeepRejectCtxt { treat_obligation_params: TreatParams::ForLookup };
-        if !drcx.args_may_unify(goal.predicate.trait_ref.args, impl_trait_ref.skip_binder().args) {
+        if !drcx.args_may_unify(
+            goal.predicate.trait_ref.args,
+            impl_trait_header.trait_ref.skip_binder().args,
+        ) {
             return Err(NoSolution);
         }
 
-        let impl_polarity = tcx.impl_polarity(impl_def_id);
         // An upper bound of the certainty of this goal, used to lower the certainty
         // of reservation impl to ambiguous during coherence.
-        let maximal_certainty = match impl_polarity {
-            ty::ImplPolarity::Positive | ty::ImplPolarity::Negative => {
-                match impl_polarity == goal.predicate.polarity {
-                    true => Certainty::Yes,
-                    false => return Err(NoSolution),
-                }
-            }
-            ty::ImplPolarity::Reservation => match ecx.solver_mode() {
-                SolverMode::Normal => return Err(NoSolution),
+        let impl_polarity = impl_trait_header.polarity;
+        let maximal_certainty = match (impl_polarity, goal.predicate.polarity) {
+            // In intercrate mode, this is ambiguous. But outside of intercrate,
+            // it's not a real impl.
+            (ty::ImplPolarity::Reservation, _) => match ecx.solver_mode() {
                 SolverMode::Coherence => Certainty::AMBIGUOUS,
+                SolverMode::Normal => return Err(NoSolution),
             },
+
+            // Impl matches polarity
+            (ty::ImplPolarity::Positive, ty::PredicatePolarity::Positive)
+            | (ty::ImplPolarity::Negative, ty::PredicatePolarity::Negative) => Certainty::Yes,
+
+            // Impl doesn't match polarity
+            (ty::ImplPolarity::Positive, ty::PredicatePolarity::Negative)
+            | (ty::ImplPolarity::Negative, ty::PredicatePolarity::Positive) => {
+                return Err(NoSolution);
+            }
         };
 
         ecx.probe_trait_candidate(CandidateSource::Impl(impl_def_id)).enter(|ecx| {
             let impl_args = ecx.fresh_args_for_item(impl_def_id);
-            let impl_trait_ref = impl_trait_ref.instantiate(tcx, impl_args);
+            let impl_trait_ref = impl_trait_header.trait_ref.instantiate(tcx, impl_args);
 
             ecx.eq(goal.param_env, goal.predicate.trait_ref, impl_trait_ref)?;
             let where_clause_bounds = tcx
@@ -95,7 +108,6 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
             if trait_clause.def_id() == goal.predicate.def_id()
                 && trait_clause.polarity() == goal.predicate.polarity
             {
-                // FIXME: Constness
                 ecx.probe_misc_candidate("assumption").enter(|ecx| {
                     let assumption_trait_pred = ecx.instantiate_binder_with_infer(trait_clause);
                     ecx.eq(
@@ -117,7 +129,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -162,7 +174,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -185,7 +197,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -199,7 +211,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -213,7 +225,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -244,14 +256,16 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
     ) -> QueryResult<'tcx> {
         let self_ty = goal.predicate.self_ty();
         match goal.predicate.polarity {
-            ty::ImplPolarity::Positive => {
+            // impl FnPtr for FnPtr {}
+            ty::PredicatePolarity::Positive => {
                 if self_ty.is_fn_ptr() {
                     ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
                 } else {
                     Err(NoSolution)
                 }
             }
-            ty::ImplPolarity::Negative => {
+            //  impl !FnPtr for T where T != FnPtr && T is rigid {}
+            ty::PredicatePolarity::Negative => {
                 // If a type is rigid and not a fn ptr, then we know for certain
                 // that it does *not* implement `FnPtr`.
                 if !self_ty.is_fn_ptr() && self_ty.is_known_rigid() {
@@ -259,10 +273,6 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
                 } else {
                     Err(NoSolution)
                 }
-            }
-            // FIXME: Goal polarity should be split from impl polarity
-            ty::ImplPolarity::Reservation => {
-                bug!("we never expect a `Reservation` polarity in a trait goal")
             }
         }
     }
@@ -272,7 +282,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         goal: Goal<'tcx, Self>,
         goal_kind: ty::ClosureKind,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -308,7 +318,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         goal: Goal<'tcx, Self>,
         goal_kind: ty::ClosureKind,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -321,14 +331,19 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
                 // This region doesn't matter because we're throwing away the coroutine type
                 tcx.lifetimes.re_static,
             )?;
-        let output_is_sized_pred =
-            tupled_inputs_and_output_and_coroutine.map_bound(|(_, output, _)| {
-                ty::TraitRef::from_lang_item(tcx, LangItem::Sized, DUMMY_SP, [output])
-            });
+        let output_is_sized_pred = tupled_inputs_and_output_and_coroutine.map_bound(
+            |AsyncCallableRelevantTypes { output_coroutine_ty, .. }| {
+                ty::TraitRef::from_lang_item(tcx, LangItem::Sized, DUMMY_SP, [output_coroutine_ty])
+            },
+        );
 
         let pred = tupled_inputs_and_output_and_coroutine
-            .map_bound(|(inputs, _, _)| {
-                ty::TraitRef::new(tcx, goal.predicate.def_id(), [goal.predicate.self_ty(), inputs])
+            .map_bound(|AsyncCallableRelevantTypes { tupled_inputs_ty, .. }| {
+                ty::TraitRef::new(
+                    tcx,
+                    goal.predicate.def_id(),
+                    [goal.predicate.self_ty(), tupled_inputs_ty],
+                )
             })
             .to_predicate(tcx);
         // A built-in `AsyncFn` impl only holds if the output is sized.
@@ -363,11 +378,17 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         }
     }
 
+    /// ```rust, ignore (not valid rust syntax)
+    /// impl Tuple for () {}
+    /// impl Tuple for (T1,) {}
+    /// impl Tuple for (T1, T2) {}
+    /// impl Tuple for (T1, .., Tn) {}
+    /// ```
     fn consider_builtin_tuple_candidate(
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -382,7 +403,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -393,7 +414,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -417,7 +438,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -437,11 +458,33 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
 
+    fn consider_builtin_fused_iterator_candidate(
+        ecx: &mut EvalCtxt<'_, 'tcx>,
+        goal: Goal<'tcx, Self>,
+    ) -> QueryResult<'tcx> {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+            return Err(NoSolution);
+        }
+
+        let ty::Coroutine(def_id, _) = *goal.predicate.self_ty().kind() else {
+            return Err(NoSolution);
+        };
+
+        // Coroutines are not iterators unless they come from `gen` desugaring
+        let tcx = ecx.tcx();
+        if !tcx.coroutine_is_gen(def_id) {
+            return Err(NoSolution);
+        }
+
+        // Gen coroutines unconditionally implement `FusedIterator`
+        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+    }
+
     fn consider_builtin_async_iterator_candidate(
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -465,7 +508,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -496,7 +539,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -508,7 +551,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -523,7 +566,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return Err(NoSolution);
         }
 
@@ -537,14 +580,13 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         let args = ecx.tcx().erase_regions(goal.predicate.trait_ref.args);
 
         let Some(assume) =
-            rustc_transmute::Assume::from_const(ecx.tcx(), goal.param_env, args.const_at(3))
+            rustc_transmute::Assume::from_const(ecx.tcx(), goal.param_env, args.const_at(2))
         else {
             return Err(NoSolution);
         };
 
         let certainty = ecx.is_transmutable(
             rustc_transmute::Types { dst: args.type_at(0), src: args.type_at(1) },
-            args.type_at(2),
             assume,
         )?;
         ecx.evaluate_added_goals_and_make_canonical_response(certainty)
@@ -561,7 +603,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
     ) -> Vec<(CanonicalResponse<'tcx>, BuiltinImplSource)> {
-        if goal.predicate.polarity != ty::ImplPolarity::Positive {
+        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
             return vec![];
         }
 
@@ -581,11 +623,11 @@ impl<'tcx> assembly::GoalKind<'tcx> for TraitPredicate<'tcx> {
             let a_ty = goal.predicate.self_ty();
             // We need to normalize the b_ty since it's matched structurally
             // in the other functions below.
-            let b_ty = match ecx
-                .try_normalize_ty(goal.param_env, goal.predicate.trait_ref.args.type_at(1))
-            {
-                Some(b_ty) => b_ty,
-                None => return vec![misc_candidate(ecx, Certainty::OVERFLOW)],
+            let Ok(b_ty) = ecx.structurally_normalize_ty(
+                goal.param_env,
+                goal.predicate.trait_ref.args.type_at(1),
+            ) else {
+                return vec![];
             };
 
             let goal = goal.with(ecx.tcx(), (a_ty, b_ty));
@@ -659,13 +701,6 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
     ) -> Vec<(CanonicalResponse<'tcx>, BuiltinImplSource)> {
         let tcx = self.tcx();
         let Goal { predicate: (a_ty, _b_ty), .. } = goal;
-
-        // All of a's auto traits need to be in b's auto traits.
-        let auto_traits_compatible =
-            b_data.auto_traits().all(|b| a_data.auto_traits().any(|a| a == b));
-        if !auto_traits_compatible {
-            return vec![];
-        }
 
         let mut responses = vec![];
         // If the principal def ids match (or are both none), then we're not doing
@@ -754,6 +789,17 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
     ) -> QueryResult<'tcx> {
         let param_env = goal.param_env;
 
+        // We may upcast to auto traits that are either explicitly listed in
+        // the object type's bounds, or implied by the principal trait ref's
+        // supertraits.
+        let a_auto_traits: FxIndexSet<DefId> = a_data
+            .auto_traits()
+            .chain(a_data.principal_def_id().into_iter().flat_map(|principal_def_id| {
+                supertrait_def_ids(self.tcx(), principal_def_id)
+                    .filter(|def_id| self.tcx().trait_is_auto(*def_id))
+            }))
+            .collect();
+
         // More than one projection in a_ty's bounds may match the projection
         // in b_ty's bound. Use this to first determine *which* apply without
         // having any inference side-effects. We process obligations because
@@ -803,7 +849,7 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
                 }
                 // Check that b_ty's auto traits are present in a_ty's bounds.
                 ty::ExistentialPredicate::AutoTrait(def_id) => {
-                    if !a_data.auto_traits().any(|source_def_id| source_def_id == def_id) {
+                    if !a_auto_traits.contains(&def_id) {
                         return Err(NoSolution);
                     }
                 }
@@ -877,8 +923,8 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
         let a_tail_ty = tail_field_ty.instantiate(tcx, a_args);
         let b_tail_ty = tail_field_ty.instantiate(tcx, b_args);
 
-        // Substitute just the unsizing params from B into A. The type after
-        // this substitution must be equal to B. This is so we don't unsize
+        // Instantiate just the unsizing params from B into A. The type after
+        // this instantiation must be equal to B. This is so we don't unsize
         // unrelated type parameters.
         let new_a_args = tcx.mk_args_from_iter(
             a_args
@@ -927,7 +973,7 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
         let (&a_last_ty, a_rest_tys) = a_tys.split_last().unwrap();
         let &b_last_ty = b_tys.last().unwrap();
 
-        // Substitute just the tail field of B., and require that they're equal.
+        // Instantiate just the tail field of B., and require that they're equal.
         let unsized_a_ty =
             Ty::new_tup_from_iter(tcx, a_rest_tys.iter().copied().chain([b_last_ty]));
         self.eq(goal.param_env, unsized_a_ty, b_ty)?;
@@ -1006,7 +1052,7 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
             | ty::Str
             | ty::Array(_, _)
             | ty::Slice(_)
-            | ty::RawPtr(_)
+            | ty::RawPtr(_, _)
             | ty::Ref(_, _, _)
             | ty::FnDef(_, _)
             | ty::FnPtr(_)

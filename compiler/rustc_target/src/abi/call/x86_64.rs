@@ -51,7 +51,7 @@ where
 
             Abi::Scalar(scalar) => match scalar.primitive() {
                 abi::Int(..) | abi::Pointer(_) => Class::Int,
-                abi::F32 | abi::F64 => Class::Sse,
+                abi::F16 | abi::F32 | abi::F64 | abi::F128 => Class::Sse,
             },
 
             Abi::Vector { .. } => Class::Sse,
@@ -217,6 +217,8 @@ where
         match cls_or_mem {
             Err(Memory) => {
                 if is_arg {
+                    // The x86_64 ABI doesn't have any special requirements for `byval` alignment,
+                    // the type's alignment is always used.
                     arg.make_indirect_byval(None);
                 } else {
                     // `sret` parameter thus one less integer register available

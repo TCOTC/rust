@@ -1,7 +1,8 @@
 use super::potentially_plural_count;
 use crate::errors::{LifetimesOrBoundsMismatchOnTrait, MethodShouldReturnFuture};
+use core::ops::ControlFlow;
 use hir::def_id::{DefId, DefIdMap, LocalDefId};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_errors::{codes::*, pluralize, struct_span_code_err, Applicability, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
@@ -125,9 +126,9 @@ fn check_method_is_structurally_compatible<'tcx>(
 /// <'b> fn(t: &'i0 U0, m: &'b N0) -> Foo
 /// ```
 ///
-/// We now want to extract and substitute the type of the *trait*
+/// We now want to extract and instantiate the type of the *trait*
 /// method and compare it. To do so, we must create a compound
-/// substitution by combining `trait_to_impl_args` and
+/// instantiation by combining `trait_to_impl_args` and
 /// `impl_to_placeholder_args`, and also adding a mapping for the method
 /// type parameters. We extend the mapping to also include
 /// the method parameters.
@@ -146,11 +147,11 @@ fn check_method_is_structurally_compatible<'tcx>(
 /// vs `'b`). However, the normal subtyping rules on fn types handle
 /// this kind of equivalency just fine.
 ///
-/// We now use these substitutions to ensure that all declared bounds are
-/// satisfied by the implementation's method.
+/// We now use these generic parameters to ensure that all declared bounds
+/// are satisfied by the implementation's method.
 ///
 /// We do this by creating a parameter environment which contains a
-/// substitution corresponding to `impl_to_placeholder_args`. We then build
+/// generic parameter corresponding to `impl_to_placeholder_args`. We then build
 /// `trait_to_placeholder_args` and use it to convert the predicates contained
 /// in the `trait_m` generics to the placeholder form.
 ///
@@ -392,7 +393,7 @@ fn compare_method_predicate_entailment<'tcx>(
 
 struct RemapLateBound<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    mapping: &'a FxHashMap<ty::BoundRegionKind, ty::BoundRegionKind>,
+    mapping: &'a FxIndexMap<ty::BoundRegionKind, ty::BoundRegionKind>,
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for RemapLateBound<'_, 'tcx> {
@@ -454,7 +455,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
     let impl_trait_ref =
         tcx.impl_trait_ref(impl_m.impl_container(tcx).unwrap()).unwrap().instantiate_identity();
     // First, check a few of the same things as `compare_impl_method`,
-    // just so we don't ICE during substitution later.
+    // just so we don't ICE during instantiation later.
     check_method_is_structurally_compatible(tcx, impl_m, trait_m, impl_trait_ref, true)?;
 
     let trait_to_impl_args = impl_trait_ref.args;
@@ -520,14 +521,6 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
         )
         .fold_with(&mut collector);
 
-    if !unnormalized_trait_sig.output().references_error() {
-        debug_assert_ne!(
-            collector.types.len(),
-            0,
-            "expect >1 RPITITs in call to `collect_return_position_impl_trait_in_trait_tys`"
-        );
-    }
-
     let trait_sig = ocx.normalize(&misc_cause, param_env, unnormalized_trait_sig);
     trait_sig.error_reported()?;
     let trait_return_ty = trait_sig.output();
@@ -543,7 +536,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
     // }
     // ```
     // .. to compile. However, since we use both the normalized and unnormalized
-    // inputs and outputs from the substituted trait signature, we will end up
+    // inputs and outputs from the instantiated trait signature, we will end up
     // seeing the hidden type of an RPIT in the signature itself. Naively, this
     // means that we will use the hidden type to imply the hidden type's own
     // well-formedness.
@@ -553,7 +546,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
     // prove below that the hidden types are well formed.
     let universe = infcx.create_next_universe();
     let mut idx = 0;
-    let mapping: FxHashMap<_, _> = collector
+    let mapping: FxIndexMap<_, _> = collector
         .types
         .iter()
         .map(|(_, &(ty, _))| {
@@ -646,6 +639,12 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
         }
     }
 
+    if !unnormalized_trait_sig.output().references_error() && collector.types.is_empty() {
+        tcx.dcx().delayed_bug(
+            "expect >0 RPITITs in call to `collect_return_position_impl_trait_in_trait_tys`",
+        );
+    }
+
     // FIXME: This has the same issue as #108544, but since this isn't breaking
     // existing code, I'm not particularly inclined to do the same hack as above
     // where we process wf obligations manually. This can be fixed in a forward-
@@ -690,7 +689,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
                 // contains `def_id`'s early-bound regions.
                 let id_args = GenericArgs::identity_for_item(tcx, def_id);
                 debug!(?id_args, ?args);
-                let map: FxHashMap<_, _> = std::iter::zip(args, id_args)
+                let map: FxIndexMap<_, _> = std::iter::zip(args, id_args)
                     .skip(tcx.generics_of(trait_m.def_id).count())
                     .filter_map(|(a, b)| Some((a.as_region()?, b.as_region()?)))
                     .collect();
@@ -699,7 +698,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
                 // NOTE(compiler-errors): RPITITs, like all other RPITs, have early-bound
                 // region args that are synthesized during AST lowering. These are args
                 // that are appended to the parent args (trait and trait method). However,
-                // we're trying to infer the unsubstituted type value of the RPITIT inside
+                // we're trying to infer the uninstantiated type value of the RPITIT inside
                 // the *impl*, so we can later use the impl's method args to normalize
                 // an RPITIT to a concrete type (`confirm_impl_trait_in_trait_candidate`).
                 //
@@ -711,7 +710,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
                 // guarantee that the indices from the trait args and impl args line up.
                 // So to fix this, we subtract the number of trait args and add the number of
                 // impl args to *renumber* these early-bound regions to their corresponding
-                // indices in the impl's substitutions list.
+                // indices in the impl's generic parameters list.
                 //
                 // Also, we only need to account for a difference in trait and impl args,
                 // since we previously enforce that the trait method and impl method have the
@@ -734,18 +733,19 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
                 remapped_types.insert(def_id, ty::EarlyBinder::bind(ty));
             }
             Err(err) => {
-                let reported = tcx.dcx().span_delayed_bug(
-                    return_span,
-                    format!("could not fully resolve: {ty} => {err:?}"),
-                );
-                remapped_types.insert(def_id, ty::EarlyBinder::bind(Ty::new_error(tcx, reported)));
+                // This code path is not reached in any tests, but may be
+                // reachable. If this is triggered, it should be converted to
+                // `span_delayed_bug` and the triggering case turned into a
+                // test.
+                tcx.dcx()
+                    .span_bug(return_span, format!("could not fully resolve: {ty} => {err:?}"));
             }
         }
     }
 
     // We may not collect all RPITITs that we see in the HIR for a trait signature
     // because an RPITIT was located within a missing item. Like if we have a sig
-    // returning `-> Missing<impl Sized>`, that gets converted to `-> [type error]`,
+    // returning `-> Missing<impl Sized>`, that gets converted to `-> {type error}`,
     // and when walking through the signature we end up never collecting the def id
     // of the `impl Sized`. Insert that here, so we don't ICE later.
     for assoc_item in tcx.associated_types_for_impl_traits_in_associated_fn(trait_m.def_id) {
@@ -766,7 +766,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
 
 struct ImplTraitInTraitCollector<'a, 'tcx> {
     ocx: &'a ObligationCtxt<'a, 'tcx>,
-    types: FxHashMap<DefId, (Ty<'tcx>, ty::GenericArgsRef<'tcx>)>,
+    types: FxIndexMap<DefId, (Ty<'tcx>, ty::GenericArgsRef<'tcx>)>,
     span: Span,
     param_env: ty::ParamEnv<'tcx>,
     body_id: LocalDefId,
@@ -779,7 +779,7 @@ impl<'a, 'tcx> ImplTraitInTraitCollector<'a, 'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         body_id: LocalDefId,
     ) -> Self {
-        ImplTraitInTraitCollector { ocx, types: FxHashMap::default(), span, param_env, body_id }
+        ImplTraitInTraitCollector { ocx, types: FxIndexMap::default(), span, param_env, body_id }
     }
 }
 
@@ -838,7 +838,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ImplTraitInTraitCollector<'_, 'tcx> {
 
 struct RemapHiddenTyRegions<'tcx> {
     tcx: TyCtxt<'tcx>,
-    map: FxHashMap<ty::Region<'tcx>, ty::Region<'tcx>>,
+    map: FxIndexMap<ty::Region<'tcx>, ty::Region<'tcx>>,
     num_trait_args: usize,
     num_impl_args: usize,
     def_id: DefId,
@@ -917,7 +917,13 @@ impl<'tcx> ty::FallibleTypeFolder<TyCtxt<'tcx>> for RemapHiddenTyRegions<'tcx> {
                         .with_note(format!("hidden type inferred to be `{}`", self.ty))
                         .emit()
                 }
-                _ => self.tcx.dcx().delayed_bug("should've been able to remap region"),
+                _ => {
+                    // This code path is not reached in any tests, but may be
+                    // reachable. If this is triggered, it should be converted
+                    // to `delayed_bug` and the triggering case turned into a
+                    // test.
+                    self.tcx.dcx().bug("should've been able to remap region");
+                }
             };
             return Err(guar);
         };
@@ -1276,9 +1282,10 @@ fn compare_number_of_generics<'tcx>(
     // inheriting the generics from will also have mismatched arguments, and
     // we'll report an error for that instead. Delay a bug for safety, though.
     if trait_.is_impl_trait_in_trait() {
-        return Err(tcx.dcx().delayed_bug(
-            "errors comparing numbers of generics of trait/impl functions were not emitted",
-        ));
+        // FIXME: no tests trigger this. If you find example code that does
+        // trigger this, please add it to the test suite.
+        tcx.dcx()
+            .bug("errors comparing numbers of generics of trait/impl functions were not emitted");
     }
 
     let matchings = [
@@ -1297,7 +1304,7 @@ fn compare_number_of_generics<'tcx>(
                     .iter()
                     .filter(|p| match p.kind {
                         hir::GenericParamKind::Lifetime {
-                            kind: hir::LifetimeParamKind::Elided,
+                            kind: hir::LifetimeParamKind::Elided(_),
                         } => {
                             // A fn can have an arbitrary number of extra elided lifetimes for the
                             // same signature.
@@ -1557,24 +1564,24 @@ fn compare_synthetic_generics<'tcx>(
                     let (sig, _) = impl_m.expect_fn();
                     let input_tys = sig.decl.inputs;
 
-                    struct Visitor(Option<Span>, hir::def_id::LocalDefId);
+                    struct Visitor(hir::def_id::LocalDefId);
                     impl<'v> intravisit::Visitor<'v> for Visitor {
-                        fn visit_ty(&mut self, ty: &'v hir::Ty<'v>) {
-                            intravisit::walk_ty(self, ty);
+                        type Result = ControlFlow<Span>;
+                        fn visit_ty(&mut self, ty: &'v hir::Ty<'v>) -> Self::Result {
                             if let hir::TyKind::Path(hir::QPath::Resolved(None, path)) = ty.kind
                                 && let Res::Def(DefKind::TyParam, def_id) = path.res
-                                && def_id == self.1.to_def_id()
+                                && def_id == self.0.to_def_id()
                             {
-                                self.0 = Some(ty.span);
+                                ControlFlow::Break(ty.span)
+                            } else {
+                                intravisit::walk_ty(self, ty)
                             }
                         }
                     }
 
-                    let mut visitor = Visitor(None, impl_def_id);
-                    for ty in input_tys {
-                        intravisit::Visitor::visit_ty(&mut visitor, ty);
-                    }
-                    let span = visitor.0?;
+                    let span = input_tys.iter().find_map(|ty| {
+                        intravisit::Visitor::visit_ty(&mut Visitor(impl_def_id), ty).break_value()
+                    })?;
 
                     let bounds = impl_m.generics.bounds_for_param(impl_def_id).next()?.bounds;
                     let bounds = bounds.first()?.span().to(bounds.last()?.span());

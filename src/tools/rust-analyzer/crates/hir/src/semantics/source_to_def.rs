@@ -86,6 +86,7 @@
 //! syntax nodes against this specific crate.
 
 use base_db::FileId;
+use either::Either;
 use hir_def::{
     child_by_source::ChildBySource,
     dyn_map::{
@@ -93,14 +94,14 @@ use hir_def::{
         DynMap,
     },
     hir::{BindingId, LabelId},
-    AdtId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternCrateId, FieldId,
-    FunctionId, GenericDefId, GenericParamId, ImplId, LifetimeParamId, MacroId, ModuleId, StaticId,
-    StructId, TraitAliasId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
+    AdtId, BlockId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternCrateId,
+    FieldId, FunctionId, GenericDefId, GenericParamId, ImplId, LifetimeParamId, MacroId, ModuleId,
+    StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
 };
 use hir_expand::{attrs::AttrId, name::AsName, HirFileId, HirFileIdExt, MacroCallId};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use stdx::{impl_from, never};
+use stdx::impl_from;
 use syntax::{
     ast::{self, HasName},
     AstNode, SyntaxNode,
@@ -117,7 +118,7 @@ pub(super) struct SourceToDefCtx<'a, 'b> {
 
 impl SourceToDefCtx<'_, '_> {
     pub(super) fn file_to_def(&self, file: FileId) -> SmallVec<[ModuleId; 1]> {
-        let _p = tracing::span!(tracing::Level::INFO, "SourceBinder::to_module_def");
+        let _p = tracing::span!(tracing::Level::INFO, "SourceBinder::file_to_module_def");
         let mut mods = SmallVec::new();
         for &crate_id in self.db.relevant_crates(file).iter() {
             // FIXME: inner items
@@ -131,15 +132,19 @@ impl SourceToDefCtx<'_, '_> {
         mods
     }
 
-    pub(super) fn module_to_def(&self, src: InFile<ast::Module>) -> Option<ModuleId> {
+    pub(super) fn module_to_def(&mut self, src: InFile<ast::Module>) -> Option<ModuleId> {
         let _p = tracing::span!(tracing::Level::INFO, "module_to_def");
         let parent_declaration = src
             .syntax()
             .ancestors_with_macros_skip_attr_item(self.db.upcast())
-            .find_map(|it| it.map(ast::Module::cast).transpose());
+            .find_map(|it| it.map(Either::<ast::Module, ast::BlockExpr>::cast).transpose())
+            .map(|it| it.transpose());
 
         let parent_module = match parent_declaration {
-            Some(parent_declaration) => self.module_to_def(parent_declaration),
+            Some(Either::Right(parent_block)) => self
+                .block_to_def(parent_block)
+                .map(|block| self.db.block_def_map(block).root_module_id()),
+            Some(Either::Left(parent_declaration)) => self.module_to_def(parent_declaration),
             None => {
                 let file_id = src.file_id.original_file(self.db.upcast());
                 self.file_to_def(file_id).first().copied()
@@ -197,6 +202,9 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn tuple_field_to_def(&mut self, src: InFile<ast::TupleField>) -> Option<FieldId> {
         self.to_def(src, keys::TUPLE_FIELD)
     }
+    pub(super) fn block_to_def(&mut self, src: InFile<ast::BlockExpr>) -> Option<BlockId> {
+        self.to_def(src, keys::BLOCK)
+    }
     pub(super) fn enum_variant_to_def(
         &mut self,
         src: InFile<ast::Variant>,
@@ -245,14 +253,8 @@ impl SourceToDefCtx<'_, '_> {
         src: InFile<ast::SelfParam>,
     ) -> Option<(DefWithBodyId, BindingId)> {
         let container = self.find_pat_or_label_container(src.syntax())?;
-        let (body, source_map) = self.db.body_with_source_map(container);
-        let pat_id = source_map.node_self_param(src.as_ref())?;
-        if let crate::Pat::Bind { id, .. } = body[pat_id] {
-            Some((container, id))
-        } else {
-            never!();
-            None
-        }
+        let body = self.db.body(container);
+        Some((container, body.self_param?))
     }
     pub(super) fn label_to_def(
         &mut self,

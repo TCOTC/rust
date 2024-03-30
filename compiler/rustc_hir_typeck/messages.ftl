@@ -103,6 +103,8 @@ hir_typeck_no_associated_item = no {$item_kind} named `{$item_name}` found for {
     *[other] {" "}in the current scope
 }
 
+hir_typeck_note_caller_chooses_ty_for_ty_param = the caller chooses a type for `{$ty_param_name}` which can be different from `{$found_ty}`
+
 hir_typeck_note_edition_guide = for more on editions, read https://doc.rust-lang.org/edition-guide
 
 hir_typeck_option_result_asref = use `{$def_path}::as_ref` to convert `{$expected_ty}` to `{$expr_ty}`
@@ -119,6 +121,10 @@ hir_typeck_return_stmt_outside_of_fn_body =
     {$statement_kind} statement outside of function body
     .encl_body_label = the {$statement_kind} is part of this body...
     .encl_fn_label = ...not the enclosing function body
+
+hir_typeck_rpit_box_return_expr = if you change the return type to expect trait objects, box the returned expressions
+
+hir_typeck_rpit_change_return_type = you could change the return type to be a boxed trait object
 
 hir_typeck_rustcall_incorrect_args =
     functions with the "rust-call" ABI must take a single non-self tuple argument

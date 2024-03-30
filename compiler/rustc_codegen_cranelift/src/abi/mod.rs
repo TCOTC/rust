@@ -8,8 +8,11 @@ use std::borrow::Cow;
 
 use cranelift_codegen::ir::SigRef;
 use cranelift_module::ModuleError;
+use rustc_codegen_ssa::errors::CompilerBuiltinsCannotCall;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::layout::FnAbiOf;
+use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_monomorphize::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_session::Session;
 use rustc_span::source_map::Spanned;
 use rustc_target::abi::call::{Conv, FnAbi};
@@ -219,17 +222,15 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
         Spread(Vec<Option<CValue<'tcx>>>),
     }
 
-    let fn_abi = fx.fn_abi.take().unwrap();
-
     // FIXME implement variadics in cranelift
-    if fn_abi.c_variadic {
+    if fx.fn_abi.c_variadic {
         fx.tcx.dcx().span_fatal(
             fx.mir.span,
             "Defining variadic functions is not yet supported by Cranelift",
         );
     }
 
-    let mut arg_abis_iter = fn_abi.args.iter();
+    let mut arg_abis_iter = fx.fn_abi.args.iter();
 
     let func_params = fx
         .mir
@@ -276,7 +277,6 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
     }
 
     assert!(arg_abis_iter.next().is_none(), "ArgAbi left behind");
-    fx.fn_abi = Some(fn_abi);
     assert!(block_params_iter.next().is_none(), "arg_value left behind");
 
     self::comments::add_locals_header_comment(fx);
@@ -372,6 +372,17 @@ pub(crate) fn codegen_terminator_call<'tcx>(
             ty::Instance::expect_resolve(fx.tcx, ty::ParamEnv::reveal_all(), def_id, fn_args)
                 .polymorphize(fx.tcx);
 
+        if is_call_from_compiler_builtins_to_upstream_monomorphization(fx.tcx, instance) {
+            if target.is_some() {
+                let caller = with_no_trimmed_paths!(fx.tcx.def_path_str(fx.instance.def_id()));
+                let callee = with_no_trimmed_paths!(fx.tcx.def_path_str(def_id));
+                fx.tcx.dcx().emit_err(CompilerBuiltinsCannotCall { caller, callee });
+            } else {
+                fx.bcx.ins().trap(TrapCode::User(0));
+                return;
+            }
+        }
+
         if fx.tcx.symbol_name(instance).name.starts_with("llvm.") {
             crate::intrinsics::codegen_llvm_intrinsic_call(
                 fx,
@@ -387,15 +398,17 @@ pub(crate) fn codegen_terminator_call<'tcx>(
 
         match instance.def {
             InstanceDef::Intrinsic(_) => {
-                crate::intrinsics::codegen_intrinsic_call(
+                match crate::intrinsics::codegen_intrinsic_call(
                     fx,
                     instance,
                     args,
                     ret_place,
                     target,
                     source_info,
-                );
-                return;
+                ) {
+                    Ok(()) => return,
+                    Err(instance) => Some(instance),
+                }
             }
             InstanceDef::DropGlue(_, None) => {
                 // empty drop glue - a nop.
@@ -661,11 +674,7 @@ pub(crate) fn codegen_drop<'tcx>(
 
                 let arg_value = drop_place.place_ref(
                     fx,
-                    fx.layout_of(Ty::new_ref(
-                        fx.tcx,
-                        fx.tcx.lifetimes.re_erased,
-                        TypeAndMut { ty, mutbl: crate::rustc_hir::Mutability::Mut },
-                    )),
+                    fx.layout_of(Ty::new_mut_ref(fx.tcx, fx.tcx.lifetimes.re_erased, ty)),
                 );
                 let arg_value = adjust_arg_for_abi(fx, arg_value, &fn_abi.args[0], true);
 

@@ -11,8 +11,8 @@ use crate::infer::lexical_region_resolve::RegionResolutionError;
 use crate::infer::SubregionOrigin;
 use crate::infer::TyCtxt;
 
-use rustc_errors::AddToDiagnostic;
-use rustc_errors::{Diagnostic, ErrorGuaranteed};
+use rustc_errors::Subdiagnostic;
+use rustc_errors::{Diag, ErrorGuaranteed};
 use rustc_hir::Ty;
 use rustc_middle::ty::Region;
 
@@ -142,8 +142,8 @@ pub fn suggest_adding_lifetime_params<'tcx>(
     sub: Region<'tcx>,
     ty_sup: &'tcx Ty<'_>,
     ty_sub: &'tcx Ty<'_>,
-    err: &mut Diagnostic,
+    err: &mut Diag<'_>,
 ) {
     let suggestion = AddLifetimeParamsSuggestion { tcx, sub, ty_sup, ty_sub, add_note: false };
-    suggestion.add_to_diagnostic(err);
+    suggestion.add_to_diag(err);
 }

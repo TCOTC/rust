@@ -4,6 +4,7 @@ use crate::mir::Body;
 use crate::ty::{Allocation, ClosureDef, ClosureKind, FnDef, GenericArgs, IndexedVal, Ty};
 use crate::{with, CrateItem, DefId, Error, ItemKind, Opaque, Symbol};
 use std::fmt::{Debug, Formatter};
+use std::io;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MonoItem {
@@ -57,7 +58,7 @@ impl Instance {
         with(|cx| cx.is_foreign_item(self.def.def_id()))
     }
 
-    /// Get the instance type with generic substitutions applied and lifetimes erased.
+    /// Get the instance type with generic instantiations applied and lifetimes erased.
     pub fn ty(&self) -> Ty {
         with(|context| context.instance_ty(self.def))
     }
@@ -88,6 +89,17 @@ impl Instance {
     /// path and print only the name.
     pub fn trimmed_name(&self) -> Symbol {
         with(|context| context.instance_name(self.def, true))
+    }
+
+    /// Retrieve the plain intrinsic name of an instance if it's an intrinsic.
+    ///
+    /// The plain name does not include type arguments (as `trimmed_name` does),
+    /// which is more convenient to match with intrinsic symbols.
+    pub fn intrinsic_name(&self) -> Option<Symbol> {
+        match self.kind {
+            InstanceKind::Intrinsic => Some(with(|context| context.intrinsic_name(self.def))),
+            InstanceKind::Item | InstanceKind::Virtual { .. } | InstanceKind::Shim => None,
+        }
     }
 
     /// Resolve an instance starting from a function definition and generic arguments.
@@ -145,6 +157,11 @@ impl Instance {
     /// `type_id`.
     pub fn try_const_eval(&self, const_ty: Ty) -> Result<Allocation, Error> {
         with(|cx| cx.eval_instance(self.def, const_ty))
+    }
+
+    /// Emit the body of this instance if it has one.
+    pub fn emit_mir<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        if let Some(body) = self.body() { body.dump(w, &self.name()) } else { Ok(()) }
     }
 }
 

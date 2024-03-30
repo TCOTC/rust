@@ -4,23 +4,22 @@ use crate::query::plumbing::CycleError;
 use crate::query::DepKind;
 use crate::query::{QueryContext, QueryStackFrame};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{DiagCtxt, Diagnostic, DiagnosticBuilder, Level};
+use rustc_errors::{Diag, DiagCtxt};
 use rustc_hir::def::DefKind;
 use rustc_session::Session;
 use rustc_span::Span;
 
 use std::hash::Hash;
 use std::io::Write;
-use std::num::NonZeroU64;
+use std::num::NonZero;
 
 #[cfg(parallel_compiler)]
 use {
     parking_lot::{Condvar, Mutex},
     rustc_data_structures::fx::FxHashSet,
-    rustc_data_structures::{defer, jobserver},
+    rustc_data_structures::jobserver,
     rustc_span::DUMMY_SP,
     std::iter,
-    std::process,
     std::sync::Arc,
 };
 
@@ -36,7 +35,7 @@ pub type QueryMap = FxHashMap<QueryJobId, QueryJobInfo>;
 
 /// A value uniquely identifying an active query job.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub struct QueryJobId(pub NonZeroU64);
+pub struct QueryJobId(pub NonZero<u64>);
 
 impl QueryJobId {
     fn query(self, map: &QueryMap) -> QueryStackFrame {
@@ -514,12 +513,7 @@ fn remove_cycle(
 /// There may be multiple cycles involved in a deadlock, so this searches
 /// all active queries for cycles before finally resuming all the waiters at once.
 #[cfg(parallel_compiler)]
-pub fn deadlock(query_map: QueryMap, registry: &rayon_core::Registry) {
-    let on_panic = defer(|| {
-        eprintln!("deadlock handler panicked, aborting process");
-        process::abort();
-    });
-
+pub fn break_query_cycles(query_map: QueryMap, registry: &rayon_core::Registry) {
     let mut wakelist = Vec::new();
     let mut jobs: Vec<QueryJobId> = query_map.keys().cloned().collect();
 
@@ -539,19 +533,17 @@ pub fn deadlock(query_map: QueryMap, registry: &rayon_core::Registry) {
     // X to Y due to Rayon waiting and a true dependency from Y to X. The algorithm here
     // only considers the true dependency and won't detect a cycle.
     if !found_cycle {
-        if query_map.len() == 0 {
-            panic!("deadlock detected without any query!")
-        } else {
-            panic!("deadlock detected! current query map:\n{:#?}", query_map);
-        }
+        panic!(
+            "deadlock detected as we're unable to find a query cycle to break\n\
+            current query map:\n{:#?}",
+            query_map
+        );
     }
 
     // FIXME: Ensure this won't cause a deadlock before we return
     for waiter in wakelist.into_iter() {
         waiter.notify(registry);
     }
-
-    on_panic.disable();
 }
 
 #[inline(never)]
@@ -559,7 +551,7 @@ pub fn deadlock(query_map: QueryMap, registry: &rayon_core::Registry) {
 pub fn report_cycle<'a>(
     sess: &'a Session,
     CycleError { usage, cycle: stack }: &CycleError,
-) -> DiagnosticBuilder<'a> {
+) -> Diag<'a> {
     assert!(!stack.is_empty());
 
     let span = stack[0].query.default_span(stack[1 % stack.len()].span);
@@ -628,15 +620,15 @@ pub fn print_query_stack<Qcx: QueryContext>(
         };
         if Some(count_printed) < num_frames || num_frames.is_none() {
             // Only print to stderr as many stack frames as `num_frames` when present.
-            let mut diag = Diagnostic::new(
-                Level::FailureNote,
-                format!(
-                    "#{} [{:?}] {}",
-                    count_printed, query_info.query.dep_kind, query_info.query.description
-                ),
-            );
-            diag.span = query_info.job.span.into();
-            dcx.force_print_diagnostic(diag);
+            // FIXME: needs translation
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            #[allow(rustc::untranslatable_diagnostic)]
+            dcx.struct_failure_note(format!(
+                "#{} [{:?}] {}",
+                count_printed, query_info.query.dep_kind, query_info.query.description
+            ))
+            .with_span(query_info.job.span)
+            .emit();
             count_printed += 1;
         }
 

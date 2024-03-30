@@ -1,8 +1,7 @@
-// ignore-msvc
-// ignore-wasm32-bare compiled with panic=abort by default
-// needs-unwind
+//@ ignore-msvc
+//@ needs-unwind
 
-// compile-flags: -O -C no-prepopulate-passes
+//@ compile-flags: -O -C no-prepopulate-passes
 
 #![crate_type="lib"]
 

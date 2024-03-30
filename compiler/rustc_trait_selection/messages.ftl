@@ -8,14 +8,19 @@ trait_selection_adjust_signature_remove_borrow = consider adjusting the signatur
         *[other] arguments
     }
 
-trait_selection_closure_fn_mut_label = closure is `FnMut` because it mutates the variable `{$place}` here
+trait_selection_async_closure_not_fn = async closure does not implement `{$kind}` because it captures state from its environment
 
-trait_selection_closure_fn_once_label = closure is `FnOnce` because it moves the variable `{$place}` out of its environment
+trait_selection_closure_fn_mut_label = closure is `{$trait_prefix}FnMut` because it mutates the variable `{$place}` here
 
-trait_selection_closure_kind_mismatch = expected a closure that implements the `{$expected}` trait, but this closure only implements `{$found}`
-    .label = this closure implements `{$found}`, not `{$expected}`
+trait_selection_closure_fn_once_label = closure is `{$trait_prefix}FnOnce` because it moves the variable `{$place}` out of its environment
 
-trait_selection_closure_kind_requirement = the requirement to implement `{$expected}` derives from here
+trait_selection_closure_kind_mismatch = expected a closure that implements the `{$trait_prefix}{$expected}` trait, but this closure only implements `{$trait_prefix}{$found}`
+    .label = this closure implements `{$trait_prefix}{$found}`, not `{$trait_prefix}{$expected}`
+
+trait_selection_closure_kind_requirement = the requirement to implement `{$trait_prefix}{$expected}` derives from here
+
+trait_selection_disallowed_positional_argument = positional format arguments are not allowed here
+    .help = only named format arguments with the name of one of the generic types are allowed in this context
 
 trait_selection_dump_vtable_entries = vtable entries for `{$trait_ref}`: {$entries}
 
@@ -27,6 +32,9 @@ trait_selection_ignored_diagnostic_option = `{$option_name}` is ignored due to p
     .label = `{$option_name}` is already declared here
 
 trait_selection_inherent_projection_normalization_overflow = overflow evaluating associated type `{$ty}`
+
+trait_selection_invalid_format_specifier = invalid format specifier
+    .help = no format specifier are supported in this position
 
 trait_selection_invalid_on_clause_in_rustc_on_unimplemented = invalid `on`-clause in `#[rustc_on_unimplemented]`
     .label = invalid on-clause here
@@ -58,3 +66,6 @@ trait_selection_unable_to_construct_constant_value = unable to construct a const
 
 trait_selection_unknown_format_parameter_for_on_unimplemented_attr = there is no parameter `{$argument_name}` on trait `{$trait_name}`
     .help = expect either a generic argument name or {"`{Self}`"} as format argument
+
+trait_selection_wrapped_parser_error = {$description}
+    .label = {$label}

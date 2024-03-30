@@ -143,7 +143,6 @@ fn current_dll_path() -> Result<PathBuf, String> {
             &mut module,
         )
     }
-    .ok()
     .map_err(|e| e.to_string())?;
 
     let mut filename = vec![0; 1024];
@@ -192,6 +191,12 @@ pub fn sysroot_candidates() -> SmallVec<[PathBuf; 2]> {
     }
 
     return sysroot_candidates;
+}
+
+/// Returns the provided sysroot or calls [`get_or_default_sysroot`] if it's none.
+/// Panics if [`get_or_default_sysroot`]  returns an error.
+pub fn materialize_sysroot(maybe_sysroot: Option<PathBuf>) -> PathBuf {
+    maybe_sysroot.unwrap_or_else(|| get_or_default_sysroot().expect("Failed finding sysroot"))
 }
 
 /// This function checks if sysroot is found using env::args().next(), and if it

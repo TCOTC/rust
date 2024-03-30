@@ -177,8 +177,8 @@ impl EraseType for Option<mir::DestructuredConstant<'_>> {
     type Result = [u8; size_of::<Option<mir::DestructuredConstant<'static>>>()];
 }
 
-impl EraseType for Option<ty::EarlyBinder<ty::TraitRef<'_>>> {
-    type Result = [u8; size_of::<Option<ty::EarlyBinder<ty::TraitRef<'static>>>>()];
+impl EraseType for Option<ty::ImplTraitHeader<'_>> {
+    type Result = [u8; size_of::<Option<ty::ImplTraitHeader<'static>>>()];
 }
 
 impl EraseType for Option<ty::EarlyBinder<Ty<'_>>> {
@@ -234,12 +234,15 @@ trivial! {
     Option<rustc_middle::middle::stability::DeprecationEntry>,
     Option<rustc_middle::ty::Destructor>,
     Option<rustc_middle::ty::ImplTraitInTraitData>,
+    Option<rustc_middle::ty::ScalarInt>,
     Option<rustc_span::def_id::CrateNum>,
     Option<rustc_span::def_id::DefId>,
     Option<rustc_span::def_id::LocalDefId>,
     Option<rustc_span::Span>,
+    Option<rustc_target::abi::FieldIdx>,
     Option<rustc_target::spec::PanicStrategy>,
     Option<usize>,
+    Option<rustc_middle::ty::IntrinsicDef>,
     Result<(), rustc_errors::ErrorGuaranteed>,
     Result<(), rustc_middle::traits::query::NoSolution>,
     Result<rustc_middle::traits::EvaluationResult, rustc_middle::traits::OverflowError>,
@@ -336,6 +339,7 @@ tcx_lifetime! {
     rustc_middle::mir::ConstValue,
     rustc_middle::mir::interpret::GlobalId,
     rustc_middle::mir::interpret::LitToConstInput,
+    rustc_middle::mir::interpret::EvalStaticInitializerRawResult,
     rustc_middle::traits::query::MethodAutoderefStepsResult,
     rustc_middle::traits::query::type_op::AscribeUserType,
     rustc_middle::traits::query::type_op::Eq,

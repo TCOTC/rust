@@ -237,12 +237,12 @@ fn path_segment_certainty(
         },
 
         // `get_parent` because `hir_id` refers to a `Pat`, and we're interested in the node containing the `Pat`.
-        Res::Local(hir_id) => match cx.tcx.hir().get_parent(hir_id) {
+        Res::Local(hir_id) => match cx.tcx.parent_hir_node(hir_id) {
             // An argument's type is always certain.
             Node::Param(..) => Certainty::Certain(None),
             // A local's type is certain if its type annotation is certain or it has an initializer whose
             // type is certain.
-            Node::Local(local) => {
+            Node::LetStmt(local) => {
                 let lhs = local.ty.map_or(Certainty::Uncertain, |ty| type_certainty(cx, ty));
                 let rhs = local
                     .init

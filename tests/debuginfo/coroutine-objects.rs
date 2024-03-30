@@ -1,11 +1,11 @@
 // Require a gdb that can read DW_TAG_variant_part.
-// min-gdb-version: 8.2
+//@ min-gdb-version: 8.2
 
 // LLDB without native Rust support cannot read DW_TAG_variant_part,
 // so it prints nothing for coroutines. But those tests are kept to
 // ensure that LLDB won't crash at least (like #57822).
 
-// compile-flags:-g
+//@ compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
@@ -25,17 +25,17 @@
 // === LLDB TESTS ==================================================================================
 
 // lldb-command:run
-// lldb-command:print b
-// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) $0 =
+// lldb-command:v b
+// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) b =
 // lldb-command:continue
-// lldb-command:print b
-// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) $1 =
+// lldb-command:v b
+// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) b =
 // lldb-command:continue
-// lldb-command:print b
-// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) $2 =
+// lldb-command:v b
+// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) b =
 // lldb-command:continue
-// lldb-command:print b
-// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) $3 =
+// lldb-command:v b
+// lldbg-check:(coroutine_objects::main::{coroutine_env#0}) b =
 
 // === CDB TESTS ===================================================================================
 

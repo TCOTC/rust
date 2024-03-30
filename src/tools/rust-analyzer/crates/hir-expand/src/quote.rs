@@ -31,7 +31,7 @@ macro_rules! __quote {
                     open: $span,
                     close: $span,
                 },
-                token_trees: $crate::quote::IntoTt::to_tokens(children),
+                token_trees: $crate::quote::IntoTt::to_tokens(children).into_boxed_slice(),
             }
         }
     };
@@ -146,7 +146,7 @@ impl IntoTt for Vec<crate::tt::TokenTree> {
     fn to_subtree(self, span: Span) -> crate::tt::Subtree {
         crate::tt::Subtree {
             delimiter: crate::tt::Delimiter::invisible_spanned(span),
-            token_trees: self,
+            token_trees: self.into_boxed_slice(),
         }
     }
 
@@ -266,10 +266,11 @@ mod tests {
 
         let quoted = quote!(DUMMY =>#a);
         assert_eq!(quoted.to_string(), "hello");
-        let t = format!("{quoted:?}");
+        let t = format!("{quoted:#?}");
         expect![[r#"
-            SUBTREE $$ SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) } SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) }
-              IDENT   hello SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) }"#]].assert_eq(&t);
+            SUBTREE $$ 937550:0@0..0#0 937550:0@0..0#0
+              IDENT   hello 937550:0@0..0#0"#]]
+        .assert_eq(&t);
     }
 
     #[test]
@@ -296,8 +297,9 @@ mod tests {
         // }
         let struct_name = mk_ident("Foo");
         let fields = [mk_ident("name"), mk_ident("id")];
-        let fields =
-            fields.iter().flat_map(|it| quote!(DUMMY =>#it: self.#it.clone(), ).token_trees);
+        let fields = fields
+            .iter()
+            .flat_map(|it| quote!(DUMMY =>#it: self.#it.clone(), ).token_trees.into_vec());
 
         let list = crate::tt::Subtree {
             delimiter: crate::tt::Delimiter {

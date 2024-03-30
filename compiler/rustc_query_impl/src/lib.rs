@@ -3,11 +3,10 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
 #![feature(rustdoc_internals)]
+#![feature(generic_nonzero)]
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
 #![allow(rustc::potential_query_instability, unused_parens)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 #![allow(internal_features)]
 
 #[macro_use]
@@ -42,7 +41,7 @@ use rustc_span::{ErrorGuaranteed, Span};
 
 #[macro_use]
 mod plumbing;
-pub use crate::plumbing::QueryCtxt;
+pub use crate::plumbing::{query_key_hash_verify_all, QueryCtxt};
 
 mod profiling_support;
 pub use self::profiling_support::alloc_self_profile_query_strings;

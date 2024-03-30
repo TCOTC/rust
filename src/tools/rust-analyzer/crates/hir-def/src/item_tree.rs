@@ -29,9 +29,6 @@
 //!
 //! In general, any item in the `ItemTree` stores its `AstId`, which allows mapping it back to its
 //! surface syntax.
-//!
-//! Note that we cannot store [`span::Span`]s inside of this, as typing in an item invalidates its
-//! encompassing span!
 
 mod lower;
 mod pretty;
@@ -44,21 +41,15 @@ use std::{
     ops::{Index, Range},
 };
 
-use ast::{AstNode, HasName, StructKind};
+use ast::{AstNode, StructKind};
 use base_db::CrateId;
 use either::Either;
-use hir_expand::{
-    ast_id_map::{AstIdNode, FileAstId},
-    attrs::RawAttrs,
-    name::{name, AsName, Name},
-    ExpandTo, HirFileId, InFile,
-};
+use hir_expand::{attrs::RawAttrs, name::Name, ExpandTo, HirFileId, InFile};
 use intern::Interned;
 use la_arena::{Arena, Idx, IdxRange, RawIdx};
-use profile::Count;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use span::Span;
+use span::{AstIdNode, FileAstId, SyntaxContextId};
 use stdx::never;
 use syntax::{ast, match_ast, SyntaxKind};
 use triomphe::Arc;
@@ -67,7 +58,7 @@ use crate::{
     attr::Attrs,
     db::DefDatabase,
     generics::{GenericParams, LifetimeParamData, TypeOrConstParamData},
-    path::{path, AssociatedTypeBinding, GenericArgs, ImportAlias, ModPath, Path, PathKind},
+    path::{GenericArgs, ImportAlias, ModPath, Path, PathKind},
     type_ref::{Mutability, TraitRef, TypeBound, TypeRef},
     visibility::{RawVisibility, VisibilityExplicitness},
     BlockId, Lookup,
@@ -99,8 +90,6 @@ impl fmt::Debug for RawVisibilityId {
 /// The item tree of a source file.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ItemTree {
-    _c: Count<Self>,
-
     top_level: SmallVec<[ModItem; 1]>,
     attrs: FxHashMap<AttrOwner, RawAttrs>,
 
@@ -268,14 +257,6 @@ impl ItemVisibilities {
     }
 }
 
-static VIS_PUB: RawVisibility = RawVisibility::Public;
-static VIS_PRIV_IMPLICIT: RawVisibility =
-    RawVisibility::Module(ModPath::from_kind(PathKind::Super(0)), VisibilityExplicitness::Implicit);
-static VIS_PRIV_EXPLICIT: RawVisibility =
-    RawVisibility::Module(ModPath::from_kind(PathKind::Super(0)), VisibilityExplicitness::Explicit);
-static VIS_PUB_CRATE: RawVisibility =
-    RawVisibility::Module(ModPath::from_kind(PathKind::Crate), VisibilityExplicitness::Explicit);
-
 #[derive(Default, Debug, Eq, PartialEq)]
 struct ItemTreeData {
     uses: Arena<Use>,
@@ -337,20 +318,18 @@ from_attrs!(
     LifetimeParamData(Idx<LifetimeParamData>),
 );
 
-/// Trait implemented by all item nodes in the item tree.
-pub trait ItemTreeModItemNode: Clone {
-    type Source: AstIdNode + Into<ast::Item>;
+/// Trait implemented by all nodes in the item tree.
+pub trait ItemTreeNode: Clone {
+    type Source: AstIdNode;
 
     fn ast_id(&self) -> FileAstId<Self::Source>;
 
     /// Looks up an instance of `Self` in an item tree.
     fn lookup(tree: &ItemTree, index: Idx<Self>) -> &Self;
-
-    /// Downcasts a `ModItem` to a `FileItemTreeId` specific to this type.
-    fn id_from_mod_item(mod_item: ModItem) -> Option<FileItemTreeId<Self>>;
-
-    /// Upcasts a `FileItemTreeId` to a generic `ModItem`.
-    fn id_to_mod_item(id: FileItemTreeId<Self>) -> ModItem;
+    fn attr_owner(id: FileItemTreeId<Self>) -> AttrOwner;
+}
+pub trait GenericsItemTreeNode: ItemTreeNode {
+    fn generic_params(&self) -> &Interned<GenericParams>;
 }
 
 pub struct FileItemTreeId<N>(Idx<N>);
@@ -372,7 +351,7 @@ impl<N> FileItemTreeId<N> {
 
 impl<N> Clone for FileItemTreeId<N> {
     fn clone(&self) -> Self {
-        Self(self.0)
+        *self
     }
 }
 impl<N> Copy for FileItemTreeId<N> {}
@@ -410,7 +389,7 @@ impl TreeId {
 
     pub(crate) fn item_tree(&self, db: &dyn DefDatabase) -> Arc<ItemTree> {
         match self.block {
-            Some(block) => db.block_item_tree_query(block),
+            Some(block) => db.block_item_tree(block),
             None => db.file_item_tree(self.file),
         }
     }
@@ -478,7 +457,7 @@ impl<N> Hash for ItemTreeId<N> {
 }
 
 macro_rules! mod_items {
-    ( $( $typ:ident in $fld:ident -> $ast:ty ),+ $(,)? ) => {
+    ( $( $typ:ident $(<$generic_params:ident>)? in $fld:ident -> $ast:ty ),+ $(,)? ) => {
         #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
         pub enum ModItem {
             $(
@@ -495,7 +474,7 @@ macro_rules! mod_items {
         )+
 
         $(
-            impl ItemTreeModItemNode for $typ {
+            impl ItemTreeNode for $typ {
                 type Source = $ast;
 
                 fn ast_id(&self) -> FileAstId<Self::Source> {
@@ -506,15 +485,8 @@ macro_rules! mod_items {
                     &tree.data().$fld[index]
                 }
 
-                fn id_from_mod_item(mod_item: ModItem) -> Option<FileItemTreeId<Self>> {
-                    match mod_item {
-                        ModItem::$typ(id) => Some(id),
-                        _ => None,
-                    }
-                }
-
-                fn id_to_mod_item(id: FileItemTreeId<Self>) -> ModItem {
-                    ModItem::$typ(id)
+                fn attr_owner(id: FileItemTreeId<Self>) -> AttrOwner {
+                    AttrOwner::ModItem(ModItem::$typ(id))
                 }
             }
 
@@ -525,6 +497,14 @@ macro_rules! mod_items {
                     &self.data().$fld[index]
                 }
             }
+
+            $(
+                impl GenericsItemTreeNode for $typ {
+                    fn generic_params(&self) -> &Interned<GenericParams> {
+                        &self.$generic_params
+                    }
+                }
+            )?
         )+
     };
 }
@@ -533,16 +513,16 @@ mod_items! {
     Use in uses -> ast::Use,
     ExternCrate in extern_crates -> ast::ExternCrate,
     ExternBlock in extern_blocks -> ast::ExternBlock,
-    Function in functions -> ast::Fn,
-    Struct in structs -> ast::Struct,
-    Union in unions -> ast::Union,
-    Enum in enums -> ast::Enum,
+    Function<explicit_generic_params> in functions -> ast::Fn,
+    Struct<generic_params> in structs -> ast::Struct,
+    Union<generic_params> in unions -> ast::Union,
+    Enum<generic_params> in enums -> ast::Enum,
     Const in consts -> ast::Const,
     Static in statics -> ast::Static,
-    Trait in traits -> ast::Trait,
-    TraitAlias in trait_aliases -> ast::TraitAlias,
-    Impl in impls -> ast::Impl,
-    TypeAlias in type_aliases -> ast::TypeAlias,
+    Trait<generic_params> in traits -> ast::Trait,
+    TraitAlias<generic_params> in trait_aliases -> ast::TraitAlias,
+    Impl<generic_params> in impls -> ast::Impl,
+    TypeAlias<generic_params> in type_aliases -> ast::TypeAlias,
     Mod in mods -> ast::Module,
     MacroCall in macro_calls -> ast::MacroCall,
     MacroRules in macro_rules -> ast::MacroRules,
@@ -568,6 +548,20 @@ impl_index!(fields: Field, variants: Variant, params: Param);
 impl Index<RawVisibilityId> for ItemTree {
     type Output = RawVisibility;
     fn index(&self, index: RawVisibilityId) -> &Self::Output {
+        static VIS_PUB: RawVisibility = RawVisibility::Public;
+        static VIS_PRIV_IMPLICIT: RawVisibility = RawVisibility::Module(
+            ModPath::from_kind(PathKind::Super(0)),
+            VisibilityExplicitness::Implicit,
+        );
+        static VIS_PRIV_EXPLICIT: RawVisibility = RawVisibility::Module(
+            ModPath::from_kind(PathKind::Super(0)),
+            VisibilityExplicitness::Explicit,
+        );
+        static VIS_PUB_CRATE: RawVisibility = RawVisibility::Module(
+            ModPath::from_kind(PathKind::Crate),
+            VisibilityExplicitness::Explicit,
+        );
+
         match index {
             RawVisibilityId::PRIV_IMPLICIT => &VIS_PRIV_IMPLICIT,
             RawVisibilityId::PRIV_EXPLICIT => &VIS_PRIV_EXPLICIT,
@@ -578,17 +572,26 @@ impl Index<RawVisibilityId> for ItemTree {
     }
 }
 
-impl<N: ItemTreeModItemNode> Index<FileItemTreeId<N>> for ItemTree {
+impl<N: ItemTreeNode> Index<FileItemTreeId<N>> for ItemTree {
     type Output = N;
     fn index(&self, id: FileItemTreeId<N>) -> &N {
         N::lookup(self, id.index())
     }
 }
 
-impl Index<FileItemTreeId<Variant>> for ItemTree {
-    type Output = Variant;
-    fn index(&self, id: FileItemTreeId<Variant>) -> &Variant {
-        &self[id.index()]
+impl ItemTreeNode for Variant {
+    type Source = ast::Variant;
+
+    fn ast_id(&self) -> FileAstId<Self::Source> {
+        self.ast_id
+    }
+
+    fn lookup(tree: &ItemTree, index: Idx<Self>) -> &Self {
+        &tree.data().variants[index]
+    }
+
+    fn attr_owner(id: FileItemTreeId<Self>) -> AttrOwner {
+        AttrOwner::Variant(id)
     }
 }
 
@@ -787,8 +790,7 @@ pub struct MacroCall {
     pub path: Interned<ModPath>,
     pub ast_id: FileAstId<ast::MacroCall>,
     pub expand_to: ExpandTo,
-    // FIXME: We need to move this out. It invalidates the item tree when typing inside the macro call.
-    pub call_site: Span,
+    pub ctxt: SyntaxContextId,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -818,11 +820,13 @@ impl Use {
         // Note: The AST unwraps are fine, since if they fail we should have never obtained `index`.
         let ast = InFile::new(file_id, self.ast_id).to_node(db.upcast());
         let ast_use_tree = ast.use_tree().expect("missing `use_tree`");
-        let span_map = db.span_map(file_id);
-        let (_, source_map) = lower::lower_use_tree(db, span_map.as_ref(), ast_use_tree)
-            .expect("failed to lower use tree");
+        let (_, source_map) = lower::lower_use_tree(db, ast_use_tree, &mut |range| {
+            db.span_map(file_id).span_for_range(range).ctx
+        })
+        .expect("failed to lower use tree");
         source_map[index].clone()
     }
+
     /// Maps a `UseTree` contained in this import back to its AST node.
     pub fn use_tree_source_map(
         &self,
@@ -833,10 +837,11 @@ impl Use {
         // Note: The AST unwraps are fine, since if they fail we should have never obtained `index`.
         let ast = InFile::new(file_id, self.ast_id).to_node(db.upcast());
         let ast_use_tree = ast.use_tree().expect("missing `use_tree`");
-        let span_map = db.span_map(file_id);
-        lower::lower_use_tree(db, span_map.as_ref(), ast_use_tree)
-            .expect("failed to lower use tree")
-            .1
+        lower::lower_use_tree(db, ast_use_tree, &mut |range| {
+            db.span_map(file_id).span_for_range(range).ctx
+        })
+        .expect("failed to lower use tree")
+        .1
     }
 }
 
@@ -868,25 +873,19 @@ impl UseTree {
             prefix: Option<ModPath>,
             path: &ModPath,
         ) -> Option<(ModPath, ImportKind)> {
-            match (prefix, &path.kind) {
+            match (prefix, path.kind) {
                 (None, _) => Some((path.clone(), ImportKind::Plain)),
                 (Some(mut prefix), PathKind::Plain) => {
-                    for segment in path.segments() {
-                        prefix.push_segment(segment.clone());
-                    }
+                    prefix.extend(path.segments().iter().cloned());
                     Some((prefix, ImportKind::Plain))
                 }
-                (Some(mut prefix), PathKind::Super(n))
-                    if *n > 0 && prefix.segments().is_empty() =>
-                {
+                (Some(mut prefix), PathKind::Super(n)) if n > 0 && prefix.segments().is_empty() => {
                     // `super::super` + `super::rest`
                     match &mut prefix.kind {
                         PathKind::Super(m) => {
                             cov_mark::hit!(concat_super_mod_paths);
-                            *m += *n;
-                            for segment in path.segments() {
-                                prefix.push_segment(segment.clone());
-                            }
+                            *m += n;
+                            prefix.extend(path.segments().iter().cloned());
                             Some((prefix, ImportKind::Plain))
                         }
                         _ => None,
@@ -960,10 +959,10 @@ impl ModItem {
             | ModItem::Mod(_)
             | ModItem::MacroRules(_)
             | ModItem::Macro2(_) => None,
-            ModItem::MacroCall(call) => Some(AssocItem::MacroCall(*call)),
-            ModItem::Const(konst) => Some(AssocItem::Const(*konst)),
-            ModItem::TypeAlias(alias) => Some(AssocItem::TypeAlias(*alias)),
-            ModItem::Function(func) => Some(AssocItem::Function(*func)),
+            &ModItem::MacroCall(call) => Some(AssocItem::MacroCall(call)),
+            &ModItem::Const(konst) => Some(AssocItem::Const(konst)),
+            &ModItem::TypeAlias(alias) => Some(AssocItem::TypeAlias(alias)),
+            &ModItem::Function(func) => Some(AssocItem::Function(func)),
         }
     }
 
@@ -1027,7 +1026,7 @@ impl AssocItem {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Variant {
     pub name: Name,
     pub fields: Fields,

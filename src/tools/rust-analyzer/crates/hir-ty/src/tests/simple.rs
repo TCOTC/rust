@@ -2121,6 +2121,7 @@ async fn main() {
         "#,
         expect![[r#"
             16..193 '{     ...2 }; }': ()
+            16..193 '{     ...2 }; }': impl Future<Output = ()>
             26..27 'x': i32
             30..43 'unsafe { 92 }': i32
             39..41 '92': i32
@@ -2130,6 +2131,8 @@ async fn main() {
             65..83 'async ....await': ()
             73..75 '()': ()
             95..96 'z': ControlFlow<(), ()>
+            130..140 'try { () }': ControlFlow<(), ()>
+            130..140 'try { () }': fn from_output<ControlFlow<(), ()>>(<ControlFlow<(), ()> as Try>::Output) -> ControlFlow<(), ()>
             130..140 'try { () }': ControlFlow<(), ()>
             136..138 '()': ()
             150..151 'w': i32
@@ -2190,9 +2193,9 @@ fn main() {
             149..151 'Ok': extern "rust-call" Ok<(), ()>(()) -> Result<(), ()>
             149..155 'Ok(())': Result<(), ()>
             152..154 '()': ()
-            167..171 'test': fn test<(), (), impl Fn() -> impl Future<Output = Result<(), ()>>, impl Future<Output = Result<(), ()>>>(impl Fn() -> impl Future<Output = Result<(), ()>>)
+            167..171 'test': fn test<(), (), impl FnMut() -> impl Future<Output = Result<(), ()>>, impl Future<Output = Result<(), ()>>>(impl FnMut() -> impl Future<Output = Result<(), ()>>)
             167..228 'test(|...    })': ()
-            172..227 '|| asy...     }': impl Fn() -> impl Future<Output = Result<(), ()>>
+            172..227 '|| asy...     }': impl FnMut() -> impl Future<Output = Result<(), ()>>
             175..227 'async ...     }': impl Future<Output = Result<(), ()>>
             191..205 'return Err(())': !
             198..201 'Err': extern "rust-call" Err<(), ()>(()) -> Result<(), ()>
@@ -2887,6 +2890,43 @@ fn f() {
 }
 
 #[test]
+fn closure_kind_with_predicates() {
+    check_types(
+        r#"
+//- minicore: fn
+#![feature(unboxed_closures)]
+
+struct X<T: FnOnce()>(T);
+
+fn f1() -> impl FnOnce() {
+    || {}
+ // ^^^^^ impl FnOnce()
+}
+
+fn f2(c: impl FnOnce<(), Output = i32>) {}
+
+fn test {
+    let x1 = X(|| {});
+    let c1 = x1.0;
+     // ^^ impl FnOnce()
+
+    let c2 = || {};
+     // ^^ impl Fn()
+    let x2 = X(c2);
+    let c3 = x2.0
+     // ^^ impl Fn()
+
+    let c4 = f1();
+     // ^^ impl FnOnce() + ?Sized
+
+    f2(|| { 0 });
+    // ^^^^^^^^ impl FnOnce() -> i32
+}
+    "#,
+    )
+}
+
+#[test]
 fn derive_macro_should_work_for_associated_type() {
     check_types(
         r#"
@@ -3376,11 +3416,8 @@ fn main() {
     [x,] = &[1,];
   //^^^^expected &[i32; 1], got [{unknown}; _]
 
-    // FIXME we only want the outermost error, but this matches the current
-    // behavior of slice patterns
     let x;
     [(x,),] = &[(1,),];
-  // ^^^^expected {unknown}, got ({unknown},)
   //^^^^^^^expected &[(i32,); 1], got [{unknown}; _]
 
     let x;

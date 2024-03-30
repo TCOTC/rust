@@ -2,9 +2,9 @@
 // for nested closures and coroutines.
 
 // Require a gdb that can read DW_TAG_variant_part.
-// min-gdb-version: 8.2
+//@ min-gdb-version: 8.2
 
-// compile-flags:-g
+//@ compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
@@ -20,11 +20,11 @@
 
 // lldb-command:run
 
-// lldb-command:print g
-// lldbg-check:(issue_57822::main::{closure_env#1}) $0 = { f = { x = 1 } }
+// lldb-command:v g
+// lldbg-check:(issue_57822::main::{closure_env#1}) g = { f = { x = 1 } }
 
-// lldb-command:print b
-// lldbg-check:(issue_57822::main::{coroutine_env#3}) $1 =
+// lldb-command:v b
+// lldbg-check:(issue_57822::main::{coroutine_env#3}) b =
 
 #![feature(omit_gdb_pretty_printer_section, coroutines, coroutine_trait)]
 #![omit_gdb_pretty_printer_section]

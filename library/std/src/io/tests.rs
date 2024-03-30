@@ -262,6 +262,17 @@ fn chain_bufread() {
 }
 
 #[test]
+fn chain_splitted_char() {
+    let chain = b"\xc3".chain(b"\xa9".as_slice());
+    assert_eq!(crate::io::read_to_string(chain).unwrap(), "é");
+
+    let mut chain = b"\xc3".chain(b"\xa9\n".as_slice());
+    let mut buf = String::new();
+    assert_eq!(chain.read_line(&mut buf).unwrap(), 3);
+    assert_eq!(buf, "é\n");
+}
+
+#[test]
 fn bufreader_size_hint() {
     let testdata = b"ABCDEFGHIJKL";
     let mut buf_reader = BufReader::new(&testdata[..]);
@@ -655,7 +666,7 @@ fn bench_take_read_buf(b: &mut test::Bencher) {
 
 // Issue #120603
 #[test]
-#[should_panic = "read should not return more bytes than there is capacity for in the read buffer"]
+#[should_panic]
 fn read_buf_broken_read() {
     struct MalformedRead;
 
@@ -680,4 +691,16 @@ fn read_buf_full_read() {
     }
 
     assert_eq!(BufReader::new(FullRead).fill_buf().unwrap().len(), DEFAULT_BUF_SIZE);
+}
+
+#[test]
+// Miri does not support signalling OOM
+#[cfg_attr(miri, ignore)]
+// 64-bit only to be sure the allocator will fail fast on an impossible to satsify size
+#[cfg(target_pointer_width = "64")]
+fn try_oom_error() {
+    let mut v = Vec::<u8>::new();
+    let reserve_err = v.try_reserve(isize::MAX as usize - 1).unwrap_err();
+    let io_err = io::Error::from(reserve_err);
+    assert_eq!(io::ErrorKind::OutOfMemory, io_err.kind());
 }

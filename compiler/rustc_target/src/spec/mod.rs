@@ -123,6 +123,8 @@ pub enum LinkerFlavor {
     Bpf,
     /// Linker tool for Nvidia PTX.
     Ptx,
+    /// LLVM bitcode linker that can be used as a `self-contained` linker
+    Llbc,
 }
 
 /// Linker flavors available externally through command line (`-Clinker-flavor`)
@@ -141,6 +143,7 @@ pub enum LinkerFlavorCli {
     EmCc,
     Bpf,
     Ptx,
+    Llbc,
 
     // Legacy stable values
     Gcc,
@@ -160,6 +163,7 @@ impl LinkerFlavorCli {
             | LinkerFlavorCli::Msvc(Lld::Yes)
             | LinkerFlavorCli::EmCc
             | LinkerFlavorCli::Bpf
+            | LinkerFlavorCli::Llbc
             | LinkerFlavorCli::Ptx => true,
             LinkerFlavorCli::Gcc
             | LinkerFlavorCli::Ld
@@ -207,7 +211,7 @@ impl ToJson for LldFlavor {
 
 impl LinkerFlavor {
     /// At this point the target's reference linker flavor doesn't yet exist and we need to infer
-    /// it. The inference always succeds and gives some result, and we don't report any flavor
+    /// it. The inference always succeeds and gives some result, and we don't report any flavor
     /// incompatibility errors for json target specs. The CLI flavor is used as the main source
     /// of truth, other flags are used in case of ambiguities.
     fn from_cli_json(cli: LinkerFlavorCli, lld_flavor: LldFlavor, is_gnu: bool) -> LinkerFlavor {
@@ -219,6 +223,7 @@ impl LinkerFlavor {
             LinkerFlavorCli::Msvc(lld) => LinkerFlavor::Msvc(lld),
             LinkerFlavorCli::EmCc => LinkerFlavor::EmCc,
             LinkerFlavorCli::Bpf => LinkerFlavor::Bpf,
+            LinkerFlavorCli::Llbc => LinkerFlavor::Llbc,
             LinkerFlavorCli::Ptx => LinkerFlavor::Ptx,
 
             // Below: legacy stable values
@@ -258,6 +263,7 @@ impl LinkerFlavor {
             LinkerFlavor::Msvc(..) => LinkerFlavorCli::Msvc(Lld::No),
             LinkerFlavor::EmCc => LinkerFlavorCli::Em,
             LinkerFlavor::Bpf => LinkerFlavorCli::Bpf,
+            LinkerFlavor::Llbc => LinkerFlavorCli::Llbc,
             LinkerFlavor::Ptx => LinkerFlavorCli::Ptx,
         }
     }
@@ -272,6 +278,7 @@ impl LinkerFlavor {
             LinkerFlavor::Msvc(lld) => LinkerFlavorCli::Msvc(lld),
             LinkerFlavor::EmCc => LinkerFlavorCli::EmCc,
             LinkerFlavor::Bpf => LinkerFlavorCli::Bpf,
+            LinkerFlavor::Llbc => LinkerFlavorCli::Llbc,
             LinkerFlavor::Ptx => LinkerFlavorCli::Ptx,
         }
     }
@@ -286,6 +293,7 @@ impl LinkerFlavor {
             LinkerFlavorCli::Msvc(lld) => (Some(Cc::No), Some(lld)),
             LinkerFlavorCli::EmCc => (Some(Cc::Yes), Some(Lld::Yes)),
             LinkerFlavorCli::Bpf | LinkerFlavorCli::Ptx => (None, None),
+            LinkerFlavorCli::Llbc => (None, None),
 
             // Below: legacy stable values
             LinkerFlavorCli::Gcc => (Some(Cc::Yes), None),
@@ -340,7 +348,7 @@ impl LinkerFlavor {
             LinkerFlavor::WasmLld(cc) => LinkerFlavor::WasmLld(cc_hint.unwrap_or(cc)),
             LinkerFlavor::Unix(cc) => LinkerFlavor::Unix(cc_hint.unwrap_or(cc)),
             LinkerFlavor::Msvc(lld) => LinkerFlavor::Msvc(lld_hint.unwrap_or(lld)),
-            LinkerFlavor::EmCc | LinkerFlavor::Bpf | LinkerFlavor::Ptx => self,
+            LinkerFlavor::EmCc | LinkerFlavor::Bpf | LinkerFlavor::Llbc | LinkerFlavor::Ptx => self,
         }
     }
 
@@ -355,8 +363,8 @@ impl LinkerFlavor {
     pub fn check_compatibility(self, cli: LinkerFlavorCli) -> Option<String> {
         let compatible = |cli| {
             // The CLI flavor should be compatible with the target if:
-            // 1. they are counterparts: they have the same principal flavor.
             match (self, cli) {
+                // 1. they are counterparts: they have the same principal flavor.
                 (LinkerFlavor::Gnu(..), LinkerFlavorCli::Gnu(..))
                 | (LinkerFlavor::Darwin(..), LinkerFlavorCli::Darwin(..))
                 | (LinkerFlavor::WasmLld(..), LinkerFlavorCli::WasmLld(..))
@@ -364,11 +372,14 @@ impl LinkerFlavor {
                 | (LinkerFlavor::Msvc(..), LinkerFlavorCli::Msvc(..))
                 | (LinkerFlavor::EmCc, LinkerFlavorCli::EmCc)
                 | (LinkerFlavor::Bpf, LinkerFlavorCli::Bpf)
+                | (LinkerFlavor::Llbc, LinkerFlavorCli::Llbc)
                 | (LinkerFlavor::Ptx, LinkerFlavorCli::Ptx) => return true,
+                // 2. The linker flavor is independent of target and compatible
+                (LinkerFlavor::Ptx, LinkerFlavorCli::Llbc) => return true,
                 _ => {}
             }
 
-            // 2. or, the flavor is legacy and survives this roundtrip.
+            // 3. or, the flavor is legacy and survives this roundtrip.
             cli == self.with_cli_hints(cli).to_cli()
         };
         (!compatible(cli)).then(|| {
@@ -387,6 +398,7 @@ impl LinkerFlavor {
             | LinkerFlavor::Unix(..)
             | LinkerFlavor::EmCc
             | LinkerFlavor::Bpf
+            | LinkerFlavor::Llbc
             | LinkerFlavor::Ptx => LldFlavor::Ld,
             LinkerFlavor::Darwin(..) => LldFlavor::Ld64,
             LinkerFlavor::WasmLld(..) => LldFlavor::Wasm,
@@ -412,6 +424,7 @@ impl LinkerFlavor {
             | LinkerFlavor::Msvc(_)
             | LinkerFlavor::Unix(_)
             | LinkerFlavor::Bpf
+            | LinkerFlavor::Llbc
             | LinkerFlavor::Ptx => false,
         }
     }
@@ -431,6 +444,7 @@ impl LinkerFlavor {
             | LinkerFlavor::Msvc(_)
             | LinkerFlavor::Unix(_)
             | LinkerFlavor::Bpf
+            | LinkerFlavor::Llbc
             | LinkerFlavor::Ptx => false,
         }
     }
@@ -480,6 +494,7 @@ linker_flavor_cli_impls! {
     (LinkerFlavorCli::Msvc(Lld::No)) "msvc"
     (LinkerFlavorCli::EmCc) "em-cc"
     (LinkerFlavorCli::Bpf) "bpf"
+    (LinkerFlavorCli::Llbc) "llbc"
     (LinkerFlavorCli::Ptx) "ptx"
 
     // Legacy stable flavors
@@ -566,7 +581,7 @@ impl LinkSelfContainedDefault {
         self == LinkSelfContainedDefault::False
     }
 
-    /// Returns whether the target spec explictly requests self-contained linking, i.e. not via
+    /// Returns whether the target spec explicitly requests self-contained linking, i.e. not via
     /// inference.
     pub fn is_linker_enabled(self) -> bool {
         match self {
@@ -1221,6 +1236,7 @@ bitflags::bitflags! {
         const KCFI    = 1 << 8;
         const KERNELADDRESS = 1 << 9;
         const SAFESTACK = 1 << 10;
+        const DATAFLOW = 1 << 11;
     }
 }
 rustc_data_structures::external_bitflags_debug! { SanitizerSet }
@@ -1233,6 +1249,7 @@ impl SanitizerSet {
         Some(match self {
             SanitizerSet::ADDRESS => "address",
             SanitizerSet::CFI => "cfi",
+            SanitizerSet::DATAFLOW => "dataflow",
             SanitizerSet::KCFI => "kcfi",
             SanitizerSet::KERNELADDRESS => "kernel-address",
             SanitizerSet::LEAK => "leak",
@@ -1402,6 +1419,7 @@ supported_targets! {
     ("i686-unknown-linux-gnu", i686_unknown_linux_gnu),
     ("i586-unknown-linux-gnu", i586_unknown_linux_gnu),
     ("loongarch64-unknown-linux-gnu", loongarch64_unknown_linux_gnu),
+    ("loongarch64-unknown-linux-musl", loongarch64_unknown_linux_musl),
     ("m68k-unknown-linux-gnu", m68k_unknown_linux_gnu),
     ("csky-unknown-linux-gnuabiv2", csky_unknown_linux_gnuabiv2),
     ("csky-unknown-linux-gnuabiv2hf", csky_unknown_linux_gnuabiv2hf),
@@ -1562,6 +1580,7 @@ supported_targets! {
 
     ("aarch64-pc-windows-msvc", aarch64_pc_windows_msvc),
     ("aarch64-uwp-windows-msvc", aarch64_uwp_windows_msvc),
+    ("arm64ec-pc-windows-msvc", arm64ec_pc_windows_msvc),
     ("x86_64-pc-windows-msvc", x86_64_pc_windows_msvc),
     ("x86_64-uwp-windows-msvc", x86_64_uwp_windows_msvc),
     ("x86_64-win7-windows-msvc", x86_64_win7_windows_msvc),
@@ -1575,7 +1594,9 @@ supported_targets! {
     ("wasm32-unknown-emscripten", wasm32_unknown_emscripten),
     ("wasm32-unknown-unknown", wasm32_unknown_unknown),
     ("wasm32-wasi", wasm32_wasi),
-    ("wasm32-wasi-preview1-threads", wasm32_wasi_preview1_threads),
+    ("wasm32-wasip1", wasm32_wasip1),
+    ("wasm32-wasip2", wasm32_wasip2),
+    ("wasm32-wasip1-threads", wasm32_wasip1_threads),
     ("wasm64-unknown-unknown", wasm64_unknown_unknown),
 
     ("thumbv6m-none-eabi", thumbv6m_none_eabi),
@@ -1600,6 +1621,7 @@ supported_targets! {
     ("riscv32i-unknown-none-elf", riscv32i_unknown_none_elf),
     ("riscv32im-risc0-zkvm-elf", riscv32im_risc0_zkvm_elf),
     ("riscv32im-unknown-none-elf", riscv32im_unknown_none_elf),
+    ("riscv32ima-unknown-none-elf", riscv32ima_unknown_none_elf),
     ("riscv32imc-unknown-none-elf", riscv32imc_unknown_none_elf),
     ("riscv32imc-esp-espidf", riscv32imc_esp_espidf),
     ("riscv32imac-esp-espidf", riscv32imac_esp_espidf),
@@ -1673,7 +1695,7 @@ supported_targets! {
 
     ("mips64-openwrt-linux-musl", mips64_openwrt_linux_musl),
 
-    ("aarch64-unknown-nto-qnx710", aarch64_unknown_nto_qnx_710),
+    ("aarch64-unknown-nto-qnx710", aarch64_unknown_nto_qnx710),
     ("x86_64-pc-nto-qnx710", x86_64_pc_nto_qnx710),
     ("i586-pc-nto-qnx700", i586_pc_nto_qnx700),
 
@@ -1737,6 +1759,9 @@ impl TargetWarnings {
 pub struct Target {
     /// Target triple to pass to LLVM.
     pub llvm_target: StaticCow<str>,
+    /// Metadata about a target, for example the description or tier.
+    /// Used for generating target documentation.
+    pub metadata: TargetMetadata,
     /// Number of bits in a pointer. Influences the `target_pointer_width` `cfg` variable.
     pub pointer_width: u32,
     /// Architecture to use for ABI considerations. Valid options include: "x86",
@@ -1746,6 +1771,23 @@ pub struct Target {
     pub data_layout: StaticCow<str>,
     /// Optional settings with defaults.
     pub options: TargetOptions,
+}
+
+/// Metadata about a target like the description or tier.
+/// Part of #120745.
+/// All fields are optional for now, but intended to be required in the future.
+#[derive(Default, PartialEq, Clone, Debug)]
+pub struct TargetMetadata {
+    /// A short description of the target including platform requirements,
+    /// for example "64-bit Linux (kernel 3.2+, glibc 2.17+)".
+    pub description: Option<StaticCow<str>>,
+    /// The tier of the target. 1, 2 or 3.
+    pub tier: Option<u64>,
+    /// Whether the Rust project ships host tools for a target.
+    pub host_tools: Option<bool>,
+    /// Whether a target has the `std` library. This is usually true for targets running
+    /// on an operating system.
+    pub std: Option<bool>,
 }
 
 impl Target {
@@ -2044,6 +2086,17 @@ pub struct TargetOptions {
     /// Default number of codegen units to use in debug mode
     pub default_codegen_units: Option<u64>,
 
+    /// Default codegen backend used for this target. Defaults to `None`.
+    ///
+    /// If `None`, then `CFG_DEFAULT_CODEGEN_BACKEND` environmental variable captured when
+    /// compiling `rustc` will be used instead (or llvm if it is not set).
+    ///
+    /// N.B. when *using* the compiler, backend can always be overridden with `-Zcodegen-backend`.
+    ///
+    /// This was added by WaffleLapkin in #116793. The motivation is a rustc fork that requires a
+    /// custom codegen backend for a particular target.
+    pub default_codegen_backend: Option<StaticCow<str>>,
+
     /// Whether to generate trap instructions in places where optimization would
     /// otherwise produce control flow that falls through into unrelated memory.
     pub trap_unreachable: bool,
@@ -2194,6 +2247,7 @@ fn add_link_args_iter(
         | LinkerFlavor::Unix(..)
         | LinkerFlavor::EmCc
         | LinkerFlavor::Bpf
+        | LinkerFlavor::Llbc
         | LinkerFlavor::Ptx => {}
     }
 }
@@ -2350,6 +2404,7 @@ impl Default for TargetOptions {
             stack_probes: StackProbeType::None,
             min_global_align: None,
             default_codegen_units: None,
+            default_codegen_backend: None,
             trap_unreachable: true,
             requires_lto: false,
             singlethread: false,
@@ -2448,7 +2503,6 @@ impl Target {
             | System { .. }
             | RustIntrinsic
             | RustCall
-            | PlatformIntrinsic
             | Unadjusted
             | Cdecl { .. }
             | RustCold => true,
@@ -2539,6 +2593,7 @@ impl Target {
 
         let mut base = Target {
             llvm_target: get_req_field("llvm-target")?.into(),
+            metadata: Default::default(),
             pointer_width: get_req_field("target-pointer-width")?
                 .parse::<u32>()
                 .map_err(|_| "target-pointer-width must be an integer".to_string())?,
@@ -2546,6 +2601,22 @@ impl Target {
             arch: get_req_field("arch")?.into(),
             options: Default::default(),
         };
+
+        // FIXME: This doesn't properly validate anything and just ignores the data if it's invalid.
+        // That's okay for now, the only use of this is when generating docs, which we don't do for
+        // custom targets.
+        if let Some(Json::Object(mut metadata)) = obj.remove("metadata") {
+            base.metadata.description = metadata
+                .remove("description")
+                .and_then(|desc| desc.as_str().map(|desc| desc.to_owned().into()));
+            base.metadata.tier = metadata
+                .remove("tier")
+                .and_then(|tier| tier.as_u64())
+                .filter(|tier| (1..=3).contains(tier));
+            base.metadata.host_tools =
+                metadata.remove("host_tools").and_then(|host| host.as_bool());
+            base.metadata.std = metadata.remove("std").and_then(|host| host.as_bool());
+        }
 
         let mut incorrect_type = vec![];
 
@@ -2790,6 +2861,7 @@ impl Target {
                             base.$key_name |= match s.as_str() {
                                 Some("address") => SanitizerSet::ADDRESS,
                                 Some("cfi") => SanitizerSet::CFI,
+                                Some("dataflow") => SanitizerSet::DATAFLOW,
                                 Some("kcfi") => SanitizerSet::KCFI,
                                 Some("kernel-address") => SanitizerSet::KERNELADDRESS,
                                 Some("leak") => SanitizerSet::LEAK,
@@ -3241,6 +3313,7 @@ impl ToJson for Target {
         }
 
         target_val!(llvm_target);
+        target_val!(metadata);
         d.insert("target-pointer-width".to_string(), self.pointer_width.to_string().to_json());
         target_val!(arch);
         target_val!(data_layout);

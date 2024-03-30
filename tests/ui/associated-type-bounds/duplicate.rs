@@ -1,4 +1,3 @@
-#![feature(associated_type_bounds)]
 #![feature(type_alias_impl_trait)]
 
 use std::iter;
@@ -133,16 +132,19 @@ where
 
 fn FRPIT1() -> impl Iterator<Item: Copy, Item: Send> {
     //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+    //~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
     iter::empty()
     //~^ ERROR type annotations needed
 }
 fn FRPIT2() -> impl Iterator<Item: Copy, Item: Copy> {
     //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+    //~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
     iter::empty()
     //~^ ERROR type annotations needed
 }
 fn FRPIT3() -> impl Iterator<Item: 'static, Item: 'static> {
     //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+    //~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
     iter::empty()
     //~^ ERROR type annotations needed
 }
@@ -183,10 +185,13 @@ type ETAI3<T: Iterator<Item: 'static, Item: 'static>> = impl Copy;
 //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 type ETAI4 = impl Iterator<Item: Copy, Item: Send>;
 //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+//~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 type ETAI5 = impl Iterator<Item: Copy, Item: Copy>;
 //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+//~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 type ETAI6 = impl Iterator<Item: 'static, Item: 'static>;
 //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+//~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 
 trait TRI1<T: Iterator<Item: Copy, Item: Send>> {}
 //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
@@ -251,24 +256,17 @@ where
 trait TRA1 {
     type A: Iterator<Item: Copy, Item: Send>;
     //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
-    //~| ERROR `<<Self as TRA1>::A as Iterator>::Item` cannot be sent between threads safely
-    //~| ERROR the trait bound `<<Self as TRA1>::A as Iterator>::Item: Copy` is not satisfied
+    //~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 }
 trait TRA2 {
     type A: Iterator<Item: Copy, Item: Copy>;
     //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
-    //~| ERROR the trait bound `<<Self as TRA2>::A as Iterator>::Item: Copy` is not satisfied
+    //~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 }
 trait TRA3 {
     type A: Iterator<Item: 'static, Item: 'static>;
     //~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
+    //~| ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 }
-
-type TADyn1 = dyn Iterator<Item: Copy, Item: Send>;
-//~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
-type TADyn2 = Box<dyn Iterator<Item: Copy, Item: Copy>>;
-//~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
-type TADyn3 = dyn Iterator<Item: 'static, Item: 'static>;
-//~^ ERROR the value of the associated type `Item` in trait `Iterator` is already specified [E0719]
 
 fn main() {}

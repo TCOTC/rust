@@ -1,9 +1,6 @@
-// aux-build:block-on.rs
-// edition:2021
-// run-pass
-
-// FIXME(async_closures): When `fn_sig_for_fn_abi` is fixed, remove this.
-// ignore-pass (test emits codegen-time warnings)
+//@ aux-build:block-on.rs
+//@ edition:2021
+//@ run-pass
 
 #![feature(async_closure)]
 

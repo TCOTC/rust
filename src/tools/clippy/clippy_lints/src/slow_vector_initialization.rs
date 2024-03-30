@@ -62,7 +62,7 @@ declare_lint_pass!(SlowVectorInit => [SLOW_VECTOR_INITIALIZATION]);
 /// assigned to a variable. For example, `let mut vec = Vec::with_capacity(0)` or
 /// `vec = Vec::with_capacity(0)`
 struct VecAllocation<'tcx> {
-    /// HirId of the variable
+    /// `HirId` of the variable
     local_id: HirId,
 
     /// Reference to the expression which allocates the vector
@@ -119,7 +119,7 @@ impl<'tcx> LateLintPass<'tcx> for SlowVectorInit {
     fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'_>) {
         // Matches statements which initializes vectors. For example: `let mut vec = Vec::with_capacity(10)`
         // or `Vec::new()`
-        if let StmtKind::Local(local) = stmt.kind
+        if let StmtKind::Let(local) = stmt.kind
             && let PatKind::Binding(BindingAnnotation::MUT, local_id, _, None) = local.pat.kind
             && let Some(init) = local.init
             && let Some(size_expr) = Self::as_vec_initializer(cx, init)

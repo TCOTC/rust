@@ -101,7 +101,7 @@ fn field_fix(
     };
     Some(Assist {
         id: AssistId("expected-method-found-field-fix", AssistKind::QuickFix),
-        label: Label::new("Use parentheses to call the value of the field".to_string()),
+        label: Label::new("Use parentheses to call the value of the field".to_owned()),
         group: None,
         target: range,
         source_change: Some(SourceChange::from_iter([
@@ -335,8 +335,8 @@ fn main() {
             r#"
 struct Foo { bar: i32 }
 fn foo() {
-    Foo { bar: i32 }.bar();
-                  // ^^^ error: no method `bar` on type `Foo`, but a field with a similar name exists
+    Foo { bar: 0 }.bar();
+                // ^^^ error: no method `bar` on type `Foo`, but a field with a similar name exists
 }
 "#,
         );

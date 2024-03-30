@@ -1,6 +1,6 @@
 use super::TypeErrCtxt;
 use rustc_errors::Applicability::{MachineApplicable, MaybeIncorrect};
-use rustc_errors::{pluralize, Diagnostic, MultiSpan};
+use rustc_errors::{pluralize, Diag, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_middle::traits::ObligationCauseCode;
@@ -15,7 +15,7 @@ use rustc_span::{def_id::DefId, sym, BytePos, Span, Symbol};
 impl<'tcx> TypeErrCtxt<'_, 'tcx> {
     pub fn note_and_explain_type_err(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         err: TypeError<'tcx>,
         cause: &ObligationCause<'tcx>,
         sp: Span,
@@ -106,7 +106,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                                 }
                                 p_def_id.as_local().and_then(|id| {
                                     let local_id = tcx.local_def_id_to_hir_id(id);
-                                    let generics = tcx.hir().find_parent(local_id)?.generics()?;
+                                    let generics = tcx.parent_hir_node(local_id).generics()?;
                                     Some((id, generics))
                                 })
                             });
@@ -299,17 +299,19 @@ impl<T> Trait<T> for X {
                     }
                     (ty::Dynamic(t, _, ty::DynKind::Dyn), ty::Alias(ty::Opaque, alias))
                         if let Some(def_id) = t.principal_def_id()
-                            && tcx.explicit_item_bounds(alias.def_id).skip_binder().iter().any(
-                                |(pred, _span)| match pred.kind().skip_binder() {
+                            && tcx
+                                .explicit_item_super_predicates(alias.def_id)
+                                .skip_binder()
+                                .iter()
+                                .any(|(pred, _span)| match pred.kind().skip_binder() {
                                     ty::ClauseKind::Trait(trait_predicate)
                                         if trait_predicate.polarity
-                                            == ty::ImplPolarity::Positive =>
+                                            == ty::PredicatePolarity::Positive =>
                                     {
                                         trait_predicate.def_id() == def_id
                                     }
                                     _ => false,
-                                },
-                            ) =>
+                                }) =>
                     {
                         diag.help(format!(
                             "you can box the `{}` to coerce it to `Box<{}>`, but you'll have to \
@@ -372,7 +374,7 @@ impl<T> Trait<T> for X {
                             && matches!(
                                 tcx.def_kind(body_owner_def_id),
                                 DefKind::Fn
-                                    | DefKind::Static(_)
+                                    | DefKind::Static { .. }
                                     | DefKind::Const
                                     | DefKind::AssocFn
                                     | DefKind::AssocConst
@@ -412,13 +414,13 @@ impl<T> Trait<T> for X {
                             ty::Alias(..) => values.expected,
                             _ => values.found,
                         };
-                        let preds = tcx.explicit_item_bounds(opaque_ty.def_id);
+                        let preds = tcx.explicit_item_super_predicates(opaque_ty.def_id);
                         for (pred, _span) in preds.skip_binder() {
                             let ty::ClauseKind::Trait(trait_predicate) = pred.kind().skip_binder()
                             else {
                                 continue;
                             };
-                            if trait_predicate.polarity != ty::ImplPolarity::Positive {
+                            if trait_predicate.polarity != ty::PredicatePolarity::Positive {
                                 continue;
                             }
                             let def_id = trait_predicate.def_id();
@@ -522,7 +524,7 @@ impl<T> Trait<T> for X {
 
     fn suggest_constraint(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         msg: impl Fn() -> String,
         body_owner_def_id: DefId,
         proj_ty: &ty::AliasTy<'tcx>,
@@ -595,7 +597,7 @@ impl<T> Trait<T> for X {
     ///    fn that returns the type.
     fn expected_projection(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         proj_ty: &ty::AliasTy<'tcx>,
         values: ExpectedFound<Ty<'tcx>>,
         body_owner_def_id: DefId,
@@ -705,7 +707,7 @@ fn foo(&self) -> Self::T { String::new() }
     /// a return type. This can occur when dealing with `TryStream` (#71035).
     fn suggest_constraining_opaque_associated_type(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         msg: impl Fn() -> String,
         proj_ty: &ty::AliasTy<'tcx>,
         ty: Ty<'tcx>,
@@ -740,7 +742,7 @@ fn foo(&self) -> Self::T { String::new() }
 
     fn point_at_methods_that_satisfy_associated_type(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         assoc_container_id: DefId,
         current_method_ident: Option<Symbol>,
         proj_ty_item_def_id: DefId,
@@ -798,29 +800,28 @@ fn foo(&self) -> Self::T { String::new() }
 
     fn point_at_associated_type(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         body_owner_def_id: DefId,
         found: Ty<'tcx>,
     ) -> bool {
         let tcx = self.tcx;
 
-        let Some(hir_id) = body_owner_def_id.as_local() else {
+        let Some(def_id) = body_owner_def_id.as_local() else {
             return false;
         };
-        let Some(hir_id) = tcx.opt_local_def_id_to_hir_id(hir_id) else {
-            return false;
-        };
+
         // When `body_owner` is an `impl` or `trait` item, look in its associated types for
         // `expected` and point at it.
+        let hir_id = tcx.local_def_id_to_hir_id(def_id);
         let parent_id = tcx.hir().get_parent_item(hir_id);
-        let item = tcx.opt_hir_node_by_def_id(parent_id.def_id);
+        let item = tcx.hir_node_by_def_id(parent_id.def_id);
 
         debug!("expected_projection parent item {:?}", item);
 
         let param_env = tcx.param_env(body_owner_def_id);
 
         match item {
-            Some(hir::Node::Item(hir::Item { kind: hir::ItemKind::Trait(.., items), .. })) => {
+            hir::Node::Item(hir::Item { kind: hir::ItemKind::Trait(.., items), .. }) => {
                 // FIXME: account for `#![feature(specialization)]`
                 for item in &items[..] {
                     match item.kind {
@@ -845,10 +846,10 @@ fn foo(&self) -> Self::T { String::new() }
                     }
                 }
             }
-            Some(hir::Node::Item(hir::Item {
+            hir::Node::Item(hir::Item {
                 kind: hir::ItemKind::Impl(hir::Impl { items, .. }),
                 ..
-            })) => {
+            }) => {
                 for item in &items[..] {
                     if let hir::AssocItemKind::Type = item.kind {
                         let assoc_ty = tcx.type_of(item.id.owner_id).instantiate_identity();
@@ -879,7 +880,7 @@ fn foo(&self) -> Self::T { String::new() }
     /// type is defined on a supertrait of the one present in the bounds.
     fn constrain_generic_bound_associated_type_structured_suggestion(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         trait_ref: &ty::TraitRef<'tcx>,
         bounds: hir::GenericBounds<'_>,
         assoc: ty::AssocItem,
@@ -916,7 +917,7 @@ fn foo(&self) -> Self::T { String::new() }
     /// associated type to a given type `ty`.
     fn constrain_associated_type_structured_suggestion(
         &self,
-        diag: &mut Diagnostic,
+        diag: &mut Diag<'_>,
         span: Span,
         assoc: ty::AssocItem,
         assoc_args: &[ty::GenericArg<'tcx>],

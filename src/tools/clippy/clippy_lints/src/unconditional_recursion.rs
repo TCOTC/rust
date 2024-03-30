@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{expr_or_init, get_trait_def_id, path_def_id};
+use clippy_utils::{expr_or_init, fn_def_id_with_node_args, path_def_id};
 use rustc_ast::BinOpKind;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
@@ -7,7 +7,7 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{walk_body, walk_expr, FnKind, Visitor};
 use rustc_hir::{Body, Expr, ExprKind, FnDecl, HirId, Item, ItemKind, Node, QPath, TyKind};
-use rustc_hir_analysis::hir_ty_to_ty;
+use rustc_hir_analysis::lower_ty;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
@@ -19,11 +19,11 @@ use rustc_trait_selection::traits::error_reporting::suggestions::ReturnsVisitor;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks that there isn't an infinite recursion in `PartialEq` trait
-    /// implementation.
+    /// Checks that there isn't an infinite recursion in trait
+    /// implementations.
     ///
     /// ### Why is this bad?
-    /// This is a hard to find infinite recursion which will crashing any code
+    /// This is a hard to find infinite recursion that will crash any code.
     /// using it.
     ///
     /// ### Example
@@ -42,7 +42,7 @@ declare_clippy_lint! {
     /// Use instead:
     ///
     /// In such cases, either use `#[derive(PartialEq)]` or don't implement it.
-    #[clippy::version = "1.76.0"]
+    #[clippy::version = "1.77.0"]
     pub UNCONDITIONAL_RECURSION,
     suspicious,
     "detect unconditional recursion in some traits implementation"
@@ -69,20 +69,12 @@ fn span_error(cx: &LateContext<'_>, method_span: Span, expr: &Expr<'_>) {
     );
 }
 
-fn get_ty_def_id(ty: Ty<'_>) -> Option<DefId> {
-    match ty.peel_refs().kind() {
-        ty::Adt(adt, _) => Some(adt.did()),
-        ty::Foreign(def_id) => Some(*def_id),
-        _ => None,
-    }
-}
-
 fn get_hir_ty_def_id<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: rustc_hir::Ty<'tcx>) -> Option<DefId> {
     let TyKind::Path(qpath) = hir_ty.kind else { return None };
     match qpath {
         QPath::Resolved(_, path) => path.res.opt_def_id(),
         QPath::TypeRelative(_, _) => {
-            let ty = hir_ty_to_ty(tcx, &hir_ty);
+            let ty = lower_ty(tcx, &hir_ty);
 
             match ty.kind() {
                 ty::Alias(ty::Projection, proj) => {
@@ -131,21 +123,49 @@ fn get_impl_trait_def_id(cx: &LateContext<'_>, method_def_id: LocalDefId) -> Opt
     }
 }
 
-#[allow(clippy::unnecessary_def_path)]
+/// When we have `x == y` where `x = &T` and `y = &T`, then that resolves to
+/// `<&T as PartialEq<&T>>::eq`, which is not the same as `<T as PartialEq<T>>::eq`,
+/// however we still would want to treat it the same, because we know that it's a blanket impl
+/// that simply delegates to the `PartialEq` impl with one reference removed.
+///
+/// Still, we can't just do `lty.peel_refs() == rty.peel_refs()` because when we have `x = &T` and
+/// `y = &&T`, this is not necessarily the same as `<T as PartialEq<T>>::eq`
+///
+/// So to avoid these FNs and FPs, we keep removing a layer of references from *both* sides
+/// until both sides match the expected LHS and RHS type (or they don't).
+fn matches_ty<'tcx>(
+    mut left: Ty<'tcx>,
+    mut right: Ty<'tcx>,
+    expected_left: Ty<'tcx>,
+    expected_right: Ty<'tcx>,
+) -> bool {
+    while let (&ty::Ref(_, lty, _), &ty::Ref(_, rty, _)) = (left.kind(), right.kind()) {
+        if lty == expected_left && rty == expected_right {
+            return true;
+        }
+        left = lty;
+        right = rty;
+    }
+    false
+}
+
 fn check_partial_eq(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId, name: Ident, expr: &Expr<'_>) {
-    let args = cx
-        .tcx
-        .instantiate_bound_regions_with_erased(cx.tcx.fn_sig(method_def_id).skip_binder())
-        .inputs();
+    let Some(sig) = cx
+        .typeck_results()
+        .liberated_fn_sigs()
+        .get(cx.tcx.local_def_id_to_hir_id(method_def_id))
+    else {
+        return;
+    };
+
     // That has two arguments.
-    if let [self_arg, other_arg] = args
-        && let Some(self_arg) = get_ty_def_id(*self_arg)
-        && let Some(other_arg) = get_ty_def_id(*other_arg)
+    if let [self_arg, other_arg] = sig.inputs()
+        && let &ty::Ref(_, self_arg, _) = self_arg.kind()
+        && let &ty::Ref(_, other_arg, _) = other_arg.kind()
         // The two arguments are of the same type.
-        && self_arg == other_arg
         && let Some(trait_def_id) = get_impl_trait_def_id(cx, method_def_id)
         // The trait is `PartialEq`.
-        && Some(trait_def_id) == get_trait_def_id(cx, &["core", "cmp", "PartialEq"])
+        && cx.tcx.is_diagnostic_item(sym::PartialEq, trait_def_id)
     {
         let to_check_op = if name.name == sym::eq {
             BinOpKind::Eq
@@ -154,31 +174,19 @@ fn check_partial_eq(cx: &LateContext<'_>, method_span: Span, method_def_id: Loca
         };
         let is_bad = match expr.kind {
             ExprKind::Binary(op, left, right) if op.node == to_check_op => {
-                // Then we check if the left-hand element is of the same type as `self`.
-                if let Some(left_ty) = cx.typeck_results().expr_ty_opt(left)
-                    && let Some(left_id) = get_ty_def_id(left_ty)
-                    && self_arg == left_id
-                    && let Some(right_ty) = cx.typeck_results().expr_ty_opt(right)
-                    && let Some(right_id) = get_ty_def_id(right_ty)
-                    && other_arg == right_id
-                {
-                    true
-                } else {
-                    false
-                }
+                // Then we check if the LHS matches self_arg and RHS matches other_arg
+                let left_ty = cx.typeck_results().expr_ty_adjusted(left);
+                let right_ty = cx.typeck_results().expr_ty_adjusted(right);
+                matches_ty(left_ty, right_ty, self_arg, other_arg)
             },
-            ExprKind::MethodCall(segment, receiver, &[_arg], _) if segment.ident.name == name.name => {
-                if let Some(ty) = cx.typeck_results().expr_ty_opt(receiver)
-                    && let Some(ty_id) = get_ty_def_id(ty)
-                    && self_arg != ty_id
-                {
-                    // Since this called on a different type, the lint should not be
-                    // triggered here.
-                    return;
-                }
+            ExprKind::MethodCall(segment, receiver, [arg], _) if segment.ident.name == name.name => {
+                let receiver_ty = cx.typeck_results().expr_ty_adjusted(receiver);
+                let arg_ty = cx.typeck_results().expr_ty_adjusted(arg);
+
                 if let Some(fn_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
                     && let Some(trait_id) = cx.tcx.trait_of_item(fn_id)
                     && trait_id == trait_def_id
+                    && matches_ty(receiver_ty, arg_ty, self_arg, other_arg)
                 {
                     true
                 } else {
@@ -193,7 +201,6 @@ fn check_partial_eq(cx: &LateContext<'_>, method_span: Span, method_def_id: Loca
     }
 }
 
-#[allow(clippy::unnecessary_def_path)]
 fn check_to_string(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId, name: Ident, expr: &Expr<'_>) {
     let args = cx
         .tcx
@@ -216,7 +223,7 @@ fn check_to_string(cx: &LateContext<'_>, method_span: Span, method_def_id: Local
         && let Some(trait_) = impl_.of_trait
         && let Some(trait_def_id) = trait_.trait_def_id()
         // The trait is `ToString`.
-        && Some(trait_def_id) == get_trait_def_id(cx, &["alloc", "string", "ToString"])
+        && cx.tcx.is_diagnostic_item(sym::ToString, trait_def_id)
     {
         let is_bad = match expr.kind {
             ExprKind::MethodCall(segment, _receiver, &[_arg], _) if segment.ident.name == name.name => {
@@ -283,7 +290,6 @@ where
         self.map
     }
 
-    #[allow(clippy::unnecessary_def_path)]
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         if self.found_default_call {
             return;
@@ -295,7 +301,7 @@ where
             && is_default_method_on_current_ty(self.cx.tcx, qpath, self.implemented_ty_id)
             && let Some(method_def_id) = path_def_id(self.cx, f)
             && let Some(trait_def_id) = self.cx.tcx.trait_of_item(method_def_id)
-            && Some(trait_def_id) == get_trait_def_id(self.cx, &["core", "default", "Default"])
+            && self.cx.tcx.is_diagnostic_item(sym::Default, trait_def_id)
         {
             self.found_default_call = true;
             span_error(self.cx, self.method_span, expr);
@@ -304,10 +310,9 @@ where
 }
 
 impl UnconditionalRecursion {
-    #[allow(clippy::unnecessary_def_path)]
     fn init_default_impl_for_type_if_needed(&mut self, cx: &LateContext<'_>) {
         if self.default_impl_for_type.is_empty()
-            && let Some(default_trait_id) = get_trait_def_id(cx, &["core", "default", "Default"])
+            && let Some(default_trait_id) = cx.tcx.get_diagnostic_item(sym::Default)
         {
             let impls = cx.tcx.trait_impls_of(default_trait_id);
             for (ty, impl_def_ids) in impls.non_blanket_impls() {
@@ -386,6 +391,34 @@ impl UnconditionalRecursion {
     }
 }
 
+fn check_from(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId, expr: &Expr<'_>) {
+    let Some(sig) = cx
+        .typeck_results()
+        .liberated_fn_sigs()
+        .get(cx.tcx.local_def_id_to_hir_id(method_def_id))
+    else {
+        return;
+    };
+
+    // Check if we are calling `Into::into` where the node args match with our `From::from` signature:
+    // From::from signature: fn(S1) -> S2
+    // <S1 as Into<S2>>::into(s1), node_args=[S1, S2]
+    // If they do match, then it must mean that it is the blanket impl,
+    // which calls back into our `From::from` again (`Into` is not specializable).
+    // rustc's unconditional_recursion already catches calling `From::from` directly
+    if let Some((fn_def_id, node_args)) = fn_def_id_with_node_args(cx, expr)
+        && let [s1, s2] = **node_args
+        && let (Some(s1), Some(s2)) = (s1.as_type(), s2.as_type())
+        && let Some(trait_def_id) = cx.tcx.trait_of_item(fn_def_id)
+        && cx.tcx.is_diagnostic_item(sym::Into, trait_def_id)
+        && get_impl_trait_def_id(cx, method_def_id) == cx.tcx.get_diagnostic_item(sym::From)
+        && s1 == sig.inputs()[0]
+        && s2 == sig.output()
+    {
+        span_error(cx, method_span, expr);
+    }
+}
+
 impl<'tcx> LateLintPass<'tcx> for UnconditionalRecursion {
     fn check_fn(
         &mut self,
@@ -402,10 +435,11 @@ impl<'tcx> LateLintPass<'tcx> for UnconditionalRecursion {
             // Doesn't have a conditional return.
             && !has_conditional_return(body, expr)
         {
-            if name.name == sym::eq || name.name == sym::ne {
-                check_partial_eq(cx, method_span, method_def_id, name, expr);
-            } else if name.name == sym::to_string {
-                check_to_string(cx, method_span, method_def_id, name, expr);
+            match name.name {
+                sym::eq | sym::ne => check_partial_eq(cx, method_span, method_def_id, name, expr),
+                sym::to_string => check_to_string(cx, method_span, method_def_id, name, expr),
+                sym::from => check_from(cx, method_span, method_def_id, expr),
+                _ => {},
             }
             self.check_default_new(cx, decl, body, method_span, method_def_id);
         }

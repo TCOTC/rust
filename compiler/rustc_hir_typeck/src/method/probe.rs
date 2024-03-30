@@ -54,7 +54,7 @@ pub use self::PickKind::*;
 #[derive(Clone, Copy, Debug)]
 pub struct IsSuggestion(pub bool);
 
-struct ProbeContext<'a, 'tcx> {
+pub(crate) struct ProbeContext<'a, 'tcx> {
     fcx: &'a FnCtxt<'a, 'tcx>,
     span: Span,
     mode: Mode,
@@ -111,7 +111,7 @@ pub(crate) struct Candidate<'tcx> {
     // The way this is handled is through `xform_self_ty`. It contains
     // the receiver type of this candidate, but `xform_self_ty`,
     // `xform_ret_ty` and `kind` (which contains the predicates) have the
-    // generic parameters of this candidate substituted with the *same set*
+    // generic parameters of this candidate instantiated with the *same set*
     // of inference variables, which acts as some weird sort of "query".
     //
     // When we check out a candidate, we require `xform_self_ty` to be
@@ -355,7 +355,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         .unwrap()
     }
 
-    fn probe_op<OP, R>(
+    pub(crate) fn probe_op<OP, R>(
         &'a self,
         span: Span,
         mode: Mode,
@@ -386,10 +386,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                 let infcx = &self.infcx;
                 let (ParamEnvAnd { param_env: _, value: self_ty }, canonical_inference_vars) =
-                    infcx.instantiate_canonical_with_fresh_inference_vars(
-                        span,
-                        &param_env_and_self_ty,
-                    );
+                    infcx.instantiate_canonical(span, &param_env_and_self_ty);
                 debug!(
                     "probe_op: Mode::Path, param_env_and_self_ty={:?} self_ty={:?}",
                     param_env_and_self_ty, self_ty
@@ -531,7 +528,7 @@ fn method_autoderef_steps<'tcx>(
                 from_unsafe_deref: reached_raw_pointer,
                 unsize: false,
             };
-            if let ty::RawPtr(_) = ty.kind() {
+            if let ty::RawPtr(_, _) = ty.kind() {
                 // all the subsequent steps will be from_unsafe_deref
                 reached_raw_pointer = true;
             }
@@ -661,13 +658,13 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                 // of the iterations in the autoderef loop, so there is no problem with it
                 // being discoverable in another one of these iterations.
                 //
-                // Using `instantiate_canonical_with_fresh_inference_vars` on our
+                // Using `instantiate_canonical` on our
                 // `Canonical<QueryResponse<Ty<'tcx>>>` and then *throwing away* the
                 // `CanonicalVarValues` will exactly give us such a generalization - it
                 // will still match the original object type, but it won't pollute our
                 // type variables in any form, so just do that!
                 let (QueryResponse { value: generalized_self_ty, .. }, _ignored_var_values) =
-                    self.fcx.instantiate_canonical_with_fresh_inference_vars(self.span, self_ty);
+                    self.fcx.instantiate_canonical(self.span, self_ty);
 
                 self.assemble_inherent_candidates_from_object(generalized_self_ty);
                 self.assemble_inherent_impl_candidates_for_type(p.def_id());
@@ -699,7 +696,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             | ty::Str
             | ty::Array(..)
             | ty::Slice(_)
-            | ty::RawPtr(_)
+            | ty::RawPtr(_, _)
             | ty::Ref(..)
             | ty::Never
             | ty::Tuple(..) => self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty),
@@ -799,7 +796,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         // the `Self` type. An [`ObjectSafetyViolation::SupertraitSelf`] error
         // will be reported by `object_safety.rs` if the method refers to the
         // `Self` type anywhere other than the receiver. Here, we use a
-        // substitution that replaces `Self` with the object type itself. Hence,
+        // instantiation that replaces `Self` with the object type itself. Hence,
         // a `&self` method will wind up with an argument type like `&dyn Trait`.
         let trait_ref = principal.with_self_ty(self.tcx, self_ty);
         self.elaborate_bounds(iter::once(trait_ref), |this, new_trait_ref, item| {
@@ -1216,7 +1213,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         // In general, during probing we erase regions.
         let region = tcx.lifetimes.re_erased;
 
-        let autoref_ty = Ty::new_ref(tcx, region, ty::TypeAndMut { ty: self_ty, mutbl });
+        let autoref_ty = Ty::new_ref(tcx, region, self_ty, mutbl);
         self.pick_method(autoref_ty, unstable_candidates).map(|r| {
             r.map(|mut pick| {
                 pick.autoderefs = step.autoderefs;
@@ -1241,12 +1238,11 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             return None;
         }
 
-        let &ty::RawPtr(ty::TypeAndMut { ty, mutbl: hir::Mutability::Mut }) = self_ty.kind() else {
+        let &ty::RawPtr(ty, hir::Mutability::Mut) = self_ty.kind() else {
             return None;
         };
 
-        let const_self_ty = ty::TypeAndMut { ty, mutbl: hir::Mutability::Not };
-        let const_ptr_ty = Ty::new_ptr(self.tcx, const_self_ty);
+        let const_ptr_ty = Ty::new_imm_ptr(self.tcx, ty);
         self.pick_method(const_ptr_ty, unstable_candidates).map(|r| {
             r.map(|mut pick| {
                 pick.autoderefs = step.autoderefs;
@@ -1420,15 +1416,13 @@ impl<'tcx> Pick<'tcx> {
                     }
                     _ => {}
                 }
-                if tcx.sess.is_nightly_build() {
-                    for (candidate, feature) in &self.unstable_candidates {
-                        lint.help(format!(
-                            "add `#![feature({})]` to the crate attributes to enable `{}`",
-                            feature,
-                            tcx.def_path_str(candidate.item.def_id),
-                        ));
-                    }
-                }
+                tcx.disabled_nightly_features(
+                    lint,
+                    Some(scope_expr_id),
+                    self.unstable_candidates.iter().map(|(candidate, feature)| {
+                        (format!(" `{}`", tcx.def_path_str(candidate.item.def_id)), *feature)
+                    }),
+                );
             },
         );
     }
@@ -1751,7 +1745,9 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     /// Similarly to `probe_for_return_type`, this method attempts to find the best matching
     /// candidate method where the method name may have been misspelled. Similarly to other
     /// edit distance based suggestions, we provide at most one such suggestion.
-    fn probe_for_similar_candidate(&mut self) -> Result<Option<ty::AssocItem>, MethodError<'tcx>> {
+    pub(crate) fn probe_for_similar_candidate(
+        &mut self,
+    ) -> Result<Option<ty::AssocItem>, MethodError<'tcx>> {
         debug!("probing for method names similar to {:?}", self.method_name);
 
         self.probe(|_| {
@@ -1767,6 +1763,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             );
             pcx.allow_similar_names = true;
             pcx.assemble_inherent_candidates();
+            pcx.assemble_extension_candidates_for_all_traits();
 
             let method_names = pcx.candidate_method_names(|_| true);
             pcx.allow_similar_names = false;
@@ -1776,6 +1773,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     pcx.reset();
                     pcx.method_name = Some(method_name);
                     pcx.assemble_inherent_candidates();
+                    pcx.assemble_extension_candidates_for_all_traits();
                     pcx.pick_core().and_then(|pick| pick.ok()).map(|pick| pick.item)
                 })
                 .collect();
@@ -1857,8 +1855,8 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         assert!(!args.has_escaping_bound_vars());
 
         // It is possible for type parameters or early-bound lifetimes
-        // to appear in the signature of `self`. The substitutions we
-        // are given do not include type/lifetime parameters for the
+        // to appear in the signature of `self`. The generic parameters
+        // we are given do not include type/lifetime parameters for the
         // method yet. So create fresh variables here for those too,
         // if there are any.
         let generics = self.tcx.generics_of(method);
@@ -1889,7 +1887,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         self.instantiate_bound_regions_with_erased(xform_fn_sig)
     }
 
-    /// Gets the type of an impl and generate substitutions with inference vars.
+    /// Gets the type of an impl and generate generic parameters with inference vars.
     fn impl_ty_and_args(
         &self,
         impl_def_id: DefId,
@@ -1913,7 +1911,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     ///    late-bound regions with 'static. Otherwise, if we were going to replace late-bound
     ///    regions with actual region variables as is proper, we'd have to ensure that the same
     ///    region got replaced with the same variable, which requires a bit more coordination
-    ///    and/or tracking the substitution and
+    ///    and/or tracking the instantiations and
     ///    so forth.
     fn instantiate_bound_regions_with_erased<T>(&self, value: ty::Binder<'tcx, T>) -> T
     where
@@ -1931,7 +1929,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         }
     }
 
-    /// Determine if the associated item withe the given DefId matches
+    /// Determine if the associated item with the given DefId matches
     /// the desired name via a doc alias.
     fn matches_by_doc_alias(&self, def_id: DefId) -> bool {
         let Some(name) = self.method_name else {
@@ -1943,7 +1941,21 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         let hir_id = self.fcx.tcx.local_def_id_to_hir_id(local_def_id);
         let attrs = self.fcx.tcx.hir().attrs(hir_id);
         for attr in attrs {
-            let sym::doc = attr.name_or_empty() else {
+            if sym::doc == attr.name_or_empty() {
+            } else if sym::rustc_confusables == attr.name_or_empty() {
+                let Some(confusables) = attr.meta_item_list() else {
+                    continue;
+                };
+                // #[rustc_confusables("foo", "bar"))]
+                for n in confusables {
+                    if let Some(lit) = n.lit()
+                        && name.as_str() == lit.symbol.as_str()
+                    {
+                        return true;
+                    }
+                }
+                continue;
+            } else {
                 continue;
             };
             let Some(values) = attr.meta_item_list() else {

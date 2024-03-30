@@ -20,6 +20,7 @@ Subcommands:
     test, t                  Run tests
     nextest                  Run tests with nextest (requires cargo-nextest installed)
     setup                    Only perform automatic setup, but without asking questions (for getting a proper libstd)
+    clean                    Clean the Miri cache & target directory
 
 The cargo options are exactly the same as for `cargo run` and `cargo test`, respectively.
 
@@ -74,14 +75,15 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
     // We cannot know which of those flags take arguments and which do not,
     // so we cannot detect subcommands later.
     let Some(subcommand) = args.next() else {
-        show_error!("`cargo miri` needs to be called with a subcommand (`run`, `test`)");
+        show_error!("`cargo miri` needs to be called with a subcommand (`run`, `test`, `clean`)");
     };
     let subcommand = match &*subcommand {
         "setup" => MiriCommand::Setup,
         "test" | "t" | "run" | "r" | "nextest" => MiriCommand::Forward(subcommand),
+        "clean" => MiriCommand::Clean,
         _ =>
             show_error!(
-                "`cargo miri` supports the following subcommands: `run`, `test`, `nextest`, and `setup`."
+                "`cargo miri` supports the following subcommands: `run`, `test`, `nextest`, `clean`, and `setup`."
             ),
     };
     let verbose = num_arg_flag("-v");
@@ -92,6 +94,16 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
     let host = &rustc_version.host;
     let target = get_arg_flag_value("--target");
     let target = target.as_ref().unwrap_or(host);
+
+    // If cleaning the target directory & sysroot cache,
+    // delete them then exit. There is no reason to setup a new
+    // sysroot in this execution.
+    if let MiriCommand::Clean = subcommand {
+        let metadata = get_cargo_metadata();
+        clean_target_dir(&metadata);
+        clean_sysroot();
+        return;
+    }
 
     // We always setup.
     let miri_sysroot = setup(&subcommand, target, &rustc_version, verbose);
@@ -110,6 +122,7 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
     let cargo_cmd = match subcommand {
         MiriCommand::Forward(s) => s,
         MiriCommand::Setup => return, // `cargo miri setup` stops here.
+        MiriCommand::Clean => unreachable!(),
     };
     let metadata = get_cargo_metadata();
     let mut cmd = cargo();
@@ -142,11 +155,7 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
         .arg(format!("target.'cfg(all())'.runner=[{cargo_miri_path_for_toml}, 'runner']"));
 
     // Set `--target-dir` to `miri` inside the original target directory.
-    let mut target_dir = match get_arg_flag_value("--target-dir") {
-        Some(dir) => PathBuf::from(dir),
-        None => metadata.target_directory.clone().into_std_path_buf(),
-    };
-    target_dir.push("miri");
+    let target_dir = get_target_dir(&metadata);
     cmd.arg("--target-dir").arg(target_dir);
 
     // *After* we set all the flags that need setting, forward everything else. Make sure to skip
@@ -193,6 +202,9 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
     cmd.env("MIRI_BE_RUSTC", "target"); // we better remember to *unset* this in the other phases!
 
     // Set rustdoc to us as well, so we can run doctests.
+    if let Some(orig_rustdoc) = env::var_os("RUSTDOC") {
+        cmd.env("MIRI_ORIG_RUSTDOC", orig_rustdoc);
+    }
     cmd.env("RUSTDOC", &cargo_miri_path);
 
     cmd.env("MIRI_LOCAL_CRATES", local_crates(&metadata));
@@ -572,9 +584,10 @@ pub fn phase_rustdoc(mut args: impl Iterator<Item = String>) {
     let verbose = std::env::var("MIRI_VERBOSE")
         .map_or(0, |verbose| verbose.parse().expect("verbosity flag must be an integer"));
 
-    // phase_cargo_miri sets the RUSTDOC env var to ourselves, so we can't use that here;
-    // just default to a straight-forward invocation for now:
-    let mut cmd = Command::new("rustdoc");
+    // phase_cargo_miri sets the RUSTDOC env var to ourselves, and puts a backup
+    // of the old value into MIRI_ORIG_RUSTDOC. So that's what we have to invoke now.
+    let rustdoc = env::var("MIRI_ORIG_RUSTDOC").unwrap_or("rustdoc".to_string());
+    let mut cmd = Command::new(rustdoc);
 
     let extern_flag = "--extern";
     let runtool_flag = "--runtool";
@@ -611,7 +624,7 @@ pub fn phase_rustdoc(mut args: impl Iterator<Item = String>) {
 
     // The `--test-builder` and `--runtool` arguments are unstable rustdoc features,
     // which are disabled by default. We first need to enable them explicitly:
-    cmd.arg("-Z").arg("unstable-options");
+    cmd.arg("-Zunstable-options");
 
     // rustdoc needs to know the right sysroot.
     cmd.arg("--sysroot").arg(env::var_os("MIRI_SYSROOT").unwrap());

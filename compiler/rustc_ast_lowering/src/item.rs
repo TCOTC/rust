@@ -33,19 +33,20 @@ pub(super) struct ItemLowerer<'a, 'hir> {
 /// clause if it exists.
 fn add_ty_alias_where_clause(
     generics: &mut ast::Generics,
-    mut where_clauses: (TyAliasWhereClause, TyAliasWhereClause),
+    mut where_clauses: TyAliasWhereClauses,
     prefer_first: bool,
 ) {
     if !prefer_first {
-        where_clauses = (where_clauses.1, where_clauses.0);
+        (where_clauses.before, where_clauses.after) = (where_clauses.after, where_clauses.before);
     }
-    if where_clauses.0.0 || !where_clauses.1.0 {
-        generics.where_clause.has_where_token = where_clauses.0.0;
-        generics.where_clause.span = where_clauses.0.1;
-    } else {
-        generics.where_clause.has_where_token = where_clauses.1.0;
-        generics.where_clause.span = where_clauses.1.1;
-    }
+    let where_clause =
+        if where_clauses.before.has_where_token || !where_clauses.after.has_where_token {
+            where_clauses.before
+        } else {
+            where_clauses.after
+        };
+    generics.where_clause.has_where_token = where_clause.has_where_token;
+    generics.where_clause.span = where_clause.span;
 }
 
 impl<'a, 'hir> ItemLowerer<'a, 'hir> {
@@ -274,7 +275,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         }
                         Some(ty) => this.lower_ty(
                             ty,
-                            ImplTraitContext::TypeAliasesOpaqueTy { in_assoc_ty: false },
+                            ImplTraitContext::OpaqueTy {
+                                origin: hir::OpaqueTyOrigin::TyAlias {
+                                    parent: this.local_def_id(id),
+                                    in_assoc_ty: false,
+                                },
+                                fn_kind: None,
+                            },
                         ),
                     },
                 );
@@ -366,6 +373,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         (trait_ref, lowered_ty)
                     });
 
+                self.is_in_trait_impl = trait_ref.is_some();
                 let new_impl_items = self
                     .arena
                     .alloc_from_iter(impl_items.iter().map(|item| self.lower_impl_item_ref(item)));
@@ -569,7 +577,12 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     });
                 }
 
-                let path = if trees.is_empty() && !prefix.segments.is_empty() {
+                // Condition should match `build_reduced_graph_for_use_tree`.
+                let path = if trees.is_empty()
+                    && !(prefix.segments.is_empty()
+                        || prefix.segments.len() == 1
+                            && prefix.segments[0].ident.name == kw::PathRoot)
+                {
                     // For empty lists we need to lower the prefix so it is checked for things
                     // like stability later.
                     let res = self.lower_import_res(id, span);
@@ -715,7 +728,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
         }
     }
 
-    fn lower_field_def(&mut self, (index, f): (usize, &FieldDef)) -> hir::FieldDef<'hir> {
+    pub(super) fn lower_field_def(
+        &mut self,
+        (index, f): (usize, &FieldDef),
+    ) -> hir::FieldDef<'hir> {
         let ty = if let TyKind::Path(qself, path) = &f.ty.kind {
             let t = self.lower_path_ty(
                 &f.ty,
@@ -927,7 +943,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         Some(ty) => {
                             let ty = this.lower_ty(
                                 ty,
-                                ImplTraitContext::TypeAliasesOpaqueTy { in_assoc_ty: true },
+                                ImplTraitContext::OpaqueTy {
+                                    origin: hir::OpaqueTyOrigin::TyAlias {
+                                        parent: this.local_def_id(i.id),
+                                        in_assoc_ty: true,
+                                    },
+                                    fn_kind: None,
+                                },
                             );
                             hir::ImplItemKind::Type(ty)
                         }
@@ -957,13 +979,6 @@ impl<'hir> LoweringContext<'_, 'hir> {
     }
 
     fn lower_impl_item_ref(&mut self, i: &AssocItem) -> hir::ImplItemRef {
-        let trait_item_def_id = self
-            .resolver
-            .get_partial_res(i.id)
-            .map(|r| r.expect_full_res().opt_def_id())
-            .unwrap_or(None);
-        self.is_in_trait_impl = trait_item_def_id.is_some();
-
         hir::ImplItemRef {
             id: hir::ImplItemId { owner_id: hir::OwnerId { def_id: self.local_def_id(i.id) } },
             ident: self.lower_ident(i.ident),
@@ -979,7 +994,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 },
                 AssocItemKind::MacCall(..) => unimplemented!(),
             },
-            trait_item_def_id,
+            trait_item_def_id: self
+                .resolver
+                .get_partial_res(i.id)
+                .map(|r| r.expect_full_res().opt_def_id())
+                .unwrap_or(None),
         }
     }
 
@@ -1060,7 +1079,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
     fn lower_block_expr_opt(&mut self, span: Span, block: Option<&Block>) -> hir::Expr<'hir> {
         match block {
             Some(block) => self.lower_block_expr(block),
-            None => self.expr_err(span, self.dcx().span_delayed_bug(span, "no block")),
+            None => self.expr_err(span, self.dcx().has_errors().unwrap()),
         }
     }
 
@@ -1408,8 +1427,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
         // Error if `?Trait` bounds in where clauses don't refer directly to type parameters.
         // Note: we used to clone these bounds directly onto the type parameter (and avoid lowering
         // these into hir when we lower thee where clauses), but this makes it quite difficult to
-        // keep track of the Span info. Now, `add_implicitly_sized` in `AstConv` checks both param bounds and
-        // where clauses for `?Sized`.
+        // keep track of the Span info. Now, `<dyn HirTyLowerer>::add_implicit_sized_bound`
+        // checks both param bounds and where clauses for `?Sized`.
         for pred in &generics.where_clause.predicates {
             let WherePredicate::BoundPredicate(bound_pred) = pred else {
                 continue;

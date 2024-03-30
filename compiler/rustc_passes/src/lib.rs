@@ -8,12 +8,10 @@
 #![doc(rust_logo)]
 #![feature(rustdoc_internals)]
 #![allow(internal_features)]
+#![feature(generic_nonzero)]
 #![feature(let_chains)]
 #![feature(map_try_insert)]
-#![feature(min_specialization)]
 #![feature(try_blocks)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate rustc_middle;
@@ -30,6 +28,7 @@ mod debugger_visualizer;
 mod diagnostic_items;
 pub mod entry;
 mod errors;
+#[cfg(debug_assertions)]
 pub mod hir_id_validator;
 pub mod hir_stats;
 mod lang_items;

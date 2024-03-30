@@ -76,16 +76,10 @@ pub(super) fn mangle<'tcx>(
         }
         // FIXME(async_closures): This shouldn't be needed when we fix
         // `Instance::ty`/`Instance::def_id`.
-        ty::InstanceDef::ConstructCoroutineInClosureShim { target_kind, .. }
-        | ty::InstanceDef::CoroutineKindShim { target_kind, .. } => match target_kind {
-            ty::ClosureKind::Fn => unreachable!(),
-            ty::ClosureKind::FnMut => {
-                printer.write_str("{{fn-mut-shim}}").unwrap();
-            }
-            ty::ClosureKind::FnOnce => {
-                printer.write_str("{{fn-once-shim}}").unwrap();
-            }
-        },
+        ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
+        | ty::InstanceDef::CoroutineKindShim { .. } => {
+            printer.write_str("{{fn-once-shim}}").unwrap();
+        }
         _ => {}
     }
 
@@ -99,7 +93,7 @@ fn get_symbol_hash<'tcx>(
     instance: Instance<'tcx>,
 
     // type of the item, without any generic
-    // parameters substituted; this is
+    // parameters instantiated; this is
     // included in the hash as a kind of
     // safeguard.
     item_type: Ty<'tcx>,

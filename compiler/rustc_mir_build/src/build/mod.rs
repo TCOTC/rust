@@ -1,16 +1,15 @@
 use crate::build::expr::as_place::PlaceBuilder;
 use crate::build::scope::DropKind;
 use itertools::Itertools;
-use rustc_apfloat::ieee::{Double, Single};
+use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use rustc_apfloat::Float;
 use rustc_ast::attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedIndexMultiMap;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::Node;
+use rustc_hir::{self as hir, BindingAnnotation, ByRef, Node};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
@@ -18,9 +17,8 @@ use rustc_middle::hir::place::PlaceBase as HirPlaceBase;
 use rustc_middle::middle::region;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::*;
-use rustc_middle::thir::{
-    self, BindingMode, ExprId, LintLevel, LocalVarId, Param, ParamId, PatKind, Thir,
-};
+use rustc_middle::query::TyCtxtAt;
+use rustc_middle::thir::{self, ExprId, LintLevel, LocalVarId, Param, ParamId, PatKind, Thir};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::symbol::sym;
 use rustc_span::Span;
@@ -29,13 +27,6 @@ use rustc_target::abi::FieldIdx;
 use rustc_target::spec::abi::Abi;
 
 use super::lints;
-
-pub(crate) fn mir_built(
-    tcx: TyCtxt<'_>,
-    def: LocalDefId,
-) -> &rustc_data_structures::steal::Steal<Body<'_>> {
-    tcx.alloc_steal_mir(mir_build(tcx, def))
-}
 
 pub(crate) fn closure_saved_names_of_captured_variables<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -54,7 +45,8 @@ pub(crate) fn closure_saved_names_of_captured_variables<'tcx>(
 }
 
 /// Construct the MIR for a given `DefId`.
-fn mir_build<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Body<'tcx> {
+pub(crate) fn mir_build<'tcx>(tcx: TyCtxtAt<'tcx>, def: LocalDefId) -> Body<'tcx> {
+    let tcx = tcx.tcx;
     tcx.ensure_with_value().thir_abstract_const(def);
     if let Err(e) = tcx.check_match(def) {
         return construct_error(tcx, def, e);
@@ -234,6 +226,10 @@ struct Builder<'a, 'tcx> {
     // the root (most of them do) and saves us from retracing many sub-paths
     // many times, and rechecking many nodes.
     lint_level_roots_cache: GrowableBitSet<hir::ItemLocalId>,
+
+    /// Collects additional coverage information during MIR building.
+    /// Only present if branch coverage is enabled and this function is eligible.
+    coverage_branch_info: Option<coverageinfo::BranchInfoBuilder>,
 }
 
 type CaptureMap<'tcx> = SortedIndexMultiMap<usize, hir::HirId, Capture<'tcx>>;
@@ -338,7 +334,7 @@ struct GuardFrameLocal {
 }
 
 impl GuardFrameLocal {
-    fn new(id: LocalVarId, _binding_mode: BindingMode) -> Self {
+    fn new(id: LocalVarId) -> Self {
         GuardFrameLocal { id }
     }
 }
@@ -631,7 +627,7 @@ fn construct_error(tcx: TyCtxt<'_>, def_id: LocalDefId, guar: ErrorGuaranteed) -
         | DefKind::AssocConst
         | DefKind::AnonConst
         | DefKind::InlineConst
-        | DefKind::Static(_) => (vec![], tcx.type_of(def_id).instantiate_identity(), None),
+        | DefKind::Static { .. } => (vec![], tcx.type_of(def_id).instantiate_identity(), None),
         DefKind::Ctor(..) | DefKind::Fn | DefKind::AssocFn => {
             let sig = tcx.liberate_late_bound_regions(
                 def_id.to_def_id(),
@@ -675,16 +671,32 @@ fn construct_error(tcx: TyCtxt<'_>, def_id: LocalDefId, guar: ErrorGuaranteed) -
                         ))),
                     )
                 }
-                ty::CoroutineClosure(did, _args) => {
-                    // FIXME(async_closures): Recover the proper error signature
-                    let inputs = tcx
-                        .closure_user_provided_sig(did.expect_local())
-                        .value
-                        .skip_binder()
-                        .inputs();
-
-                    let err = Ty::new_error(tcx, guar);
-                    (inputs.iter().map(|_| err).collect(), err, None)
+                ty::CoroutineClosure(did, args) => {
+                    let args = args.as_coroutine_closure();
+                    let sig = tcx.liberate_late_bound_regions(
+                        def_id.to_def_id(),
+                        args.coroutine_closure_sig(),
+                    );
+                    let self_ty = match args.kind() {
+                        ty::ClosureKind::Fn => {
+                            Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, closure_ty)
+                        }
+                        ty::ClosureKind::FnMut => {
+                            Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, closure_ty)
+                        }
+                        ty::ClosureKind::FnOnce => closure_ty,
+                    };
+                    (
+                        [self_ty].into_iter().chain(sig.tupled_inputs_ty.tuple_fields()).collect(),
+                        sig.to_coroutine(
+                            tcx,
+                            args.parent_args(),
+                            args.kind_ty(),
+                            tcx.coroutine_for_closure(*did),
+                            Ty::new_error(tcx, guar),
+                        ),
+                        None,
+                    )
                 }
                 ty::Error(_) => (vec![closure_ty, closure_ty], closure_ty, None),
                 kind => {
@@ -791,6 +803,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             unit_temp: None,
             var_debug_info: vec![],
             lint_level_roots_cache: GrowableBitSet::new_empty(),
+            coverage_branch_info: coverageinfo::BranchInfoBuilder::new_if_enabled(tcx, def),
         };
 
         assert_eq!(builder.cfg.start_new_block(), START_BLOCK);
@@ -810,7 +823,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
         }
 
-        Body::new(
+        let mut body = Body::new(
             MirSource::item(self.def_id.to_def_id()),
             self.cfg.basic_blocks,
             self.source_scopes,
@@ -821,7 +834,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.fn_span,
             self.coroutine,
             None,
-        )
+        );
+        body.coverage_branch_info = self.coverage_branch_info.and_then(|b| b.into_done());
+        body
     }
 
     fn insert_upvar_arg(&mut self) {
@@ -949,9 +964,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             match pat.kind {
                 // Don't introduce extra copies for simple bindings
                 PatKind::Binding {
-                    mutability,
                     var,
-                    mode: BindingMode::ByValue,
+                    mode: BindingAnnotation(ByRef::No, mutability),
                     subpattern: None,
                     ..
                 } => {
@@ -961,7 +975,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         if let Some(kind) = param.self_kind {
                             LocalInfo::User(BindingForm::ImplicitSelf(kind))
                         } else {
-                            let binding_mode = ty::BindingMode::BindByValue(mutability);
+                            let binding_mode = BindingAnnotation(ByRef::No, mutability);
                             LocalInfo::User(BindingForm::Var(VarBindingForm {
                                 binding_mode,
                                 opt_ty_info: param.ty_span,
@@ -990,8 +1004,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         if let Some(source_scope) = scope {
             self.source_scope = source_scope;
         }
-
-        self.expr_into_dest(Place::return_place(), block, expr_id)
+        if self.tcx.intrinsic(self.def_id).is_some_and(|i| i.must_be_overridden) {
+            let source_info = self.source_info(rustc_span::DUMMY_SP);
+            self.cfg.terminate(block, source_info, TerminatorKind::Unreachable);
+            self.cfg.start_new_block().unit()
+        } else {
+            self.expr_into_dest(Place::return_place(), block, expr_id)
+        }
     }
 
     fn set_correct_source_scope_for_arg(
@@ -1037,6 +1056,8 @@ pub(crate) fn parse_float_into_scalar(
 ) -> Option<Scalar> {
     let num = num.as_str();
     match float_ty {
+        // FIXME(f16_f128): When available, compare to the library parser as with `f32` and `f64`
+        ty::FloatTy::F16 => num.parse::<Half>().ok().map(Scalar::from_f16),
         ty::FloatTy::F32 => {
             let Ok(rust_f) = num.parse::<f32>() else { return None };
             let mut f = num
@@ -1083,6 +1104,8 @@ pub(crate) fn parse_float_into_scalar(
 
             Some(Scalar::from_f64(f))
         }
+        // FIXME(f16_f128): When available, compare to the library parser as with `f32` and `f64`
+        ty::FloatTy::F128 => num.parse::<Quad>().ok().map(Scalar::from_f128),
     }
 }
 
@@ -1093,6 +1116,7 @@ pub(crate) fn parse_float_into_scalar(
 
 mod block;
 mod cfg;
+mod coverageinfo;
 mod custom;
 mod expr;
 mod matches;

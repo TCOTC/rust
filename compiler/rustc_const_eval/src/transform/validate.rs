@@ -4,6 +4,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::BitSet;
 use rustc_index::IndexVec;
 use rustc_infer::traits::Reveal;
+use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::visit::{NonUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
@@ -60,6 +61,8 @@ impl<'tcx> MirPass<'tcx> for Validator {
                 ty::Closure(..) => Abi::RustCall,
                 ty::CoroutineClosure(..) => Abi::RustCall,
                 ty::Coroutine(..) => Abi::Rust,
+                // No need to do MIR validation on error bodies
+                ty::Error(_) => return,
                 _ => {
                     span_bug!(body.span, "unexpected body ty: {:?} phase {:?}", body_ty, mir_phase)
                 }
@@ -82,7 +85,7 @@ impl<'tcx> MirPass<'tcx> for Validator {
         cfg_checker.check_cleanup_control_flow();
 
         // Also run the TypeChecker.
-        for (location, msg) in validate_types(tcx, self.mir_phase, param_env, body) {
+        for (location, msg) in validate_types(tcx, self.mir_phase, param_env, body, body) {
             cfg_checker.fail(location, msg);
         }
 
@@ -94,6 +97,25 @@ impl<'tcx> MirPass<'tcx> for Validator {
                         format!("Free regions in optimized {} MIR", body.phase.name()),
                     );
                 }
+            }
+        }
+
+        // Enforce that coroutine-closure layouts are identical.
+        if let Some(layout) = body.coroutine_layout_raw()
+            && let Some(by_move_body) = body.coroutine_by_move_body()
+            && let Some(by_move_layout) = by_move_body.coroutine_layout_raw()
+        {
+            // FIXME(async_closures): We could do other validation here?
+            if layout.variant_fields.len() != by_move_layout.variant_fields.len() {
+                cfg_checker.fail(
+                    Location::START,
+                    format!(
+                        "Coroutine layout has different number of variant fields from \
+                        by-move coroutine layout:\n\
+                        layout: {layout:#?}\n\
+                        by_move_layout: {by_move_layout:#?}",
+                    ),
+                );
             }
         }
     }
@@ -115,18 +137,14 @@ struct CfgChecker<'a, 'tcx> {
 impl<'a, 'tcx> CfgChecker<'a, 'tcx> {
     #[track_caller]
     fn fail(&self, location: Location, msg: impl AsRef<str>) {
-        let span = self.body.source_info(location).span;
-        // We use `span_delayed_bug` as we might see broken MIR when other errors have already
-        // occurred.
-        self.tcx.dcx().span_delayed_bug(
-            span,
-            format!(
-                "broken MIR in {:?} ({}) at {:?}:\n{}",
-                self.body.source.instance,
-                self.when,
-                location,
-                msg.as_ref()
-            ),
+        // We might see broken MIR when other errors have already occurred.
+        assert!(
+            self.tcx.dcx().has_errors().is_some(),
+            "broken MIR in {:?} ({}) at {:?}:\n{}",
+            self.body.source.instance,
+            self.when,
+            location,
+            msg.as_ref(),
         );
     }
 
@@ -323,15 +341,24 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                 // FIXME(JakobDegen) The validator should check that `self.mir_phase <
                 // DropsLowered`. However, this causes ICEs with generation of drop shims, which
                 // seem to fail to set their `MirPhase` correctly.
-                if matches!(kind, RetagKind::Raw | RetagKind::TwoPhase) {
+                if matches!(kind, RetagKind::TwoPhase) {
                     self.fail(location, format!("explicit `{kind:?}` is forbidden"));
+                }
+            }
+            StatementKind::Coverage(kind) => {
+                if self.mir_phase >= MirPhase::Analysis(AnalysisPhase::PostCleanup)
+                    && let CoverageKind::BlockMarker { .. } | CoverageKind::SpanMarker { .. } = kind
+                {
+                    self.fail(
+                        location,
+                        format!("{kind:?} should have been removed after analysis"),
+                    );
                 }
             }
             StatementKind::Assign(..)
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
             | StatementKind::Intrinsic(_)
-            | StatementKind::Coverage(_)
             | StatementKind::ConstEvalCounter
             | StatementKind::PlaceMention(..)
             | StatementKind::Nop => {}
@@ -453,9 +480,9 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                 self.check_edge(location, *real_target, EdgeKind::Normal);
                 self.check_unwind_edge(location, *unwind);
             }
-            TerminatorKind::InlineAsm { destination, unwind, .. } => {
-                if let Some(destination) = destination {
-                    self.check_edge(location, *destination, EdgeKind::Normal);
+            TerminatorKind::InlineAsm { targets, unwind, .. } => {
+                for &target in targets {
+                    self.check_edge(location, target, EdgeKind::Normal);
                 }
                 self.check_unwind_edge(location, *unwind);
             }
@@ -499,7 +526,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
 
     fn visit_source_scope(&mut self, scope: SourceScope) {
         if self.body.source_scopes.get(scope).is_none() {
-            self.tcx.dcx().span_delayed_bug(
+            self.tcx.dcx().span_bug(
                 self.body.span,
                 format!(
                     "broken MIR in {:?} ({}):\ninvalid source scope {:?}",
@@ -512,19 +539,25 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
 
 /// A faster version of the validation pass that only checks those things which may break when
 /// instantiating any generic parameters.
+///
+/// `caller_body` is used to detect cycles in MIR inlining and MIR validation before
+/// `optimized_mir` is available.
 pub fn validate_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_phase: MirPhase,
     param_env: ty::ParamEnv<'tcx>,
     body: &Body<'tcx>,
+    caller_body: &Body<'tcx>,
 ) -> Vec<(Location, String)> {
-    let mut type_checker = TypeChecker { body, tcx, param_env, mir_phase, failures: Vec::new() };
+    let mut type_checker =
+        TypeChecker { body, caller_body, tcx, param_env, mir_phase, failures: Vec::new() };
     type_checker.visit_body(body);
     type_checker.failures
 }
 
 struct TypeChecker<'a, 'tcx> {
     body: &'a Body<'tcx>,
+    caller_body: &'a Body<'tcx>,
     tcx: TyCtxt<'tcx>,
     param_env: ParamEnv<'tcx>,
     mir_phase: MirPhase,
@@ -676,13 +709,19 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     }
                     &ty::Coroutine(def_id, args) => {
                         let f_ty = if let Some(var) = parent_ty.variant_index {
-                            let gen_body = if def_id == self.body.source.def_id() {
-                                self.body
+                            // If we're currently validating an inlined copy of this body,
+                            // then it will no longer be parameterized over the original
+                            // args of the coroutine. Otherwise, we prefer to use this body
+                            // since we may be in the process of computing this MIR in the
+                            // first place.
+                            let layout = if def_id == self.caller_body.source.def_id() {
+                                // FIXME: This is not right for async closures.
+                                self.caller_body.coroutine_layout_raw()
                             } else {
-                                self.tcx.optimized_mir(def_id)
+                                self.tcx.coroutine_layout(def_id, args.as_coroutine().kind_ty())
                             };
 
-                            let Some(layout) = gen_body.coroutine_layout() else {
+                            let Some(layout) = layout else {
                                 self.fail(
                                     location,
                                     format!("No coroutine layout for {parent_ty:?}"),
@@ -1139,7 +1178,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             Rvalue::Repeat(_, _)
             | Rvalue::ThreadLocalRef(_)
             | Rvalue::AddressOf(_, _)
-            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _)
+            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::UbChecks, _)
             | Rvalue::Discriminant(_) => {}
         }
         self.super_rvalue(rvalue, location);
@@ -1254,7 +1293,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 // FIXME(JakobDegen) The validator should check that `self.mir_phase <
                 // DropsLowered`. However, this causes ICEs with generation of drop shims, which
                 // seem to fail to set their `MirPhase` correctly.
-                if matches!(kind, RetagKind::Raw | RetagKind::TwoPhase) {
+                if matches!(kind, RetagKind::TwoPhase) {
                     self.fail(location, format!("explicit `{kind:?}` is forbidden"));
                 }
             }

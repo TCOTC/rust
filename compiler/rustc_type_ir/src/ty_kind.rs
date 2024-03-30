@@ -1,3 +1,4 @@
+use rustc_ast_ir::try_visit;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 #[cfg(feature = "nightly")]
@@ -11,67 +12,7 @@ use crate::{DebruijnIndex, DebugWithInfcx, InferCtxtLike, WithInfcx};
 
 use self::TyKind::*;
 
-/// The movability of a coroutine / closure literal:
-/// whether a coroutine contains self-references, causing it to be `!Unpin`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Copy)]
-#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
-pub enum Movability {
-    /// May contain self-references, `!Unpin`.
-    Static,
-    /// Must not contain self-references, `Unpin`.
-    Movable,
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Copy)]
-#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
-pub enum Mutability {
-    // N.B. Order is deliberate, so that Not < Mut
-    Not,
-    Mut,
-}
-
-impl Mutability {
-    pub fn invert(self) -> Self {
-        match self {
-            Mutability::Mut => Mutability::Not,
-            Mutability::Not => Mutability::Mut,
-        }
-    }
-
-    /// Returns `""` (empty string) or `"mut "` depending on the mutability.
-    pub fn prefix_str(self) -> &'static str {
-        match self {
-            Mutability::Mut => "mut ",
-            Mutability::Not => "",
-        }
-    }
-
-    /// Returns `"&"` or `"&mut "` depending on the mutability.
-    pub fn ref_prefix_str(self) -> &'static str {
-        match self {
-            Mutability::Not => "&",
-            Mutability::Mut => "&mut ",
-        }
-    }
-
-    /// Returns `""` (empty string) or `"mutably "` depending on the mutability.
-    pub fn mutably_str(self) -> &'static str {
-        match self {
-            Mutability::Not => "",
-            Mutability::Mut => "mutably ",
-        }
-    }
-
-    /// Return `true` if self is mutable
-    pub fn is_mut(self) -> bool {
-        matches!(self, Self::Mut)
-    }
-
-    /// Return `true` if self is **not** mutable
-    pub fn is_not(self) -> bool {
-        matches!(self, Self::Not)
-    }
-}
+use rustc_ast_ir::Mutability;
 
 /// Specifies how a trait object is represented.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -105,21 +46,24 @@ pub enum AliasKind {
     Weak,
 }
 
+impl AliasKind {
+    pub fn descr(self) -> &'static str {
+        match self {
+            AliasKind::Projection => "associated type",
+            AliasKind::Inherent => "inherent associated type",
+            AliasKind::Opaque => "opaque type",
+            AliasKind::Weak => "type alias",
+        }
+    }
+}
+
 /// Defines the kinds of types used by the type system.
 ///
 /// Types written by the user start out as `hir::TyKind` and get
-/// converted to this representation using `AstConv::ast_ty_to_ty`.
+/// converted to this representation using `<dyn HirTyLowerer>::lower_ty`.
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "IrTyKind")]
 #[derive(derivative::Derivative)]
-#[derivative(
-    Clone(bound = ""),
-    Copy(bound = ""),
-    PartialOrd(bound = ""),
-    PartialOrd = "feature_allow_slow_enum",
-    Ord(bound = ""),
-    Ord = "feature_allow_slow_enum",
-    Hash(bound = "")
-)]
+#[derivative(Clone(bound = ""), Copy(bound = ""), Hash(bound = ""))]
 #[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable, HashStable_NoContext))]
 pub enum TyKind<I: Interner> {
     /// The primitive boolean type. Written as `bool`.
@@ -143,7 +87,7 @@ pub enum TyKind<I: Interner> {
     /// For example, the type `List<i32>` would be represented using the `AdtDef`
     /// for `struct List<T>` and the args `[i32]`.
     ///
-    /// Note that generic parameters in fields only get lazily substituted
+    /// Note that generic parameters in fields only get lazily instantiated
     /// by using something like `adt_def.all_fields().map(|field| field.ty(tcx, args))`.
     Adt(I::AdtDef, I::GenericArgs),
 
@@ -160,7 +104,7 @@ pub enum TyKind<I: Interner> {
     Slice(I::Ty),
 
     /// A raw pointer. Written as `*mut T` or `*const T`
-    RawPtr(TypeAndMut<I>),
+    RawPtr(I::Ty, Mutability),
 
     /// A reference; a pointer with an associated lifetime. Written as
     /// `&'a mut T` or `&'a T`.
@@ -197,14 +141,14 @@ pub enum TyKind<I: Interner> {
 
     /// The anonymous type of a closure. Used to represent the type of `|a| a`.
     ///
-    /// Closure args contain both the - potentially substituted - generic parameters
+    /// Closure args contain both the - potentially instantiated - generic parameters
     /// of its parent and some synthetic parameters. See the documentation for
     /// `ClosureArgs` for more details.
     Closure(I::DefId, I::GenericArgs),
 
     /// The anonymous type of a closure. Used to represent the type of `async |a| a`.
     ///
-    /// Coroutine-closure args contain both the - potentially substituted - generic
+    /// Coroutine-closure args contain both the - potentially instantiated - generic
     /// parameters of its parent and some synthetic parameters. See the documentation
     /// for `CoroutineClosureArgs` for more details.
     CoroutineClosure(I::DefId, I::GenericArgs),
@@ -318,7 +262,7 @@ const fn tykind_discriminant<I: Interner>(value: &TyKind<I>) -> usize {
         Str => 7,
         Array(_, _) => 8,
         Slice(_) => 9,
-        RawPtr(_) => 10,
+        RawPtr(_, _) => 10,
         Ref(_, _, _) => 11,
         FnDef(_, _) => 12,
         FnPtr(_) => 13,
@@ -356,7 +300,7 @@ impl<I: Interner> PartialEq for TyKind<I> {
             (Foreign(a_d), Foreign(b_d)) => a_d == b_d,
             (Array(a_t, a_c), Array(b_t, b_c)) => a_t == b_t && a_c == b_c,
             (Slice(a_t), Slice(b_t)) => a_t == b_t,
-            (RawPtr(a_t), RawPtr(b_t)) => a_t == b_t,
+            (RawPtr(a_t, a_m), RawPtr(b_t, b_m)) => a_t == b_t && a_m == b_m,
             (Ref(a_r, a_t, a_m), Ref(b_r, b_t, b_m)) => a_r == b_r && a_t == b_t && a_m == b_m,
             (FnDef(a_d, a_s), FnDef(b_d, b_s)) => a_d == b_d && a_s == b_s,
             (FnPtr(a_s), FnPtr(b_s)) => a_s == b_s,
@@ -419,7 +363,7 @@ impl<I: Interner> DebugWithInfcx<I> for TyKind<I> {
             Str => write!(f, "str"),
             Array(t, c) => write!(f, "[{:?}; {:?}]", &this.wrap(t), &this.wrap(c)),
             Slice(t) => write!(f, "[{:?}]", &this.wrap(t)),
-            RawPtr(TypeAndMut { ty, mutbl }) => {
+            RawPtr(ty, mutbl) => {
                 match mutbl {
                     Mutability::Mut => write!(f, "*mut "),
                     Mutability::Not => write!(f, "*const "),
@@ -599,22 +543,28 @@ impl UintTy {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
 pub enum FloatTy {
+    F16,
     F32,
     F64,
+    F128,
 }
 
 impl FloatTy {
     pub fn name_str(self) -> &'static str {
         match self {
+            FloatTy::F16 => "f16",
             FloatTy::F32 => "f32",
             FloatTy::F64 => "f64",
+            FloatTy::F128 => "f128",
         }
     }
 
     pub fn bit_width(self) -> u64 {
         match self {
+            FloatTy::F16 => 16,
             FloatTy::F32 => 32,
             FloatTy::F64 => 64,
+            FloatTy::F128 => 128,
         }
     }
 }
@@ -845,8 +795,6 @@ impl<I: Interner> DebugWithInfcx<I> for InferTy {
 #[derivative(
     Clone(bound = ""),
     Copy(bound = ""),
-    PartialOrd(bound = ""),
-    Ord(bound = ""),
     PartialEq(bound = ""),
     Eq(bound = ""),
     Hash(bound = ""),
@@ -874,8 +822,8 @@ impl<I: Interner> TypeVisitable<I> for TypeAndMut<I>
 where
     I::Ty: TypeVisitable<I>,
 {
-    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> std::ops::ControlFlow<V::BreakTy> {
-        self.ty.visit_with(visitor)?;
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
+        try_visit!(self.ty.visit_with(visitor));
         self.mutbl.visit_with(visitor)
     }
 }

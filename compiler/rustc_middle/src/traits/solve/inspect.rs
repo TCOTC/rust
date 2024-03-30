@@ -19,8 +19,8 @@
 //! [canonicalized]: https://rustc-dev-guide.rust-lang.org/solve/canonicalization.html
 
 use super::{
-    CandidateSource, Canonical, CanonicalInput, Certainty, Goal, GoalSource, IsNormalizesToHack,
-    NoSolution, QueryInput, QueryResult,
+    CandidateSource, Canonical, CanonicalInput, Certainty, Goal, GoalSource, NoSolution,
+    QueryInput, QueryResult,
 };
 use crate::{infer::canonical::CanonicalVarValues, ty};
 use format::ProofTreeFormatter;
@@ -50,7 +50,7 @@ pub type CanonicalState<'tcx, T> = Canonical<'tcx, State<'tcx, T>>;
 #[derive(Eq, PartialEq)]
 pub enum GoalEvaluationKind<'tcx> {
     Root { orig_values: Vec<ty::GenericArg<'tcx>> },
-    Nested { is_normalizes_to_hack: IsNormalizesToHack },
+    Nested,
 }
 
 #[derive(Eq, PartialEq)]
@@ -58,8 +58,6 @@ pub struct GoalEvaluation<'tcx> {
     pub uncanonicalized_goal: Goal<'tcx, ty::Predicate<'tcx>>,
     pub kind: GoalEvaluationKind<'tcx>,
     pub evaluation: CanonicalGoalEvaluation<'tcx>,
-    /// The nested goals from instantiating the query response.
-    pub returned_goals: Vec<Goal<'tcx, ty::Predicate<'tcx>>>,
 }
 
 #[derive(Eq, PartialEq)]

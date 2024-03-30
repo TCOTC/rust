@@ -1,5 +1,5 @@
 //@compile-flags: -Zmiri-strict-provenance
-#![feature(portable_simd, platform_intrinsics, adt_const_params, inline_const, core_intrinsics)]
+#![feature(portable_simd, adt_const_params, inline_const, core_intrinsics)]
 #![allow(incomplete_features, internal_features)]
 use std::intrinsics::simd as intrinsics;
 use std::ptr;
@@ -216,10 +216,7 @@ fn simd_ops_i32() {
 }
 
 fn simd_mask() {
-    extern "platform-intrinsic" {
-        pub(crate) fn simd_bitmask<T, U>(x: T) -> U;
-        pub(crate) fn simd_select_bitmask<M, T>(m: M, yes: T, no: T) -> T;
-    }
+    use std::intrinsics::simd::*;
 
     let intmask = Mask::from_int(i32x4::from_array([0, -1, 0, 0]));
     assert_eq!(intmask, Mask::from_array([false, true, false, false]));
@@ -268,15 +265,11 @@ fn simd_mask() {
     }
 
     // This used to cause an ICE. It exercises simd_select_bitmask with an array as input.
-    if cfg!(target_endian = "little") {
-        // FIXME this test currently fails on big-endian:
-        // <https://github.com/rust-lang/portable-simd/issues/379>
-        let bitmask = u8x4::from_array([0b00001101, 0, 0, 0]);
-        assert_eq!(
-            mask32x4::from_bitmask_vector(bitmask),
-            mask32x4::from_array([true, false, true, true]),
-        );
-    }
+    let bitmask = u8x4::from_array([0b00001101, 0, 0, 0]);
+    assert_eq!(
+        mask32x4::from_bitmask_vector(bitmask),
+        mask32x4::from_array([true, false, true, true]),
+    );
     let bitmask = u8x8::from_array([0b01000101, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         mask32x8::from_bitmask_vector(bitmask),
@@ -497,9 +490,6 @@ fn simd_round() {
 
 fn simd_intrinsics() {
     use intrinsics::*;
-    extern "platform-intrinsic" {
-        fn simd_shuffle_generic<T, U, const IDX: &'static [u32]>(x: T, y: T) -> U;
-    }
 
     unsafe {
         // Make sure simd_eq returns all-1 for `true`
@@ -536,6 +526,23 @@ fn simd_intrinsics() {
     }
 }
 
+fn simd_float_intrinsics() {
+    use intrinsics::*;
+
+    // These are just smoke tests to ensure the intrinsics can be called.
+    unsafe {
+        let a = f32x4::splat(10.0);
+        simd_fsqrt(a);
+        simd_fsin(a);
+        simd_fcos(a);
+        simd_fexp(a);
+        simd_fexp2(a);
+        simd_flog(a);
+        simd_flog2(a);
+        simd_flog10(a);
+    }
+}
+
 fn simd_masked_loadstore() {
     // The buffer is deliberarely too short, so reading the last element would be UB.
     let buf = [3i32; 3];
@@ -569,5 +576,6 @@ fn main() {
     simd_gather_scatter();
     simd_round();
     simd_intrinsics();
+    simd_float_intrinsics();
     simd_masked_loadstore();
 }

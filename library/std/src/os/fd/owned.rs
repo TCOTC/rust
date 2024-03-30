@@ -244,7 +244,7 @@ pub trait AsFd {
 }
 
 #[stable(feature = "io_safety", since = "1.63.0")]
-impl<T: AsFd> AsFd for &T {
+impl<T: AsFd + ?Sized> AsFd for &T {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         T::as_fd(self)
@@ -252,7 +252,7 @@ impl<T: AsFd> AsFd for &T {
 }
 
 #[stable(feature = "io_safety", since = "1.63.0")]
-impl<T: AsFd> AsFd for &mut T {
+impl<T: AsFd + ?Sized> AsFd for &mut T {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         T::as_fd(self)
@@ -288,6 +288,7 @@ impl AsFd for fs::File {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<fs::File> for OwnedFd {
+    /// Takes ownership of a [`File`](fs::File)'s underlying file descriptor.
     #[inline]
     fn from(file: fs::File) -> OwnedFd {
         file.into_inner().into_inner().into_inner()
@@ -296,6 +297,8 @@ impl From<fs::File> for OwnedFd {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<OwnedFd> for fs::File {
+    /// Returns a [`File`](fs::File) that takes ownership of the given
+    /// file descriptor.
     #[inline]
     fn from(owned_fd: OwnedFd) -> Self {
         Self::from_inner(FromInner::from_inner(FromInner::from_inner(owned_fd)))
@@ -312,6 +315,7 @@ impl AsFd for crate::net::TcpStream {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::net::TcpStream> for OwnedFd {
+    /// Takes ownership of a [`TcpStream`](crate::net::TcpStream)'s socket file descriptor.
     #[inline]
     fn from(tcp_stream: crate::net::TcpStream) -> OwnedFd {
         tcp_stream.into_inner().into_socket().into_inner().into_inner().into()
@@ -338,6 +342,7 @@ impl AsFd for crate::net::TcpListener {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::net::TcpListener> for OwnedFd {
+    /// Takes ownership of a [`TcpListener`](crate::net::TcpListener)'s socket file descriptor.
     #[inline]
     fn from(tcp_listener: crate::net::TcpListener) -> OwnedFd {
         tcp_listener.into_inner().into_socket().into_inner().into_inner().into()
@@ -364,6 +369,7 @@ impl AsFd for crate::net::UdpSocket {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::net::UdpSocket> for OwnedFd {
+    /// Takes ownership of a [`UdpSocket`](crate::net::UdpSocket)'s file descriptor.
     #[inline]
     fn from(udp_socket: crate::net::UdpSocket) -> OwnedFd {
         udp_socket.into_inner().into_socket().into_inner().into_inner().into()
@@ -396,7 +402,7 @@ impl From<OwnedFd> for crate::net::UdpSocket {
 /// impl MyTrait for Box<UdpSocket> {}
 /// # }
 /// ```
-impl<T: AsFd> AsFd for crate::sync::Arc<T> {
+impl<T: AsFd + ?Sized> AsFd for crate::sync::Arc<T> {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         (**self).as_fd()
@@ -404,7 +410,7 @@ impl<T: AsFd> AsFd for crate::sync::Arc<T> {
 }
 
 #[stable(feature = "asfd_rc", since = "1.69.0")]
-impl<T: AsFd> AsFd for crate::rc::Rc<T> {
+impl<T: AsFd + ?Sized> AsFd for crate::rc::Rc<T> {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         (**self).as_fd()
@@ -412,7 +418,7 @@ impl<T: AsFd> AsFd for crate::rc::Rc<T> {
 }
 
 #[stable(feature = "asfd_ptrs", since = "1.64.0")]
-impl<T: AsFd> AsFd for Box<T> {
+impl<T: AsFd + ?Sized> AsFd for Box<T> {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         (**self).as_fd()

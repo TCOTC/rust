@@ -64,17 +64,17 @@ use self::RegionKind::*;
 ///
 /// ## Bound Regions
 ///
-/// These are regions that are stored behind a binder and must be substituted
+/// These are regions that are stored behind a binder and must be instantiated
 /// with some concrete region before being used. There are two kind of
 /// bound regions: early-bound, which are bound in an item's `Generics`,
-/// and are substituted by an `GenericArgs`, and late-bound, which are part of
-/// higher-ranked types (e.g., `for<'a> fn(&'a ())`), and are substituted by
+/// and are instantiated by an `GenericArgs`, and late-bound, which are part of
+/// higher-ranked types (e.g., `for<'a> fn(&'a ())`), and are instantiated by
 /// the likes of `liberate_late_bound_regions`. The distinction exists
 /// because higher-ranked lifetimes aren't supported in all places. See [1][2].
 ///
 /// Unlike `Param`s, bound regions are not supposed to exist "in the wild"
 /// outside their binder, e.g., in types passed to type inference, and
-/// should first be substituted (by placeholder regions, free regions,
+/// should first be instantiated (by placeholder regions, free regions,
 /// or region variables).
 ///
 /// ## Placeholder and Free Regions
@@ -101,7 +101,7 @@ use self::RegionKind::*;
 /// `RePlaceholder` is designed for this purpose. In these contexts,
 /// there's also the risk that some inference variable laying around will
 /// get unified with your placeholder region: if you want to check whether
-/// `for<'a> Foo<'_>: 'a`, and you substitute your bound region `'a`
+/// `for<'a> Foo<'_>: 'a`, and you instantiate your bound region `'a`
 /// with a placeholder region `'%a`, the variable `'_` would just be
 /// instantiated to the placeholder region `'%a`, which is wrong because
 /// the inference variable is supposed to satisfy the relation
@@ -113,15 +113,7 @@ use self::RegionKind::*;
 /// [2]: https://smallcultfollowing.com/babysteps/blog/2013/11/04/intermingled-parameter-lists/
 /// [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/hrtb.html
 #[derive(derivative::Derivative)]
-#[derivative(
-    Clone(bound = ""),
-    Copy(bound = ""),
-    PartialOrd(bound = ""),
-    PartialOrd = "feature_allow_slow_enum",
-    Ord(bound = ""),
-    Ord = "feature_allow_slow_enum",
-    Hash(bound = "")
-)]
+#[derivative(Clone(bound = ""), Copy(bound = ""), Hash(bound = ""))]
 #[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable))]
 pub enum RegionKind<I: Interner> {
     /// A region parameter; for example `'a` in `impl<'a> Trait for &'a ()`.
@@ -223,23 +215,27 @@ impl<I: Interner> DebugWithInfcx<I> for RegionKind<I> {
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
         match this.data {
-            ReEarlyParam(data) => write!(f, "ReEarlyParam({data:?})"),
+            ReEarlyParam(data) => write!(f, "{data:?}"),
 
             ReBound(binder_id, bound_region) => {
-                write!(f, "ReBound({binder_id:?}, {bound_region:?})")
+                write!(f, "'")?;
+                crate::debug_bound_var(f, *binder_id, bound_region)
             }
 
             ReLateParam(fr) => write!(f, "{fr:?}"),
 
-            ReStatic => f.write_str("ReStatic"),
+            ReStatic => f.write_str("'static"),
 
             ReVar(vid) => write!(f, "{:?}", &this.wrap(vid)),
 
-            RePlaceholder(placeholder) => write!(f, "RePlaceholder({placeholder:?})"),
+            RePlaceholder(placeholder) => write!(f, "{placeholder:?}"),
 
-            ReErased => f.write_str("ReErased"),
+            // Use `'{erased}` as the output instead of `'erased` so that its more obviously distinct from
+            // a `ReEarlyParam` named `'erased`. Technically that would print as `'erased/#IDX` so this is
+            // not strictly necessary but *shrug*
+            ReErased => f.write_str("'{erased}"),
 
-            ReError(_) => f.write_str("ReError"),
+            ReError(_) => f.write_str("'{region error}"),
         }
     }
 }

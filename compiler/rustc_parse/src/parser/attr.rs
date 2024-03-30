@@ -3,12 +3,13 @@ use crate::errors::{
     SuffixedLiteralInAttribute,
 };
 use crate::fluent_generated as fluent;
+use crate::maybe_whole;
 
 use super::{AttrWrapper, Capturing, FnParseMode, ForceCollect, Parser, PathStyle};
 use rustc_ast as ast;
 use rustc_ast::attr;
-use rustc_ast::token::{self, Delimiter, Nonterminal};
-use rustc_errors::{codes::*, Diagnostic, PResult};
+use rustc_ast::token::{self, Delimiter};
+use rustc_errors::{codes::*, Diag, PResult};
 use rustc_span::{sym, BytePos, Span};
 use thin_vec::ThinVec;
 use tracing::debug;
@@ -85,7 +86,7 @@ impl<'a> Parser<'a> {
                 // Always make an outer attribute - this allows us to recover from a misplaced
                 // inner attribute.
                 Some(attr::mk_doc_comment(
-                    &self.sess.attr_id_generator,
+                    &self.psess.attr_id_generator,
                     comment_kind,
                     ast::AttrStyle::Outer,
                     data,
@@ -135,13 +136,13 @@ impl<'a> Parser<'a> {
                 this.error_on_forbidden_inner_attr(attr_sp, inner_parse_policy);
             }
 
-            Ok(attr::mk_attr_from_item(&self.sess.attr_id_generator, item, None, style, attr_sp))
+            Ok(attr::mk_attr_from_item(&self.psess.attr_id_generator, item, None, style, attr_sp))
         })
     }
 
     fn annotate_following_item_if_applicable(
         &self,
-        err: &mut Diagnostic,
+        err: &mut Diag<'_>,
         span: Span,
         attr_type: OuterAttributeType,
     ) -> Option<Span> {
@@ -251,25 +252,15 @@ impl<'a> Parser<'a> {
     ///     PATH `=` UNSUFFIXED_LIT
     /// The delimiters or `=` are still put into the resulting token stream.
     pub fn parse_attr_item(&mut self, capture_tokens: bool) -> PResult<'a, ast::AttrItem> {
-        let item = match &self.token.kind {
-            token::Interpolated(nt) => match &nt.0 {
-                Nonterminal::NtMeta(item) => Some(item.clone().into_inner()),
-                _ => None,
-            },
-            _ => None,
+        maybe_whole!(self, NtMeta, |attr| attr.into_inner());
+
+        let do_parse = |this: &mut Self| {
+            let path = this.parse_path(PathStyle::Mod)?;
+            let args = this.parse_attr_args()?;
+            Ok(ast::AttrItem { path, args, tokens: None })
         };
-        Ok(if let Some(item) = item {
-            self.bump();
-            item
-        } else {
-            let do_parse = |this: &mut Self| {
-                let path = this.parse_path(PathStyle::Mod)?;
-                let args = this.parse_attr_args()?;
-                Ok(ast::AttrItem { path, args, tokens: None })
-            };
-            // Attr items don't have attributes
-            if capture_tokens { self.collect_tokens_no_attrs(do_parse) } else { do_parse(self) }?
-        })
+        // Attr items don't have attributes
+        if capture_tokens { self.collect_tokens_no_attrs(do_parse) } else { do_parse(self) }
     }
 
     /// Parses attributes that appear after the opening of an item. These should
@@ -288,7 +279,7 @@ impl<'a> Parser<'a> {
                 if attr_style == ast::AttrStyle::Inner {
                     self.bump();
                     Some(attr::mk_doc_comment(
-                        &self.sess.attr_id_generator,
+                        &self.psess.attr_id_generator,
                         comment_kind,
                         attr_style,
                         data,
@@ -371,22 +362,18 @@ impl<'a> Parser<'a> {
     /// meta_item_inner : (meta_item | UNSUFFIXED_LIT) (',' meta_item_inner)? ;
     /// ```
     pub fn parse_meta_item(&mut self) -> PResult<'a, ast::MetaItem> {
-        let nt_meta = match &self.token.kind {
-            token::Interpolated(nt) => match &nt.0 {
-                token::NtMeta(e) => Some(e.clone()),
-                _ => None,
-            },
-            _ => None,
-        };
-
-        if let Some(item) = nt_meta {
-            return match item.meta(item.path.span) {
+        // We can't use `maybe_whole` here because it would bump in the `None`
+        // case, which we don't want.
+        if let token::Interpolated(nt) = &self.token.kind
+            && let token::NtMeta(attr_item) = &nt.0
+        {
+            match attr_item.meta(attr_item.path.span) {
                 Some(meta) => {
                     self.bump();
-                    Ok(meta)
+                    return Ok(meta);
                 }
-                None => self.unexpected(),
-            };
+                None => self.unexpected()?,
+            }
         }
 
         let lo = self.token.span;

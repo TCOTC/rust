@@ -15,8 +15,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::builder::Kind;
 use crate::core::config::Target;
-use crate::utils::cache::INTERNER;
 use crate::utils::helpers::output;
 use crate::Build;
 
@@ -65,6 +65,8 @@ pub fn check(build: &mut Build) {
     let mut skip_target_sanity =
         env::var_os("BOOTSTRAP_SKIP_TARGET_SANITY").is_some_and(|s| s == "1" || s == "true");
 
+    skip_target_sanity |= build.config.cmd.kind() == Kind::Check;
+
     // Skip target sanity checks when we are doing anything with mir-opt tests or Miri
     let skipped_paths = [OsStr::new("mir-opt"), OsStr::new("miri")];
     skip_target_sanity |= build.config.paths.iter().any(|path| {
@@ -88,19 +90,19 @@ pub fn check(build: &mut Build) {
     }
 
     // We need cmake, but only if we're actually building LLVM or sanitizers.
-    let building_llvm = build.config.rust_codegen_backends.contains(&INTERNER.intern_str("llvm"))
-        && build
-            .hosts
-            .iter()
-            .map(|host| {
-                build
+    let building_llvm = build
+        .hosts
+        .iter()
+        .map(|host| {
+            build.config.llvm_enabled(*host)
+                && build
                     .config
                     .target_config
                     .get(host)
                     .map(|config| config.llvm_config.is_none())
                     .unwrap_or(true)
-            })
-            .any(|build_llvm_ourselves| build_llvm_ourselves);
+        })
+        .any(|build_llvm_ourselves| build_llvm_ourselves);
 
     let need_cmake = building_llvm || build.config.any_sanitizers_to_build();
     if need_cmake && cmd_finder.maybe_have("cmake").is_none() {
@@ -170,11 +172,8 @@ than building it.
             continue;
         }
 
-        // Some environments don't want or need these tools, such as when testing Miri.
-        // FIXME: it would be better to refactor this code to split necessary setup from pure sanity
-        // checks, and have a regular flag for skipping the latter. Also see
-        // <https://github.com/rust-lang/rust/pull/103569#discussion_r1008741742>.
-        if skip_target_sanity {
+        // skip check for cross-targets
+        if skip_target_sanity && target != &build.build {
             continue;
         }
 
@@ -190,13 +189,16 @@ than building it.
         if !build.config.dry_run() {
             cmd_finder.must_have(build.cxx(*host).unwrap());
         }
-    }
 
-    if build.config.rust_codegen_backends.contains(&INTERNER.intern_str("llvm")) {
-        // Externally configured LLVM requires FileCheck to exist
-        let filecheck = build.llvm_filecheck(build.build);
-        if !filecheck.starts_with(&build.out) && !filecheck.exists() && build.config.codegen_tests {
-            panic!("FileCheck executable {filecheck:?} does not exist");
+        if build.config.llvm_enabled(*host) {
+            // Externally configured LLVM requires FileCheck to exist
+            let filecheck = build.llvm_filecheck(build.build);
+            if !filecheck.starts_with(&build.out)
+                && !filecheck.exists()
+                && build.config.codegen_tests
+            {
+                panic!("FileCheck executable {filecheck:?} does not exist");
+            }
         }
     }
 
@@ -213,11 +215,8 @@ than building it.
             panic!("All the *-none-* and nvptx* targets are no-std targets")
         }
 
-        // Some environments don't want or need these tools, such as when testing Miri.
-        // FIXME: it would be better to refactor this code to split necessary setup from pure sanity
-        // checks, and have a regular flag for skipping the latter. Also see
-        // <https://github.com/rust-lang/rust/pull/103569#discussion_r1008741742>.
-        if skip_target_sanity {
+        // skip check for cross-targets
+        if skip_target_sanity && target != &build.build {
             continue;
         }
 

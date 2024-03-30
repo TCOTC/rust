@@ -222,17 +222,15 @@ impl ItemScope {
         self.declarations.iter().copied()
     }
 
-    pub fn extern_crate_decls(
-        &self,
-    ) -> impl Iterator<Item = ExternCrateId> + ExactSizeIterator + '_ {
+    pub fn extern_crate_decls(&self) -> impl ExactSizeIterator<Item = ExternCrateId> + '_ {
         self.extern_crate_decls.iter().copied()
     }
 
-    pub fn use_decls(&self) -> impl Iterator<Item = UseId> + ExactSizeIterator + '_ {
+    pub fn use_decls(&self) -> impl ExactSizeIterator<Item = UseId> + '_ {
         self.use_decls.iter().copied()
     }
 
-    pub fn impls(&self) -> impl Iterator<Item = ImplId> + ExactSizeIterator + '_ {
+    pub fn impls(&self) -> impl ExactSizeIterator<Item = ImplId> + '_ {
         self.impls.iter().copied()
     }
 
@@ -243,30 +241,8 @@ impl ItemScope {
         })
     }
 
-    pub fn unnamed_consts<'a>(
-        &'a self,
-        db: &'a dyn DefDatabase,
-    ) -> impl Iterator<Item = ConstId> + 'a {
-        // FIXME: Also treat consts named `_DERIVE_*` as unnamed, since synstructure generates those.
-        // Should be removed once synstructure stops doing that.
-        let synstructure_hack_consts = self.values.values().filter_map(|(item, _, _)| match item {
-            &ModuleDefId::ConstId(id) => {
-                let loc = id.lookup(db);
-                let item_tree = loc.id.item_tree(db);
-                if item_tree[loc.id.value]
-                    .name
-                    .as_ref()
-                    .map_or(false, |n| n.to_smol_str().starts_with("_DERIVE_"))
-                {
-                    Some(id)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        });
-
-        self.unnamed_consts.iter().copied().chain(synstructure_hack_consts)
+    pub fn unnamed_consts(&self) -> impl Iterator<Item = ConstId> + '_ {
+        self.unnamed_consts.iter().copied()
     }
 
     /// Iterate over all module scoped macros
@@ -674,7 +650,7 @@ impl ItemScope {
             format_to!(
                 buf,
                 "{}:",
-                name.map_or("_".to_string(), |name| name.display(db).to_string())
+                name.map_or("_".to_owned(), |name| name.display(db).to_string())
             );
 
             if let Some((.., i)) = def.types {

@@ -70,14 +70,8 @@ fn unsize_ptr<'tcx>(
 ) -> (Value, Value) {
     match (&src_layout.ty.kind(), &dst_layout.ty.kind()) {
         (&ty::Ref(_, a, _), &ty::Ref(_, b, _))
-        | (&ty::Ref(_, a, _), &ty::RawPtr(ty::TypeAndMut { ty: b, .. }))
-        | (&ty::RawPtr(ty::TypeAndMut { ty: a, .. }), &ty::RawPtr(ty::TypeAndMut { ty: b, .. })) => {
-            (src, unsized_info(fx, *a, *b, old_info))
-        }
-        (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) if def_a.is_box() && def_b.is_box() => {
-            let (a, b) = (src_layout.ty.boxed_ty(), dst_layout.ty.boxed_ty());
-            (src, unsized_info(fx, a, b, old_info))
-        }
+        | (&ty::Ref(_, a, _), &ty::RawPtr(b, _))
+        | (&ty::RawPtr(a, _), &ty::RawPtr(b, _)) => (src, unsized_info(fx, *a, *b, old_info)),
         (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {
             assert_eq!(def_a, def_b);
 

@@ -1,8 +1,8 @@
-// check-pass
+//@ check-pass
 
 #![feature(decl_macro)]
 #![feature(fn_delegation)]
-//~^ WARN the feature `fn_delegation` is incomplete
+#![allow(incomplete_features)]
 
 macro_rules! reuse { {} => {} }
 

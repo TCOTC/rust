@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use std::num::NonZeroU32;
+use std::num::NonZero;
 use std::ops::{Index, IndexMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::fxhash::FxHashMap;
 
-pub(super) type Handle = NonZeroU32;
+pub(super) type Handle = NonZero<u32>;
 
 /// A store that associates values of type `T` with numeric handles. A value can
 /// be looked up using its handle.
@@ -20,8 +20,8 @@ pub(super) struct OwnedStore<T: 'static> {
 impl<T> OwnedStore<T> {
     pub(super) fn new(counter: &'static AtomicU32) -> Self {
         // Ensure the handle counter isn't 0, which would panic later,
-        // when `NonZeroU32::new` (aka `Handle::new`) is called in `alloc`.
-        assert_ne!(counter.load(Ordering::SeqCst), 0);
+        // when `NonZero::new` (aka `Handle::new`) is called in `alloc`.
+        assert_ne!(counter.load(Ordering::Relaxed), 0);
 
         OwnedStore { counter, data: BTreeMap::new() }
     }
@@ -29,7 +29,7 @@ impl<T> OwnedStore<T> {
 
 impl<T> OwnedStore<T> {
     pub(super) fn alloc(&mut self, x: T) -> Handle {
-        let counter = self.counter.fetch_add(1, Ordering::SeqCst);
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         let handle = Handle::new(counter).expect("`proc_macro` handle counter overflowed");
         assert!(self.data.insert(handle, x).is_none());
         handle

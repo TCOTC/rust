@@ -172,13 +172,13 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
                 self.bound_from_components(components, visited)
             }
             Component::UnresolvedInferenceVariable(v) => {
-                // ignore this, we presume it will yield an error
-                // later, since if a type variable is not resolved by
-                // this point it never will be
+                // Ignore this, we presume it will yield an error later, since
+                // if a type variable is not resolved by this point it never
+                // will be.
                 self.tcx
                     .dcx()
                     .delayed_bug(format!("unresolved inference variable in outlives: {v:?}"));
-                // add a bound that never holds
+                // Add a bound that never holds.
                 VerifyBound::AnyBound(vec![])
             }
         }
@@ -277,7 +277,7 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
     /// ```
     ///
     /// If we were given the `DefId` of `Foo::Bar`, we would return
-    /// `'a`. You could then apply the substitutions from the
+    /// `'a`. You could then apply the instantiations from the
     /// projection to convert this into your namespace. This also
     /// works if the user writes `where <Self as Foo<'a>>::Bar: 'a` on
     /// the trait. In fact, it works by searching for just such a
@@ -300,7 +300,7 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         alias_ty: ty::AliasTy<'tcx>,
     ) -> impl Iterator<Item = ty::Region<'tcx>> {
         let tcx = self.tcx;
-        let bounds = tcx.item_bounds(alias_ty.def_id);
+        let bounds = tcx.item_super_predicates(alias_ty.def_id);
         trace!("{:#?}", bounds.skip_binder());
         bounds
             .iter_instantiated(tcx, alias_ty.args)

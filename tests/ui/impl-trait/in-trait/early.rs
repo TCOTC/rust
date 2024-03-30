@@ -1,7 +1,5 @@
-// check-pass
-// edition:2021
-
-#![allow(incomplete_features)]
+//@ check-pass
+//@ edition:2021
 
 pub trait Foo {
     #[allow(async_fn_in_trait)]

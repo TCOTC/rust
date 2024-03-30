@@ -1,4 +1,4 @@
-use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::path_to_local_id;
 use clippy_utils::source::snippet;
 use clippy_utils::visitors::is_local_used;
@@ -61,7 +61,7 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
         let mut it = block.stmts.iter().peekable();
         while let Some(stmt) = it.next() {
             if let Some(expr) = it.peek()
-                && let hir::StmtKind::Local(local) = stmt.kind
+                && let hir::StmtKind::Let(local) = stmt.kind
                 && let hir::PatKind::Binding(mode, canonical_id, ident, None) = local.pat.kind
                 && let hir::StmtKind::Expr(if_) = expr.kind
                 && let hir::ExprKind::If(
@@ -122,9 +122,10 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
                     value=snippet(cx, value.span, "<value>"),
                     default=snippet(cx, default.span, "<default>"),
                 );
-                span_lint_and_then(
+                span_lint_hir_and_then(
                     cx,
                     USELESS_LET_IF_SEQ,
+                    local.hir_id,
                     span,
                     "`if _ { .. } else { .. }` is an expression",
                     |diag| {

@@ -1,5 +1,6 @@
+use rustc_ast_ir::try_visit;
+use rustc_ast_ir::visit::VisitorResult;
 use std::fmt;
-use std::ops::ControlFlow;
 
 use crate::fold::{FallibleTypeFolder, TypeFoldable};
 use crate::visit::{TypeVisitable, TypeVisitor};
@@ -91,14 +92,14 @@ where
     I::TypeOutlivesPredicate: TypeVisitable<I>,
     I::RegionOutlivesPredicate: TypeVisitable<I>,
 {
-    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
         match self {
             ClauseKind::Trait(p) => p.visit_with(visitor),
             ClauseKind::RegionOutlives(p) => p.visit_with(visitor),
             ClauseKind::TypeOutlives(p) => p.visit_with(visitor),
             ClauseKind::Projection(p) => p.visit_with(visitor),
             ClauseKind::ConstArgHasType(c, t) => {
-                c.visit_with(visitor)?;
+                try_visit!(c.visit_with(visitor));
                 t.visit_with(visitor)
             }
             ClauseKind::WellFormed(p) => p.visit_with(visitor),
@@ -147,19 +148,20 @@ pub enum PredicateKind<I: Interner> {
     /// Used for coherence to mark opaque types as possibly equal to each other but ambiguous.
     Ambiguous,
 
-    /// The alias normalizes to `term`. Unlike `Projection`, this always fails if the alias
-    /// cannot be normalized in the current context.
+    /// This should only be used inside of the new solver for `AliasRelate` and expects
+    /// the `term` to be an unconstrained inference variable.
     ///
-    /// `Projection(<T as Trait>::Assoc, ?x)` results in `?x == <T as Trait>::Assoc` while
-    /// `NormalizesTo(<T as Trait>::Assoc, ?x)` results in `NoSolution`.
-    ///
-    /// Only used in the new solver.
+    /// The alias normalizes to `term`. Unlike `Projection`, this always fails if the
+    /// alias cannot be normalized in the current context. For the rigid alias
+    /// `T as Trait>::Assoc`, `Projection(<T as Trait>::Assoc, ?x)` constrains `?x`
+    /// to `<T as Trait>::Assoc` while `NormalizesTo(<T as Trait>::Assoc, ?x)`
+    /// results in `NoSolution`.
     NormalizesTo(I::NormalizesTo),
 
     /// Separate from `ClauseKind::Projection` which is used for normalization in new solver.
     /// This predicate requires two terms to be equal to eachother.
     ///
-    /// Only used for new solver
+    /// Only used for new solver.
     AliasRelate(I::Term, I::Term, AliasRelationDirection),
 }
 
@@ -205,21 +207,21 @@ where
     I::NormalizesTo: TypeVisitable<I>,
     ClauseKind<I>: TypeVisitable<I>,
 {
-    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
         match self {
             PredicateKind::Clause(p) => p.visit_with(visitor),
             PredicateKind::ObjectSafe(d) => d.visit_with(visitor),
             PredicateKind::Subtype(s) => s.visit_with(visitor),
             PredicateKind::Coerce(s) => s.visit_with(visitor),
             PredicateKind::ConstEquate(a, b) => {
-                a.visit_with(visitor)?;
+                try_visit!(a.visit_with(visitor));
                 b.visit_with(visitor)
             }
-            PredicateKind::Ambiguous => ControlFlow::Continue(()),
+            PredicateKind::Ambiguous => V::Result::output(),
             PredicateKind::NormalizesTo(p) => p.visit_with(visitor),
             PredicateKind::AliasRelate(a, b, d) => {
-                a.visit_with(visitor)?;
-                b.visit_with(visitor)?;
+                try_visit!(a.visit_with(visitor));
+                try_visit!(b.visit_with(visitor));
                 d.visit_with(visitor)
             }
         }

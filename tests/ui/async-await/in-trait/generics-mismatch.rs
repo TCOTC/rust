@@ -1,6 +1,4 @@
-// edition: 2021
-
-#![allow(incomplete_features)]
+//@ edition: 2021
 
 trait Foo {
     async fn foo<T>();

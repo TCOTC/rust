@@ -1,5 +1,3 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(const_type_name)]
@@ -10,7 +8,6 @@
 #![feature(is_sorted)]
 #![feature(let_chains)]
 #![feature(map_try_insert)]
-#![feature(min_specialization)]
 #![feature(never_type)]
 #![feature(option_get_or_insert_default)]
 #![feature(round_char_boundary)]
@@ -39,8 +36,9 @@ use rustc_middle::mir::{
     LocalDecl, MirPass, MirPhase, Operand, Place, ProjectionElem, Promoted, RuntimePhase, Rvalue,
     SourceInfo, Statement, StatementKind, TerminatorKind, START_BLOCK,
 };
-use rustc_middle::query::Providers;
+use rustc_middle::query;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
+use rustc_middle::util::Providers;
 use rustc_span::{source_map::Spanned, sym, DUMMY_SP};
 use rustc_trait_selection::traits;
 
@@ -61,9 +59,6 @@ mod remove_place_mention;
 mod add_subtyping_projections;
 pub mod cleanup_post_borrowck;
 mod const_debuginfo;
-mod const_goto;
-mod const_prop;
-mod const_prop_lint;
 mod copy_prop;
 mod coroutine;
 mod cost_checker;
@@ -87,11 +82,13 @@ mod gvn;
 pub mod inline;
 mod instsimplify;
 mod jump_threading;
+mod known_panics_lint;
 mod large_enums;
 mod lint;
 mod lower_intrinsics;
 mod lower_slice_len;
 mod match_branches;
+mod mentioned_items;
 mod multiple_return_terminators;
 mod normalize_array_len;
 mod nrvo;
@@ -105,7 +102,6 @@ mod remove_unneeded_drops;
 mod remove_zsts;
 mod required_consts;
 mod reveal_all;
-mod separate_const_switch;
 mod shim;
 mod ssa;
 // This pass is public to allow external drivers to perform MIR cleanup
@@ -129,9 +125,9 @@ pub fn provide(providers: &mut Providers) {
     ffi_unwind_calls::provide(providers);
     shim::provide(providers);
     cross_crate_inline::provide(providers);
-    *providers = Providers {
+    providers.queries = query::Providers {
         mir_keys,
-        mir_const,
+        mir_built,
         mir_const_qualif,
         mir_promoted,
         mir_drops_elaborated_and_const_checked,
@@ -144,7 +140,7 @@ pub fn provide(providers: &mut Providers) {
         mir_inliner_callees: inline::cycle::mir_inliner_callees,
         promoted_mir,
         deduced_param_attrs: deduce_param_attrs::deduced_param_attrs,
-        ..*providers
+        ..providers.queries
     };
 }
 
@@ -165,8 +161,7 @@ fn remap_mir_for_const_eval_select<'tcx>(
                 fn_span,
                 ..
             } if let ty::FnDef(def_id, _) = *const_.ty().kind()
-                && tcx.item_name(def_id) == sym::const_eval_select
-                && tcx.is_intrinsic(def_id) =>
+                && tcx.is_intrinsic(def_id, sym::const_eval_select) =>
             {
                 let [tupled_args, called_in_const, called_at_rt]: [_; 3] =
                     std::mem::take(args).try_into().unwrap();
@@ -264,11 +259,12 @@ fn mir_const_qualif(tcx: TyCtxt<'_>, def: LocalDefId) -> ConstQualifs {
 
     // N.B., this `borrow()` is guaranteed to be valid (i.e., the value
     // cannot yet be stolen), because `mir_promoted()`, which steals
-    // from `mir_const()`, forces this query to execute before
+    // from `mir_built()`, forces this query to execute before
     // performing the steal.
-    let body = &tcx.mir_const(def).borrow();
+    let body = &tcx.mir_built(def).borrow();
 
     if body.return_ty().references_error() {
+        // It's possible to reach here without an error being emitted (#121103).
         tcx.dcx().span_delayed_bug(body.span, "mir_const_qualif: MIR had errors");
         return Default::default();
     }
@@ -283,19 +279,13 @@ fn mir_const_qualif(tcx: TyCtxt<'_>, def: LocalDefId) -> ConstQualifs {
     validator.qualifs_in_return_place()
 }
 
-/// Make MIR ready for const evaluation. This is run on all MIR, not just on consts!
-/// FIXME(oli-obk): it's unclear whether we still need this phase (and its corresponding query).
-/// We used to have this for pre-miri MIR based const eval.
-fn mir_const(tcx: TyCtxt<'_>, def: LocalDefId) -> &Steal<Body<'_>> {
+fn mir_built(tcx: TyCtxt<'_>, def: LocalDefId) -> &Steal<Body<'_>> {
     // MIR unsafety check uses the raw mir, so make sure it is run.
     if !tcx.sess.opts.unstable_opts.thir_unsafeck {
         tcx.ensure_with_value().mir_unsafety_check_result(def);
     }
 
-    // has_ffi_unwind_calls query uses the raw mir, so make sure it is run.
-    tcx.ensure_with_value().has_ffi_unwind_calls(def);
-
-    let mut body = tcx.mir_built(def).steal();
+    let mut body = tcx.build_mir(def);
 
     pass_manager::dump_mir_for_phase_change(tcx, &body);
 
@@ -338,12 +328,14 @@ fn mir_promoted(
         }
         DefKind::AssocConst
         | DefKind::Const
-        | DefKind::Static(_)
+        | DefKind::Static { .. }
         | DefKind::InlineConst
         | DefKind::AnonConst => tcx.mir_const_qualif(def),
         _ => ConstQualifs::default(),
     };
-    let mut body = tcx.mir_const(def).steal();
+    // has_ffi_unwind_calls query uses the raw mir, so make sure it is run.
+    tcx.ensure_with_value().has_ffi_unwind_calls(def);
+    let mut body = tcx.mir_built(def).steal();
     if let Some(error_reported) = const_qualifs.tainted_by_errors {
         body.tainted_by_errors = Some(error_reported);
     }
@@ -440,7 +432,7 @@ fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &
     //
     // We manually filter the predicates, skipping anything that's not
     // "global". We are in a potentially generic context
-    // (e.g. we are evaluating a function without substituting generic
+    // (e.g. we are evaluating a function without instantiating generic
     // parameters, so this filtering serves two purposes:
     //
     // 1. We skip evaluating any predicates that we would
@@ -511,7 +503,7 @@ fn run_analysis_cleanup_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
     let passes: &[&dyn MirPass<'tcx>] = &[
         &cleanup_post_borrowck::CleanupPostBorrowck,
         &remove_noop_landing_pads::RemoveNoopLandingPads,
-        &simplify::SimplifyCfg::EarlyOpt,
+        &simplify::SimplifyCfg::PostAnalysis,
         &deref_separator::Derefer,
     ];
 
@@ -533,12 +525,12 @@ fn run_runtime_lowering_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         // AddMovesForPackedDrops needs to run after drop
         // elaboration.
         &add_moves_for_packed_drops::AddMovesForPackedDrops,
-        // `AddRetag` needs to run after `ElaborateDrops`. Otherwise it should run fairly late,
+        // `AddRetag` needs to run after `ElaborateDrops` but before `ElaborateBoxDerefs`. Otherwise it should run fairly late,
         // but before optimizations begin.
+        &add_retag::AddRetag,
         &elaborate_box_derefs::ElaborateBoxDerefs,
         &coroutine::StateTransform,
-        &add_retag::AddRetag,
-        &Lint(const_prop_lint::ConstPropLint),
+        &Lint(known_panics_lint::KnownPanicsLint),
     ];
     pm::run_passes_no_validate(tcx, body, passes, Some(MirPhase::Runtime(RuntimePhase::Initial)));
 }
@@ -548,7 +540,7 @@ fn run_runtime_cleanup_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
     let passes: &[&dyn MirPass<'tcx>] = &[
         &lower_intrinsics::LowerIntrinsics,
         &remove_place_mention::RemovePlaceMention,
-        &simplify::SimplifyCfg::ElaborateDrops,
+        &simplify::SimplifyCfg::PreOptimizations,
     ];
 
     pm::run_passes(tcx, body, passes, Some(MirPhase::Runtime(RuntimePhase::PostCleanup)));
@@ -570,6 +562,10 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         tcx,
         body,
         &[
+            // Before doing anything, remember which items are being mentioned so that the set of items
+            // visited does not depend on the optimization level.
+            &mentioned_items::MentionedItems,
+            // Add some UB checks before any UB gets optimized away.
             &check_alignment::CheckAlignment,
             // Before inlining: trim down MIR with passes to reduce inlining work.
 
@@ -580,10 +576,10 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
             &inline::Inline,
             // Code from other crates may have storage markers, so this needs to happen after inlining.
             &remove_storage_markers::RemoveStorageMarkers,
-            // Inlining and substitution may introduce ZST and useless drops.
+            // Inlining and instantiation may introduce ZST and useless drops.
             &remove_zsts::RemoveZsts,
             &remove_unneeded_drops::RemoveUnneededDrops,
-            // Type substitution may create uninhabited enums.
+            // Type instantiation may create uninhabited enums.
             &uninhabited_enum_branching::UninhabitedEnumBranching,
             &unreachable_prop::UnreachablePropagation,
             &o1(simplify::SimplifyCfg::AfterUninhabitedEnumBranching),
@@ -592,7 +588,6 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
 
             // Has to run after `slice::len` lowering
             &normalize_array_len::NormalizeArrayLen,
-            &const_goto::ConstGoto,
             &ref_prop::ReferencePropagation,
             &sroa::ScalarReplacementOfAggregates,
             &match_branches::MatchBranchSimplification,
@@ -603,10 +598,6 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
             &dead_store_elimination::DeadStoreElimination::Initial,
             &gvn::GVN,
             &simplify::SimplifyLocals::AfterGVN,
-            // Perform `SeparateConstSwitch` after SSA-based analyses, as cloning blocks may
-            // destroy the SSA property. It should still happen before const-propagation, so the
-            // latter pass will leverage the created opportunities.
-            &separate_const_switch::SeparateConstSwitch,
             &dataflow_const_prop::DataflowConstProp,
             &const_debuginfo::ConstDebugInfo,
             &o1(simplify_branches::SimplifyConstCondition::AfterConstProp),
@@ -661,7 +652,6 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
     debug!("about to call mir_drops_elaborated...");
     let body = tcx.mir_drops_elaborated_and_const_checked(did).steal();
     let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);
-    debug!("body: {:#?}", body);
 
     if body.tainted_by_errors.is_some() {
         return body;
@@ -682,7 +672,7 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
 }
 
 /// Fetch all the promoteds of an item and prepare their MIR bodies to be ready for
-/// constant evaluation once all substitutions become known.
+/// constant evaluation once all generic parameters become known.
 fn promoted_mir(tcx: TyCtxt<'_>, def: LocalDefId) -> &IndexVec<Promoted, Body<'_>> {
     if tcx.is_constructor(def.to_def_id()) {
         return tcx.arena.alloc(IndexVec::new());

@@ -62,7 +62,13 @@ mod imp {
         unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), libc::GRND_NONBLOCK) }
     }
 
-    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "freebsd"))]
+    #[cfg(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        netbsd10
+    ))]
     fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
         unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
     }
@@ -72,7 +78,9 @@ mod imp {
         target_os = "android",
         target_os = "espidf",
         target_os = "horizon",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        netbsd10
     )))]
     fn getrandom_fill_bytes(_buf: &mut [u8]) -> bool {
         false
@@ -83,7 +91,9 @@ mod imp {
         target_os = "android",
         target_os = "espidf",
         target_os = "horizon",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        netbsd10
     ))]
     fn getrandom_fill_bytes(v: &mut [u8]) -> bool {
         use crate::sync::atomic::{AtomicBool, Ordering};
@@ -230,7 +240,7 @@ mod imp {
 }
 
 // FIXME: once the 10.x release becomes the minimum, this can be dropped for simplification.
-#[cfg(target_os = "netbsd")]
+#[cfg(all(target_os = "netbsd", not(netbsd10)))]
 mod imp {
     use crate::ptr;
 

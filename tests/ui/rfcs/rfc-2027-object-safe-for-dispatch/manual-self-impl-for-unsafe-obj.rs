@@ -1,8 +1,9 @@
 // Check that we can manually implement an object-unsafe trait for its trait object.
 
-// revisions: current next
-//[next] compile-flags: -Znext-solver
-// run-pass
+//@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
+//@ run-pass
 
 #![feature(object_safe_for_dispatch)]
 

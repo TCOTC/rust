@@ -8,6 +8,7 @@ use rustc_data_structures::unord::UnordMap;
 use rustc_macros::HashStable_Generic;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
+use rustc_span::symbol::kw;
 use rustc_span::Symbol;
 
 use std::array::IntoIter;
@@ -74,7 +75,12 @@ pub enum DefKind {
     Const,
     /// Constant generic parameter: `struct Foo<const N: usize> { ... }`
     ConstParam,
-    Static(ast::Mutability),
+    Static {
+        /// Whether it's a `static mut` or just a `static`.
+        mutability: ast::Mutability,
+        /// Whether it's an anonymous static generated for nested allocations.
+        nested: bool,
+    },
     /// Refers to the struct or enum variant's constructor.
     ///
     /// The reason `Ctor` exists in addition to [`DefKind::Struct`] and
@@ -115,6 +121,12 @@ pub enum DefKind {
     Impl {
         of_trait: bool,
     },
+    /// A closure, coroutine, or coroutine-closure.
+    ///
+    /// These are all represented with the same `ExprKind::Closure` in the AST and HIR,
+    /// which makes it difficult to distinguish these during def collection. Therefore,
+    /// we treat them all the same, and code which needs to distinguish them can match
+    /// or `hir::ClosureKind` or `type_of`.
     Closure,
 }
 
@@ -129,7 +141,7 @@ impl DefKind {
             DefKind::Fn => "function",
             DefKind::Mod if def_id.is_crate_root() && !def_id.is_local() => "crate",
             DefKind::Mod => "module",
-            DefKind::Static(..) => "static",
+            DefKind::Static { .. } => "static",
             DefKind::Enum => "enum",
             DefKind::Variant => "variant",
             DefKind::Ctor(CtorOf::Variant, CtorKind::Fn) => "tuple variant",
@@ -202,7 +214,7 @@ impl DefKind {
             DefKind::Fn
             | DefKind::Const
             | DefKind::ConstParam
-            | DefKind::Static(..)
+            | DefKind::Static { .. }
             | DefKind::Ctor(..)
             | DefKind::AssocFn
             | DefKind::AssocConst => Some(Namespace::ValueNS),
@@ -225,6 +237,7 @@ impl DefKind {
 
     pub fn def_path_data(self, name: Symbol) -> DefPathData {
         match self {
+            DefKind::Struct | DefKind::Union if name == kw::Empty => DefPathData::AnonAdt,
             DefKind::Mod
             | DefKind::Struct
             | DefKind::Union
@@ -237,10 +250,13 @@ impl DefKind {
             | DefKind::AssocTy
             | DefKind::TyParam
             | DefKind::ExternCrate => DefPathData::TypeNs(name),
+            // It's not exactly an anon const, but wrt DefPathData, there
+            // is no difference.
+            DefKind::Static { nested: true, .. } => DefPathData::AnonConst,
             DefKind::Fn
             | DefKind::Const
             | DefKind::ConstParam
-            | DefKind::Static(..)
+            | DefKind::Static { .. }
             | DefKind::AssocFn
             | DefKind::AssocConst
             | DefKind::Field => DefPathData::ValueNs(name),
@@ -270,7 +286,7 @@ impl DefKind {
             | DefKind::AssocFn
             | DefKind::Ctor(..)
             | DefKind::Closure
-            | DefKind::Static(_) => true,
+            | DefKind::Static { .. } => true,
             DefKind::Mod
             | DefKind::Struct
             | DefKind::Union
@@ -794,6 +810,8 @@ pub enum LifetimeRes {
         param: NodeId,
         /// Id of the introducing place. See `Param`.
         binder: NodeId,
+        /// Kind of elided lifetime
+        kind: hir::MissingLifetimeKind,
     },
     /// This variant is used for anonymous lifetimes that we did not resolve during
     /// late resolution. Those lifetimes will be inferred by typechecking.

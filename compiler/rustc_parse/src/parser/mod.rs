@@ -11,6 +11,7 @@ mod stmt;
 mod ty;
 
 use crate::lexer::UnmatchedDelim;
+use ast::token::IdentIsRaw;
 pub use attr_wrapper::AttrWrapper;
 pub use diagnostics::AttemptLocalParseRecovery;
 pub(crate) use expr::ForbiddenLetReason;
@@ -19,20 +20,19 @@ pub use pat::{CommaRecoveryMode, RecoverColon, RecoverComma};
 pub use path::PathStyle;
 
 use rustc_ast::ptr::P;
-use rustc_ast::token::{self, Delimiter, Nonterminal, Token, TokenKind};
+use rustc_ast::token::{self, Delimiter, Token, TokenKind};
 use rustc_ast::tokenstream::{AttributesData, DelimSpacing, DelimSpan, Spacing};
 use rustc_ast::tokenstream::{TokenStream, TokenTree, TokenTreeCursor};
 use rustc_ast::util::case::Case;
-use rustc_ast::AttrId;
-use rustc_ast::CoroutineKind;
-use rustc_ast::DUMMY_NODE_ID;
-use rustc_ast::{self as ast, AnonConst, Const, DelimArgs, Extern};
-use rustc_ast::{AttrArgs, AttrArgsEq, Expr, ExprKind, Mutability, StrLit};
-use rustc_ast::{HasAttrs, HasTokens, Unsafe, Visibility, VisibilityKind};
+use rustc_ast::{
+    self as ast, AnonConst, AttrArgs, AttrArgsEq, AttrId, ByRef, Const, CoroutineKind, DelimArgs,
+    Expr, ExprKind, Extern, HasAttrs, HasTokens, Mutability, StrLit, Unsafe, Visibility,
+    VisibilityKind, DUMMY_NODE_ID,
+};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::PResult;
-use rustc_errors::{Applicability, DiagnosticBuilder, FatalError, MultiSpan};
+use rustc_errors::{Applicability, Diag, FatalError, MultiSpan};
 use rustc_session::parse::ParseSess;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
@@ -92,12 +92,13 @@ pub enum TrailingToken {
 #[macro_export]
 macro_rules! maybe_whole {
     ($p:expr, $constructor:ident, |$x:ident| $e:expr) => {
-        if let token::Interpolated(nt) = &$p.token.kind {
-            if let token::$constructor(x) = &nt.0 {
-                let $x = x.clone();
-                $p.bump();
-                return Ok($e);
-            }
+        if let token::Interpolated(nt) = &$p.token.kind
+            && let token::$constructor(x) = &nt.0
+        {
+            #[allow(unused_mut)]
+            let mut $x = x.clone();
+            $p.bump();
+            return Ok($e);
         }
     };
 }
@@ -127,7 +128,7 @@ pub enum Recovery {
 
 #[derive(Clone)]
 pub struct Parser<'a> {
-    pub sess: &'a ParseSess,
+    pub psess: &'a ParseSess,
     /// The current token.
     pub token: Token,
     /// The spacing for the current token.
@@ -357,6 +358,25 @@ pub enum FollowedByType {
     No,
 }
 
+/// Whether a function performed recovery
+#[derive(Copy, Clone, Debug)]
+pub enum Recovered {
+    No,
+    Yes,
+}
+
+impl From<Recovered> for bool {
+    fn from(r: Recovered) -> bool {
+        matches!(r, Recovered::Yes)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum Trailing {
+    No,
+    Yes,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TokenDescription {
     ReservedIdentifier,
@@ -394,12 +414,12 @@ pub(super) fn token_descr(token: &Token) -> String {
 
 impl<'a> Parser<'a> {
     pub fn new(
-        sess: &'a ParseSess,
+        psess: &'a ParseSess,
         stream: TokenStream,
         subparser_name: Option<&'static str>,
     ) -> Self {
         let mut parser = Parser {
-            sess,
+            psess,
             token: Token::dummy(),
             token_spacing: Spacing::Alone,
             prev_token: Token::dummy(),
@@ -429,6 +449,7 @@ impl<'a> Parser<'a> {
         parser
     }
 
+    #[inline]
     pub fn recovery(mut self, recovery: Recovery) -> Self {
         self.recovery = recovery;
         self
@@ -441,11 +462,14 @@ impl<'a> Parser<'a> {
     ///
     /// Technically, this only needs to restrict eager recovery by doing lookahead at more tokens.
     /// But making the distinction is very subtle, and simply forbidding all recovery is a lot simpler to uphold.
+    #[inline]
     fn may_recover(&self) -> bool {
         matches!(self.recovery, Recovery::Allowed)
     }
 
-    pub fn unexpected<T>(&mut self) -> PResult<'a, T> {
+    /// Version of [`unexpected`](Parser::unexpected) that "returns" any type in the `Ok`
+    /// (both those functions never return "Ok", and so can lie like that in the type).
+    pub fn unexpected_any<T>(&mut self) -> PResult<'a, T> {
         match self.expect_one_of(&[], &[]) {
             Err(e) => Err(e),
             // We can get `Ok(true)` from `recover_closing_delimiter`
@@ -454,12 +478,16 @@ impl<'a> Parser<'a> {
         }
     }
 
+    pub fn unexpected(&mut self) -> PResult<'a, ()> {
+        self.unexpected_any()
+    }
+
     /// Expects and consumes the token `t`. Signals an error if the next token is not `t`.
-    pub fn expect(&mut self, t: &TokenKind) -> PResult<'a, bool /* recovered */> {
+    pub fn expect(&mut self, t: &TokenKind) -> PResult<'a, Recovered> {
         if self.expected_tokens.is_empty() {
             if self.token == *t {
                 self.bump();
-                Ok(false)
+                Ok(Recovered::No)
             } else {
                 self.unexpected_try_recover(t)
             }
@@ -475,13 +503,13 @@ impl<'a> Parser<'a> {
         &mut self,
         edible: &[TokenKind],
         inedible: &[TokenKind],
-    ) -> PResult<'a, bool /* recovered */> {
+    ) -> PResult<'a, Recovered> {
         if edible.contains(&self.token.kind) {
             self.bump();
-            Ok(false)
+            Ok(Recovered::No)
         } else if inedible.contains(&self.token.kind) {
             // leave it in the input
-            Ok(false)
+            Ok(Recovered::No)
         } else if self.token.kind != token::Eof
             && self.last_unexpected_token_span == Some(self.token.span)
         {
@@ -499,7 +527,7 @@ impl<'a> Parser<'a> {
     fn parse_ident_common(&mut self, recover: bool) -> PResult<'a, Ident> {
         let (ident, is_raw) = self.ident_or_err(recover)?;
 
-        if !is_raw && ident.is_reserved() {
+        if matches!(is_raw, IdentIsRaw::No) && ident.is_reserved() {
             let err = self.expected_ident_found_err();
             if recover {
                 err.emit();
@@ -511,7 +539,7 @@ impl<'a> Parser<'a> {
         Ok(ident)
     }
 
-    fn ident_or_err(&mut self, recover: bool) -> PResult<'a, (Ident, /* is_raw */ bool)> {
+    fn ident_or_err(&mut self, recover: bool) -> PResult<'a, (Ident, IdentIsRaw)> {
         match self.token.ident() {
             Some(ident) => Ok(ident),
             None => self.expected_ident_found(recover),
@@ -522,6 +550,7 @@ impl<'a> Parser<'a> {
     ///
     /// This method will automatically add `tok` to `expected_tokens` if `tok` is not
     /// encountered.
+    #[inline]
     fn check(&mut self, tok: &TokenKind) -> bool {
         let is_present = self.token == *tok;
         if !is_present {
@@ -530,6 +559,7 @@ impl<'a> Parser<'a> {
         is_present
     }
 
+    #[inline]
     fn check_noexpect(&self, tok: &TokenKind) -> bool {
         self.token == *tok
     }
@@ -538,6 +568,7 @@ impl<'a> Parser<'a> {
     ///
     /// the main purpose of this function is to reduce the cluttering of the suggestions list
     /// which using the normal eat method could introduce in some cases.
+    #[inline]
     pub fn eat_noexpect(&mut self, tok: &TokenKind) -> bool {
         let is_present = self.check_noexpect(tok);
         if is_present {
@@ -547,6 +578,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Consumes a token 'tok' if it exists. Returns whether the given token was present.
+    #[inline]
     pub fn eat(&mut self, tok: &TokenKind) -> bool {
         let is_present = self.check(tok);
         if is_present {
@@ -557,18 +589,20 @@ impl<'a> Parser<'a> {
 
     /// If the next token is the given keyword, returns `true` without eating it.
     /// An expectation is also added for diagnostics purposes.
+    #[inline]
     fn check_keyword(&mut self, kw: Symbol) -> bool {
         self.expected_tokens.push(TokenType::Keyword(kw));
         self.token.is_keyword(kw)
     }
 
+    #[inline]
     fn check_keyword_case(&mut self, kw: Symbol, case: Case) -> bool {
         if self.check_keyword(kw) {
             return true;
         }
 
         if case == Case::Insensitive
-            && let Some((ident, /* is_raw */ false)) = self.token.ident()
+            && let Some((ident, IdentIsRaw::No)) = self.token.ident()
             && ident.as_str().to_lowercase() == kw.as_str().to_lowercase()
         {
             true
@@ -580,6 +614,7 @@ impl<'a> Parser<'a> {
     /// If the next token is the given keyword, eats it and returns `true`.
     /// Otherwise, returns `false`. An expectation is also added for diagnostics purposes.
     // Public for rustfmt usage.
+    #[inline]
     pub fn eat_keyword(&mut self, kw: Symbol) -> bool {
         if self.check_keyword(kw) {
             self.bump();
@@ -592,13 +627,14 @@ impl<'a> Parser<'a> {
     /// Eats a keyword, optionally ignoring the case.
     /// If the case differs (and is ignored) an error is issued.
     /// This is useful for recovery.
+    #[inline]
     fn eat_keyword_case(&mut self, kw: Symbol, case: Case) -> bool {
         if self.eat_keyword(kw) {
             return true;
         }
 
         if case == Case::Insensitive
-            && let Some((ident, /* is_raw */ false)) = self.token.ident()
+            && let Some((ident, IdentIsRaw::No)) = self.token.ident()
             && ident.as_str().to_lowercase() == kw.as_str().to_lowercase()
         {
             self.dcx().emit_err(errors::KwBadCase { span: ident.span, kw: kw.as_str() });
@@ -609,6 +645,7 @@ impl<'a> Parser<'a> {
         false
     }
 
+    #[inline]
     fn eat_keyword_noexpect(&mut self, kw: Symbol) -> bool {
         if self.token.is_keyword(kw) {
             self.bump();
@@ -630,6 +667,7 @@ impl<'a> Parser<'a> {
         self.token.is_keyword(kw) && self.look_ahead(1, |t| t.is_ident() && !t.is_reserved_ident())
     }
 
+    #[inline]
     fn check_or_expected(&mut self, ok: bool, typ: TokenType) -> bool {
         if ok {
             true
@@ -677,6 +715,7 @@ impl<'a> Parser<'a> {
 
     /// Checks to see if the next token is either `+` or `+=`.
     /// Otherwise returns `false`.
+    #[inline]
     fn check_plus(&mut self) -> bool {
         self.check_or_expected(
             self.token.is_like_plus(),
@@ -694,7 +733,7 @@ impl<'a> Parser<'a> {
         }
         match self.token.kind.break_two_token_op() {
             Some((first, second)) if first == expected => {
-                let first_span = self.sess.source_map().start_point(self.token.span);
+                let first_span = self.psess.source_map().start_point(self.token.span);
                 let second_span = self.token.span.with_lo(first_span.hi());
                 self.token = Token::new(first, first_span);
                 // Keep track of this token - if we end token capturing now,
@@ -783,10 +822,10 @@ impl<'a> Parser<'a> {
         sep: SeqSep,
         expect: TokenExpectType,
         mut f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */, bool /* recovered */)> {
+    ) -> PResult<'a, (ThinVec<T>, Trailing, Recovered)> {
         let mut first = true;
-        let mut recovered = false;
-        let mut trailing = false;
+        let mut recovered = Recovered::No;
+        let mut trailing = Trailing::No;
         let mut v = ThinVec::new();
 
         while !self.expect_any_with_type(kets, expect) {
@@ -800,12 +839,12 @@ impl<'a> Parser<'a> {
                 } else {
                     // check for separator
                     match self.expect(t) {
-                        Ok(false) /* not recovered */ => {
+                        Ok(Recovered::No) => {
                             self.current_closure.take();
                         }
-                        Ok(true) /* recovered */ => {
+                        Ok(Recovered::Yes) => {
                             self.current_closure.take();
-                            recovered = true;
+                            recovered = Recovered::Yes;
                             break;
                         }
                         Err(mut expect_err) => {
@@ -900,7 +939,7 @@ impl<'a> Parser<'a> {
                 }
             }
             if sep.trailing_sep_allowed && self.expect_any_with_type(kets, expect) {
-                trailing = true;
+                trailing = Trailing::Yes;
                 break;
             }
 
@@ -914,7 +953,7 @@ impl<'a> Parser<'a> {
     fn recover_missing_braces_around_closure_body(
         &mut self,
         closure_spans: ClosureSpans,
-        mut expect_err: DiagnosticBuilder<'_>,
+        mut expect_err: Diag<'_>,
     ) -> PResult<'a, ()> {
         let initial_semicolon = self.token.span;
 
@@ -978,7 +1017,7 @@ impl<'a> Parser<'a> {
         ket: &TokenKind,
         sep: SeqSep,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */, bool /* recovered */)> {
+    ) -> PResult<'a, (ThinVec<T>, Trailing, Recovered)> {
         self.parse_seq_to_before_tokens(&[ket], sep, TokenExpectType::Expect, f)
     }
 
@@ -990,9 +1029,9 @@ impl<'a> Parser<'a> {
         ket: &TokenKind,
         sep: SeqSep,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */)> {
+    ) -> PResult<'a, (ThinVec<T>, Trailing)> {
         let (val, trailing, recovered) = self.parse_seq_to_before_end(ket, sep, f)?;
-        if !recovered {
+        if matches!(recovered, Recovered::No) {
             self.eat(ket);
         }
         Ok((val, trailing))
@@ -1007,7 +1046,7 @@ impl<'a> Parser<'a> {
         ket: &TokenKind,
         sep: SeqSep,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */)> {
+    ) -> PResult<'a, (ThinVec<T>, Trailing)> {
         self.expect(bra)?;
         self.parse_seq_to_end(ket, sep, f)
     }
@@ -1019,7 +1058,7 @@ impl<'a> Parser<'a> {
         &mut self,
         delim: Delimiter,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */)> {
+    ) -> PResult<'a, (ThinVec<T>, Trailing)> {
         self.parse_unspanned_seq(
             &token::OpenDelim(delim),
             &token::CloseDelim(delim),
@@ -1034,7 +1073,7 @@ impl<'a> Parser<'a> {
     fn parse_paren_comma_seq<T>(
         &mut self,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */)> {
+    ) -> PResult<'a, (ThinVec<T>, Trailing)> {
         self.parse_delim_comma_seq(Delimiter::Parenthesis, f)
     }
 
@@ -1193,7 +1232,7 @@ impl<'a> Parser<'a> {
     fn parse_closure_constness(&mut self) -> Const {
         let constness = self.parse_constness_(Case::Sensitive, true);
         if let Const::Yes(span) = constness {
-            self.sess.gated_spans.gate(sym::const_closures, span);
+            self.psess.gated_spans.gate(sym::const_closures, span);
         }
         constness
     }
@@ -1214,9 +1253,9 @@ impl<'a> Parser<'a> {
     /// Parses inline const expressions.
     fn parse_const_block(&mut self, span: Span, pat: bool) -> PResult<'a, P<Expr>> {
         if pat {
-            self.sess.gated_spans.gate(sym::inline_const_pat, span);
+            self.psess.gated_spans.gate(sym::inline_const_pat, span);
         } else {
-            self.sess.gated_spans.gate(sym::inline_const, span);
+            self.psess.gated_spans.gate(sym::inline_const, span);
         }
         self.eat_keyword(kw::Const);
         let (attrs, blk) = self.parse_inner_attrs_and_block()?;
@@ -1231,6 +1270,11 @@ impl<'a> Parser<'a> {
     /// Parses mutability (`mut` or nothing).
     fn parse_mutability(&mut self) -> Mutability {
         if self.eat_keyword(kw::Mut) { Mutability::Mut } else { Mutability::Not }
+    }
+
+    /// Parses reference binding mode (`ref`, `ref mut`, or nothing).
+    fn parse_byref(&mut self) -> ByRef {
+        if self.eat_keyword(kw::Ref) { ByRef::Yes(self.parse_mutability()) } else { ByRef::No }
     }
 
     /// Possibly parses mutability (`const` or `mut`).
@@ -1258,7 +1302,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_delim_args(&mut self) -> PResult<'a, P<DelimArgs>> {
-        if let Some(args) = self.parse_delim_args_inner() { Ok(P(args)) } else { self.unexpected() }
+        if let Some(args) = self.parse_delim_args_inner() {
+            Ok(P(args))
+        } else {
+            self.unexpected_any()
+        }
     }
 
     fn parse_attr_args(&mut self) -> PResult<'a, AttrArgs> {
@@ -1364,7 +1412,7 @@ impl<'a> Parser<'a> {
     /// so emit a proper diagnostic.
     // Public for rustfmt usage.
     pub fn parse_visibility(&mut self, fbt: FollowedByType) -> PResult<'a, Visibility> {
-        maybe_whole!(self, NtVis, |x| x.into_inner());
+        maybe_whole!(self, NtVis, |vis| vis.into_inner());
 
         if !self.eat_keyword(kw::Pub) {
             // We need a span for our `Spanned<VisibilityKind>`, but there's inherently no
@@ -1459,7 +1507,7 @@ impl<'a> Parser<'a> {
         match self.parse_str_lit() {
             Ok(str_lit) => Some(str_lit),
             Err(Some(lit)) => match lit.kind {
-                ast::LitKind::Err => None,
+                ast::LitKind::Err(_) => None,
                 _ => {
                     self.dcx().emit_err(NonStringAbiLiteral { span: lit.span });
                     None
@@ -1501,8 +1549,8 @@ impl<'a> Parser<'a> {
 
 pub(crate) fn make_unclosed_delims_error(
     unmatched: UnmatchedDelim,
-    sess: &ParseSess,
-) -> Option<DiagnosticBuilder<'_>> {
+    psess: &ParseSess,
+) -> Option<Diag<'_>> {
     // `None` here means an `Eof` was found. We already emit those errors elsewhere, we add them to
     // `unmatched_delims` only for error recovery in the `Parser`.
     let found_delim = unmatched.found_delim?;
@@ -1510,7 +1558,7 @@ pub(crate) fn make_unclosed_delims_error(
     if let Some(sp) = unmatched.unclosed_span {
         spans.push(sp);
     };
-    let err = sess.dcx.create_err(MismatchedClosingDelimiter {
+    let err = psess.dcx.create_err(MismatchedClosingDelimiter {
         spans,
         delimiter: pprust::token_kind_to_string(&token::CloseDelim(found_delim)).to_string(),
         unmatched: unmatched.found_span,
@@ -1541,8 +1589,21 @@ pub enum FlatToken {
     Empty,
 }
 
-#[derive(Debug)]
-pub enum ParseNtResult {
-    Nt(Nonterminal),
+// Metavar captures of various kinds.
+#[derive(Clone, Debug)]
+pub enum ParseNtResult<NtType> {
     Tt(TokenTree),
+    Nt(NtType),
+}
+
+impl<T> ParseNtResult<T> {
+    pub fn map_nt<F, U>(self, mut f: F) -> ParseNtResult<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        match self {
+            ParseNtResult::Tt(tt) => ParseNtResult::Tt(tt),
+            ParseNtResult::Nt(nt) => ParseNtResult::Nt(f(nt)),
+        }
+    }
 }

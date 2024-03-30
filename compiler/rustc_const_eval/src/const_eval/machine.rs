@@ -8,6 +8,7 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::fx::IndexEntry;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::LangItem;
 use rustc_middle::mir;
 use rustc_middle::mir::AssertMessage;
@@ -24,7 +25,7 @@ use crate::errors::{LongRunning, LongRunningWarn};
 use crate::fluent_generated as fluent;
 use crate::interpret::{
     self, compile_time_machine, AllocId, AllocRange, ConstAllocation, CtfeProvenance, FnArg, FnVal,
-    Frame, ImmTy, InterpCx, InterpResult, OpTy, PlaceTy, Pointer, PointerArithmetic, Scalar,
+    Frame, ImmTy, InterpCx, InterpResult, MPlaceTy, OpTy, Pointer, PointerArithmetic, Scalar,
 };
 
 use super::error::*;
@@ -51,16 +52,18 @@ pub struct CompileTimeInterpreter<'mir, 'tcx> {
     /// The virtual call stack.
     pub(super) stack: Vec<Frame<'mir, 'tcx>>,
 
-    /// We need to make sure consts never point to anything mutable, even recursively. That is
-    /// relied on for pattern matching on consts with references.
-    /// To achieve this, two pieces have to work together:
-    /// * Interning makes everything outside of statics immutable.
-    /// * Pointers to allocations inside of statics can never leak outside, to a non-static global.
-    /// This boolean here controls the second part.
-    pub(super) can_access_statics: CanAccessStatics,
+    /// Pattern matching on consts with references would be unsound if those references
+    /// could point to anything mutable. Therefore, when evaluating consts and when constructing valtrees,
+    /// we ensure that only immutable global memory can be accessed.
+    pub(super) can_access_mut_global: CanAccessMutGlobal,
 
     /// Whether to check alignment during evaluation.
     pub(super) check_alignment: CheckAlignment,
+
+    /// If `Some`, we are evaluating the initializer of the static with the given `LocalDefId`,
+    /// storing the result in the given `AllocId`.
+    /// Used to prevent reads from a static's base allocation, as that may allow for self-initialization loops.
+    pub(crate) static_root_ids: Option<(AllocId, LocalDefId)>,
 }
 
 #[derive(Copy, Clone)]
@@ -73,12 +76,12 @@ pub enum CheckAlignment {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-pub(crate) enum CanAccessStatics {
+pub(crate) enum CanAccessMutGlobal {
     No,
     Yes,
 }
 
-impl From<bool> for CanAccessStatics {
+impl From<bool> for CanAccessMutGlobal {
     fn from(value: bool) -> Self {
         if value { Self::Yes } else { Self::No }
     }
@@ -86,14 +89,15 @@ impl From<bool> for CanAccessStatics {
 
 impl<'mir, 'tcx> CompileTimeInterpreter<'mir, 'tcx> {
     pub(crate) fn new(
-        can_access_statics: CanAccessStatics,
+        can_access_mut_global: CanAccessMutGlobal,
         check_alignment: CheckAlignment,
     ) -> Self {
         CompileTimeInterpreter {
             num_evaluated_steps: 0,
             stack: Vec::new(),
-            can_access_statics,
+            can_access_mut_global,
             check_alignment,
+            static_root_ids: None,
         }
     }
 }
@@ -125,7 +129,8 @@ impl<K: Hash + Eq, V> interpret::AllocMap<K, V> for FxIndexMap<K, V> {
     where
         K: Borrow<Q>,
     {
-        FxIndexMap::remove(self, k)
+        // FIXME(#120456) - is `swap_remove` correct?
+        FxIndexMap::swap_remove(self, k)
     }
 
     #[inline(always)]
@@ -217,7 +222,7 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[FnArg<'tcx>],
-        dest: &PlaceTy<'tcx>,
+        dest: &MPlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         let def_id = instance.def_id();
@@ -225,7 +230,7 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
         if self.tcx.has_attr(def_id, sym::rustc_const_panic_str)
             || Some(def_id) == self.tcx.lang_items().begin_panic_fn()
         {
-            let args = self.copy_fn_args(args)?;
+            let args = self.copy_fn_args(args);
             // &str or &&str
             assert!(args.len() == 1);
 
@@ -241,18 +246,16 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
         } else if Some(def_id) == self.tcx.lang_items().panic_fmt() {
             // For panic_fmt, call const_panic_fmt instead.
             let const_def_id = self.tcx.require_lang_item(LangItem::ConstPanicFmt, None);
-            let new_instance = ty::Instance::resolve(
+            let new_instance = ty::Instance::expect_resolve(
                 *self.tcx,
                 ty::ParamEnv::reveal_all(),
                 const_def_id,
                 instance.args,
-            )
-            .unwrap()
-            .unwrap();
+            );
 
             return Ok(Some(new_instance));
         } else if Some(def_id) == self.tcx.lang_items().align_offset_fn() {
-            let args = self.copy_fn_args(args)?;
+            let args = self.copy_fn_args(args);
             // For align_offset, we replace the function call if the pointer has no address.
             match self.align_offset(instance, &args, dest, ret)? {
                 ControlFlow::Continue(()) => return Ok(Some(instance)),
@@ -278,7 +281,7 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx>],
-        dest: &PlaceTy<'tcx>,
+        dest: &MPlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
     ) -> InterpResult<'tcx, ControlFlow<()>> {
         assert_eq!(args.len(), 2);
@@ -391,11 +394,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                 if ecx.tcx.is_ctfe_mir_available(def) {
                     Ok(ecx.tcx.mir_for_ctfe(def))
                 } else if ecx.tcx.def_kind(def) == DefKind::AssocConst {
-                    let guar = ecx
-                        .tcx
-                        .dcx()
-                        .delayed_bug("This is likely a const item that is missing from its impl");
-                    throw_inval!(AlreadyReported(guar.into()));
+                    ecx.tcx.dcx().bug("This is likely a const item that is missing from its impl");
                 } else {
                     // `find_mir_or_eval_fn` checks that this is a const fn before even calling us,
                     // so this should be unreachable.
@@ -412,7 +411,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         orig_instance: ty::Instance<'tcx>,
         _abi: CallAbi,
         args: &[FnArg<'tcx>],
-        dest: &PlaceTy<'tcx>,
+        dest: &MPlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction, // unwinding is not supported in consts
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
@@ -457,7 +456,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx>],
-        dest: &PlaceTy<'tcx, Self::Provenance>,
+        dest: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
@@ -680,7 +679,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         machine: &Self,
         alloc_id: AllocId,
         alloc: ConstAllocation<'tcx>,
-        static_def_id: Option<DefId>,
+        _static_def_id: Option<DefId>,
         is_write: bool,
     ) -> InterpResult<'tcx> {
         let alloc = alloc.inner();
@@ -692,22 +691,15 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
             }
         } else {
             // Read access. These are usually allowed, with some exceptions.
-            if machine.can_access_statics == CanAccessStatics::Yes {
+            if machine.can_access_mut_global == CanAccessMutGlobal::Yes {
                 // Machine configuration allows us read from anything (e.g., `static` initializer).
                 Ok(())
-            } else if static_def_id.is_some() {
-                // Machine configuration does not allow us to read statics
-                // (e.g., `const` initializer).
-                // See const_eval::machine::MemoryExtra::can_access_statics for why
-                // this check is so important: if we could read statics, we could read pointers
-                // to mutable allocations *inside* statics. These allocations are not themselves
-                // statics, so pointers to them can get around the check in `validity.rs`.
-                Err(ConstEvalErrKind::ConstAccessesStatic.into())
+            } else if alloc.mutability == Mutability::Mut {
+                // Machine configuration does not allow us to read statics (e.g., `const`
+                // initializer).
+                Err(ConstEvalErrKind::ConstAccessesMutGlobal.into())
             } else {
                 // Immutable global, this read is fine.
-                // But make sure we never accept a read from something mutable, that would be
-                // unsound. The reason is that as the content of this allocation may be different
-                // now and at run-time, so if we permit reading now we might return the wrong value.
                 assert_eq!(alloc.mutability, Mutability::Not);
                 Ok(())
             }
@@ -754,6 +746,17 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         }
         // Everything else is fine.
         Ok(())
+    }
+
+    fn before_alloc_read(
+        ecx: &InterpCx<'mir, 'tcx, Self>,
+        alloc_id: AllocId,
+    ) -> InterpResult<'tcx> {
+        if Some(alloc_id) == ecx.machine.static_root_ids.map(|(id, _)| id) {
+            Err(ConstEvalErrKind::RecursiveStatic.into())
+        } else {
+            Ok(())
+        }
     }
 }
 

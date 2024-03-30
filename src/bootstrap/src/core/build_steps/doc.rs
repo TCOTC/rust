@@ -13,10 +13,9 @@ use std::{fs, mem};
 
 use crate::core::build_steps::compile;
 use crate::core::build_steps::tool::{self, prepare_tool_cargo, SourceType, Tool};
-use crate::core::builder::crate_description;
+use crate::core::builder::{self, crate_description};
 use crate::core::builder::{Alias, Builder, Compiler, Kind, RunConfig, ShouldRun, Step};
 use crate::core::config::{Config, TargetSelection};
-use crate::utils::cache::{Interned, INTERNER};
 use crate::utils::helpers::{dir_is_empty, symlink_dir, t, up_to_date};
 use crate::Mode;
 
@@ -32,7 +31,7 @@ macro_rules! submodule_helper {
 macro_rules! book {
     ($($name:ident, $path:expr, $book_name:expr $(, submodule $(= $submodule:literal)? )? ;)+) => {
         $(
-            #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+            #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         pub struct $name {
             target: TargetSelection,
         }
@@ -59,8 +58,8 @@ macro_rules! book {
                 )?
                 builder.ensure(RustbookSrc {
                     target: self.target,
-                    name: INTERNER.intern_str($book_name),
-                    src: INTERNER.intern_path(builder.src.join($path)),
+                    name: $book_name.to_owned(),
+                    src: builder.src.join($path),
                     parent: Some(self),
                 })
             }
@@ -86,7 +85,7 @@ book!(
     StyleGuide, "src/doc/style-guide", "style-guide";
 );
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct UnstableBook {
     target: TargetSelection,
 }
@@ -108,18 +107,18 @@ impl Step for UnstableBook {
         builder.ensure(UnstableBookGen { target: self.target });
         builder.ensure(RustbookSrc {
             target: self.target,
-            name: INTERNER.intern_str("unstable-book"),
-            src: INTERNER.intern_path(builder.md_doc_out(self.target).join("unstable-book")),
+            name: "unstable-book".to_owned(),
+            src: builder.md_doc_out(self.target).join("unstable-book"),
             parent: Some(self),
         })
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct RustbookSrc<P: Step> {
     target: TargetSelection,
-    name: Interned<String>,
-    src: Interned<PathBuf>,
+    name: String,
+    src: PathBuf,
     parent: Option<P>,
 }
 
@@ -141,17 +140,18 @@ impl<P: Step> Step for RustbookSrc<P> {
         let out = builder.doc_out(target);
         t!(fs::create_dir_all(&out));
 
-        let out = out.join(name);
+        let out = out.join(&name);
         let index = out.join("index.html");
         let rustbook = builder.tool_exe(Tool::Rustbook);
         let mut rustbook_cmd = builder.tool_cmd(Tool::Rustbook);
 
-        if !builder.config.dry_run() && !(up_to_date(&src, &index) || up_to_date(&rustbook, &index))
+        if !builder.config.dry_run()
+            && (!up_to_date(&src, &index) || !up_to_date(&rustbook, &index))
         {
             builder.info(&format!("Rustbook ({target}) - {name}"));
             let _ = fs::remove_dir_all(&out);
 
-            builder.run(rustbook_cmd.arg("build").arg(&src).arg("-d").arg(out));
+            builder.run(rustbook_cmd.arg("build").arg(src).arg("-d").arg(out));
         }
 
         if self.parent.is_some() {
@@ -160,7 +160,7 @@ impl<P: Step> Step for RustbookSrc<P> {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct TheBook {
     compiler: Compiler,
     target: TargetSelection,
@@ -211,8 +211,8 @@ impl Step for TheBook {
         // build book
         builder.ensure(RustbookSrc {
             target,
-            name: INTERNER.intern_str("book"),
-            src: INTERNER.intern_path(absolute_path.clone()),
+            name: "book".to_owned(),
+            src: absolute_path.clone(),
             parent: Some(self),
         });
 
@@ -220,8 +220,8 @@ impl Step for TheBook {
         for edition in &["first-edition", "second-edition", "2018-edition"] {
             builder.ensure(RustbookSrc {
                 target,
-                name: INTERNER.intern_string(format!("book/{edition}")),
-                src: INTERNER.intern_path(absolute_path.join(edition)),
+                name: format!("book/{edition}"),
+                src: absolute_path.join(edition),
                 // There should only be one book that is marked as the parent for each target, so
                 // treat the other editions as not having a parent.
                 parent: Option::<Self>::None,
@@ -286,7 +286,7 @@ fn invoke_rustdoc(
     builder.run(&mut cmd);
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Standalone {
     compiler: Compiler,
     target: TargetSelection,
@@ -384,12 +384,12 @@ impl Step for Standalone {
         // with no particular explicit doc requested (e.g. library/core).
         if builder.paths.is_empty() || builder.was_invoked_explicitly::<Self>(Kind::Doc) {
             let index = out.join("index.html");
-            builder.open_in_browser(&index);
+            builder.open_in_browser(index);
         }
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Releases {
     compiler: Compiler,
     target: TargetSelection,
@@ -492,7 +492,7 @@ pub struct SharedAssetsPaths {
     pub version_info: PathBuf,
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SharedAssets {
     target: TargetSelection,
 }
@@ -517,21 +517,24 @@ impl Step for SharedAssets {
                 .replace("VERSION", &builder.rust_release())
                 .replace("SHORT_HASH", builder.rust_info().sha_short().unwrap_or(""))
                 .replace("STAMP", builder.rust_info().sha().unwrap_or(""));
-            t!(fs::write(&version_info, &info));
+            t!(fs::write(&version_info, info));
         }
 
-        builder.copy(&builder.src.join("src").join("doc").join("rust.css"), &out.join("rust.css"));
+        builder.copy_link(
+            &builder.src.join("src").join("doc").join("rust.css"),
+            &out.join("rust.css"),
+        );
 
         SharedAssetsPaths { version_info }
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Std {
     pub stage: u32,
     pub target: TargetSelection,
     pub format: DocumentationFormat,
-    crates: Interned<Vec<String>>,
+    crates: Vec<String>,
 }
 
 impl Std {
@@ -546,7 +549,7 @@ impl Std {
             .into_iter()
             .map(|krate| krate.name.to_string())
             .collect();
-        Std { stage, target, format, crates: INTERNER.intern_list(crates) }
+        Std { stage, target, format, crates }
     }
 }
 
@@ -684,7 +687,9 @@ fn doc_std(
     // as a function parameter.
     let out_dir = target_dir.join(target.triple).join("doc");
 
-    let mut cargo = builder.cargo(compiler, Mode::Std, SourceType::InTree, target, "doc");
+    let mut cargo =
+        builder::Cargo::new(builder, compiler, Mode::Std, SourceType::InTree, target, "doc");
+
     compile::std_cargo(builder, target, compiler.stage, &mut cargo);
     cargo
         .arg("--no-deps")
@@ -712,18 +717,18 @@ fn doc_std(
     }
 
     let description =
-        format!("library{} in {} format", crate_description(&requested_crates), format.as_str());
-    let _guard = builder.msg_doc(compiler, &description, target);
+        format!("library{} in {} format", crate_description(requested_crates), format.as_str());
+    let _guard = builder.msg_doc(compiler, description, target);
 
     builder.run(&mut cargo.into());
-    builder.cp_r(&out_dir, &out);
+    builder.cp_link_r(&out_dir, out);
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Rustc {
     pub stage: u32,
     pub target: TargetSelection,
-    crates: Interned<Vec<String>>,
+    crates: Vec<String>,
 }
 
 impl Rustc {
@@ -733,7 +738,7 @@ impl Rustc {
             .into_iter()
             .map(|krate| krate.name.to_string())
             .collect();
-        Self { stage, target, crates: INTERNER.intern_list(crates) }
+        Self { stage, target, crates }
     }
 }
 
@@ -779,13 +784,15 @@ impl Step for Rustc {
         let _guard = builder.msg_sysroot_tool(
             Kind::Doc,
             stage,
-            &format!("compiler{}", crate_description(&self.crates)),
+            format!("compiler{}", crate_description(&self.crates)),
             compiler.host,
             target,
         );
 
         // Build cargo command.
-        let mut cargo = builder.cargo(compiler, Mode::Rustc, SourceType::InTree, target, "doc");
+        let mut cargo =
+            builder::Cargo::new(builder, compiler, Mode::Rustc, SourceType::InTree, target, "doc");
+
         cargo.rustdocflag("--document-private-items");
         // Since we always pass --document-private-items, there's no need to warn about linking to private items.
         cargo.rustdocflag("-Arustdoc::private-intra-doc-links");
@@ -793,7 +800,10 @@ impl Step for Rustc {
         cargo.rustdocflag("-Zunstable-options");
         cargo.rustdocflag("-Znormalize-docs");
         cargo.rustdocflag("--show-type-layout");
-        cargo.rustdocflag("--generate-link-to-definition");
+        // FIXME: `--generate-link-to-definition` tries to resolve cfged out code
+        // see https://github.com/rust-lang/rust/pull/122066#issuecomment-1983049222
+        // cargo.rustdocflag("--generate-link-to-definition");
+
         compile::rustc_cargo(builder, &mut cargo, target, compiler.stage);
         cargo.arg("-Zunstable-options");
         cargo.arg("-Zskip-rustdoc-fingerprint");
@@ -815,7 +825,7 @@ impl Step for Rustc {
             // Create all crate output directories first to make sure rustdoc uses
             // relative links.
             // FIXME: Cargo should probably do this itself.
-            let dir_name = krate.replace("-", "_");
+            let dir_name = krate.replace('-', "_");
             t!(fs::create_dir_all(out_dir.join(&*dir_name)));
             cargo.arg("-p").arg(krate);
             if to_open.is_none() {
@@ -840,7 +850,7 @@ impl Step for Rustc {
         if !builder.config.dry_run() {
             // Sanity check on linked compiler crates
             for krate in &*self.crates {
-                let dir_name = krate.replace("-", "_");
+                let dir_name = krate.replace('-', "_");
                 // Making sure the directory exists and is not empty.
                 assert!(out.join(&*dir_name).read_dir().unwrap().next().is_some());
             }
@@ -868,7 +878,7 @@ macro_rules! tool_doc {
         $(is_library = $is_library:expr,)?
         $(crates = $crates:expr)?
        ) => {
-        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+        #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         pub struct $tool {
             target: TargetSelection,
         }
@@ -949,8 +959,10 @@ macro_rules! tool_doc {
                 cargo.rustdocflag("-Arustdoc::private-intra-doc-links");
                 cargo.rustdocflag("--enable-index-page");
                 cargo.rustdocflag("--show-type-layout");
-                cargo.rustdocflag("--generate-link-to-definition");
                 cargo.rustdocflag("-Zunstable-options");
+                // FIXME: `--generate-link-to-definition` tries to resolve cfged out code
+                // see https://github.com/rust-lang/rust/pull/122066#issuecomment-1983049222
+                // cargo.rustdocflag("--generate-link-to-definition");
 
                 let out_dir = builder.stage_out(compiler, Mode::ToolRustc).join(target.triple).join("doc");
                 $(for krate in $crates {
@@ -1017,7 +1029,7 @@ tool_doc!(
     crates = ["bootstrap"]
 );
 
-#[derive(Ord, PartialOrd, Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Ord, PartialOrd, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ErrorIndex {
     pub target: TargetSelection,
 }
@@ -1052,7 +1064,7 @@ impl Step for ErrorIndex {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct UnstableBookGen {
     target: TargetSelection,
 }
@@ -1108,7 +1120,7 @@ fn symlink_dir_force(config: &Config, original: &Path, link: &Path) {
     );
 }
 
-#[derive(Ord, PartialOrd, Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Ord, PartialOrd, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RustcBook {
     pub compiler: Compiler,
     pub target: TargetSelection,
@@ -1142,7 +1154,7 @@ impl Step for RustcBook {
         let out_base = builder.md_doc_out(self.target).join("rustc");
         t!(fs::create_dir_all(&out_base));
         let out_listing = out_base.join("src/lints");
-        builder.cp_r(&builder.src.join("src/doc/rustc"), &out_base);
+        builder.cp_link_r(&builder.src.join("src/doc/rustc"), &out_base);
         builder.info(&format!("Generating lint docs ({})", self.target));
 
         let rustc = builder.rustc(self.compiler);
@@ -1156,7 +1168,7 @@ impl Step for RustcBook {
         cmd.arg(&out_listing);
         cmd.arg("--rustc");
         cmd.arg(&rustc);
-        cmd.arg("--rustc-target").arg(&self.target.rustc_target_arg());
+        cmd.arg("--rustc-target").arg(self.target.rustc_target_arg());
         if builder.is_verbose() {
             cmd.arg("--verbose");
         }
@@ -1185,8 +1197,8 @@ impl Step for RustcBook {
         // Run rustbook/mdbook to generate the HTML pages.
         builder.ensure(RustbookSrc {
             target: self.target,
-            name: INTERNER.intern_str("rustc"),
-            src: INTERNER.intern_path(out_base),
+            name: "rustc".to_owned(),
+            src: out_base,
             parent: Some(self),
         });
     }

@@ -2,8 +2,6 @@ use crate::ty::{self, Binder, BoundTy, Ty, TyCtxt, TypeVisitableExt};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir::def_id::DefId;
 
-use std::collections::BTreeMap;
-
 pub use rustc_type_ir::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeSuperFoldable};
 
 ///////////////////////////////////////////////////////////////////////////
@@ -254,12 +252,12 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         value: Binder<'tcx, T>,
         mut fld_r: F,
-    ) -> (T, BTreeMap<ty::BoundRegion, ty::Region<'tcx>>)
+    ) -> (T, FxIndexMap<ty::BoundRegion, ty::Region<'tcx>>)
     where
         F: FnMut(ty::BoundRegion) -> ty::Region<'tcx>,
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let mut region_map = BTreeMap::new();
+        let mut region_map = FxIndexMap::default();
         let real_fld_r = |br: ty::BoundRegion| *region_map.entry(br).or_insert_with(|| fld_r(br));
         let value = self.instantiate_bound_regions_uncached(value, real_fld_r);
         (value, region_map)
@@ -418,10 +416,10 @@ impl<'tcx> TyCtxt<'tcx> {
 // Shifter
 //
 // Shifts the De Bruijn indices on all escaping bound vars by a
-// fixed amount. Useful in substitution or when otherwise introducing
+// fixed amount. Useful in instantiation or when otherwise introducing
 // a binding level that is not intended to capture the existing bound
 // vars. See comment on `shift_vars_through_binders` method in
-// `subst.rs` for more details.
+// `rustc_middle/src/ty/generic_args.rs` for more details.
 
 struct Shifter<'tcx> {
     tcx: TyCtxt<'tcx>,

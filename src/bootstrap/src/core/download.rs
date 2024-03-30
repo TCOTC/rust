@@ -1,6 +1,6 @@
 use std::{
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, ErrorKind, Write},
     path::{Path, PathBuf},
@@ -61,7 +61,7 @@ impl Config {
         if self.dry_run() {
             return true;
         }
-        self.verbose(&format!("running: {cmd:?}"));
+        self.verbose(|| println!("running: {cmd:?}"));
         check_run(cmd, self.is_verbose())
     }
 
@@ -159,7 +159,7 @@ impl Config {
             ";
             nix_build_succeeded = try_run(
                 self,
-                Command::new("nix-build").args(&[
+                Command::new("nix-build").args([
                     Path::new("-E"),
                     Path::new(NIX_EXPR),
                     Path::new("-o"),
@@ -183,19 +183,19 @@ impl Config {
             entries
         };
         patchelf.args(&[OsString::from("--set-rpath"), rpath_entries]);
-        if !fname.extension().map_or(false, |ext| ext == "so") {
+        if !path_is_dylib(fname) {
             // Finally, set the correct .interp for binaries
             let dynamic_linker_path = nix_deps_dir.join("nix-support/dynamic-linker");
             // FIXME: can we support utf8 here? `args` doesn't accept Vec<u8>, only OsString ...
             let dynamic_linker = t!(String::from_utf8(t!(fs::read(dynamic_linker_path))));
-            patchelf.args(&["--set-interpreter", dynamic_linker.trim_end()]);
+            patchelf.args(["--set-interpreter", dynamic_linker.trim_end()]);
         }
 
         let _ = try_run(self, patchelf.arg(fname));
     }
 
     fn download_file(&self, url: &str, dest_path: &Path, help_on_error: &str) {
-        self.verbose(&format!("download {url}"));
+        self.verbose(|| println!("download {url}"));
         // Use a temporary file in case we crash while downloading, to avoid a corrupt download in cache/.
         let tempfile = self.tempdir().join(dest_path.file_name().unwrap());
         // While bootstrap itself only supports http and https downloads, downstream forks might
@@ -218,7 +218,7 @@ impl Config {
         println!("downloading {url}");
         // Try curl. If that fails and we are on windows, fallback to PowerShell.
         let mut curl = Command::new("curl");
-        curl.args(&[
+        curl.args([
             "-y",
             "30",
             "-Y",
@@ -242,7 +242,7 @@ impl Config {
             if self.build.contains("windows-msvc") {
                 eprintln!("Fallback to PowerShell");
                 for _ in 0..3 {
-                    if try_run(self, Command::new("PowerShell.exe").args(&[
+                    if try_run(self, Command::new("PowerShell.exe").args([
                         "/nologo",
                         "-Command",
                         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;",
@@ -300,7 +300,9 @@ impl Config {
             }
             short_path = t!(short_path.strip_prefix(pattern));
             let dst_path = dst.join(short_path);
-            self.verbose(&format!("extracting {} to {}", original_path.display(), dst.display()));
+            self.verbose(|| {
+                println!("extracting {} to {}", original_path.display(), dst.display())
+            });
             if !t!(member.unpack_in(dst)) {
                 panic!("path traversal attack ??");
             }
@@ -323,7 +325,7 @@ impl Config {
     pub(crate) fn verify(&self, path: &Path, expected: &str) -> bool {
         use sha2::Digest;
 
-        self.verbose(&format!("verifying {}", path.display()));
+        self.verbose(|| println!("verifying {}", path.display()));
 
         if self.dry_run() {
             return false;
@@ -379,7 +381,7 @@ enum DownloadSource {
 /// Functions that are only ever called once, but named for clarify and to avoid thousand-line functions.
 impl Config {
     pub(crate) fn download_clippy(&self) -> PathBuf {
-        self.verbose("downloading stage0 clippy artifacts");
+        self.verbose(|| println!("downloading stage0 clippy artifacts"));
 
         let date = &self.stage0_metadata.compiler.date;
         let version = &self.stage0_metadata.compiler.version;
@@ -388,7 +390,7 @@ impl Config {
         let bin_root = self.out.join(host.triple).join("stage0");
         let clippy_stamp = bin_root.join(".clippy-stamp");
         let cargo_clippy = bin_root.join("bin").join(exe("cargo-clippy", host));
-        if cargo_clippy.exists() && !program_out_of_date(&clippy_stamp, &date) {
+        if cargo_clippy.exists() && !program_out_of_date(&clippy_stamp, date) {
             return cargo_clippy;
         }
 
@@ -399,6 +401,7 @@ impl Config {
             self.fix_bin_or_dylib(&cargo_clippy.with_file_name(exe("clippy-driver", host)));
         }
 
+        self.create(&clippy_stamp, date);
         cargo_clippy
     }
 
@@ -420,14 +423,14 @@ impl Config {
             DownloadSource::Dist,
             format!("rustfmt-{version}-{build}.tar.xz", build = host.triple),
             "rustfmt-preview",
-            &date,
+            date,
             "rustfmt",
         );
         self.download_component(
             DownloadSource::Dist,
             format!("rustc-{version}-{build}.tar.xz", build = host.triple),
             "rustc",
-            &date,
+            date,
             "rustfmt",
         );
 
@@ -437,7 +440,7 @@ impl Config {
             let lib_dir = bin_root.join("lib");
             for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
                 let lib = t!(lib);
-                if lib.path().extension() == Some(OsStr::new("so")) {
+                if path_is_dylib(&lib.path()) {
                     self.fix_bin_or_dylib(&lib.path());
                 }
             }
@@ -468,7 +471,7 @@ impl Config {
     }
 
     pub(crate) fn download_ci_rustc(&self, commit: &str) {
-        self.verbose(&format!("using downloaded stage2 artifacts from CI (commit {commit})"));
+        self.verbose(|| println!("using downloaded stage2 artifacts from CI (commit {commit})"));
 
         let version = self.artifact_version_part(commit);
         // download-rustc doesn't need its own cargo, it can just use beta's. But it does need the
@@ -485,7 +488,7 @@ impl Config {
     }
 
     pub(crate) fn download_beta_toolchain(&self) {
-        self.verbose("downloading stage0 beta artifacts");
+        self.verbose(|| println!("downloading stage0 beta artifacts"));
 
         let date = &self.stage0_metadata.compiler.date;
         let version = &self.stage0_metadata.compiler.version;
@@ -542,7 +545,7 @@ impl Config {
                 let lib_dir = bin_root.join("lib");
                 for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
                     let lib = t!(lib);
-                    if lib.path().extension() == Some(OsStr::new("so")) {
+                    if path_is_dylib(&lib.path()) {
                         self.fix_bin_or_dylib(&lib.path());
                     }
                 }
@@ -577,7 +580,9 @@ impl Config {
             return;
         }
 
-        let cache_dst = self.out.join("cache");
+        let cache_dst =
+            self.bootstrap_cache_path.as_ref().cloned().unwrap_or_else(|| self.out.join("cache"));
+
         let cache_dir = cache_dst.join(key);
         if !cache_dir.exists() {
             t!(fs::create_dir_all(&cache_dir));
@@ -622,10 +627,12 @@ impl Config {
                     self.unpack(&tarball, &bin_root, prefix);
                     return;
                 } else {
-                    self.verbose(&format!(
-                        "ignoring cached file {} due to failed verification",
-                        tarball.display()
-                    ));
+                    self.verbose(|| {
+                        println!(
+                            "ignoring cached file {} due to failed verification",
+                            tarball.display()
+                        )
+                    });
                     self.remove(&tarball);
                 }
             }
@@ -664,7 +671,7 @@ download-rustc = false
         }
         let llvm_root = self.ci_llvm_root();
         let llvm_stamp = llvm_root.join(".llvm-stamp");
-        let llvm_sha = detect_llvm_sha(&self, self.rust_info.is_managed_git_subrepository());
+        let llvm_sha = detect_llvm_sha(self, self.rust_info.is_managed_git_subrepository());
         let key = format!("{}{}", llvm_sha, self.llvm_assertions);
         if program_out_of_date(&llvm_stamp, &key) && !self.dry_run() {
             self.download_ci_llvm(&llvm_sha);
@@ -684,13 +691,13 @@ download-rustc = false
             // rebuild.
             let now = filetime::FileTime::from_system_time(std::time::SystemTime::now());
             let llvm_config = llvm_root.join("bin").join(exe("llvm-config", self.build));
-            t!(filetime::set_file_times(&llvm_config, now, now));
+            t!(filetime::set_file_times(llvm_config, now, now));
 
             if self.should_fix_bins_and_dylibs() {
                 let llvm_lib = llvm_root.join("lib");
-                for entry in t!(fs::read_dir(&llvm_lib)) {
+                for entry in t!(fs::read_dir(llvm_lib)) {
                     let lib = t!(entry).path();
-                    if lib.extension().map_or(false, |ext| ext == "so") {
+                    if path_is_dylib(&lib) {
                         self.fix_bin_or_dylib(&lib);
                     }
                 }
@@ -704,7 +711,9 @@ download-rustc = false
         let llvm_assertions = self.llvm_assertions;
 
         let cache_prefix = format!("llvm-{llvm_sha}-{llvm_assertions}");
-        let cache_dst = self.out.join("cache");
+        let cache_dst =
+            self.bootstrap_cache_path.as_ref().cloned().unwrap_or_else(|| self.out.join("cache"));
+
         let rustc_cache = cache_dst.join(cache_prefix);
         if !rustc_cache.exists() {
             t!(fs::create_dir_all(&rustc_cache));
@@ -720,8 +729,10 @@ download-rustc = false
         if !tarball.exists() {
             let help_on_error = "ERROR: failed to download llvm from ci
 
-    HELP: old builds get deleted after a certain time
-    HELP: if trying to compile an old commit of rustc, disable `download-ci-llvm` in config.toml:
+    HELP: There could be two reasons behind this:
+        1) The host triple is not supported for `download-ci-llvm`.
+        2) Old builds get deleted after a certain time.
+    HELP: In either case, disable `download-ci-llvm` in your config.toml:
 
     [llvm]
     download-ci-llvm = false
@@ -731,4 +742,9 @@ download-rustc = false
         let llvm_root = self.ci_llvm_root();
         self.unpack(&tarball, &llvm_root, "rust-dev");
     }
+}
+
+fn path_is_dylib(path: &Path) -> bool {
+    // The .so is not necessarily the extension, it might be libLLVM.so.18.1
+    path.to_str().map_or(false, |path| path.contains(".so"))
 }

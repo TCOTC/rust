@@ -139,6 +139,17 @@ impl From<ast::AssocItem> for ast::Item {
     }
 }
 
+impl From<ast::ExternItem> for ast::Item {
+    fn from(extern_item: ast::ExternItem) -> Self {
+        match extern_item {
+            ast::ExternItem::Static(it) => ast::Item::Static(it),
+            ast::ExternItem::Fn(it) => ast::Item::Fn(it),
+            ast::ExternItem::MacroCall(it) => ast::Item::MacroCall(it),
+            ast::ExternItem::TypeAlias(it) => ast::Item::TypeAlias(it),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AttrKind {
     Inner,
@@ -565,6 +576,26 @@ impl fmt::Display for NameOrNameRef {
         match self {
             NameOrNameRef::Name(it) => fmt::Display::fmt(it, f),
             NameOrNameRef::NameRef(it) => fmt::Display::fmt(it, f),
+        }
+    }
+}
+
+impl ast::AstNode for NameOrNameRef {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        matches!(kind, SyntaxKind::NAME | SyntaxKind::NAME_REF)
+    }
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        let res = match syntax.kind() {
+            SyntaxKind::NAME => NameOrNameRef::Name(ast::Name { syntax }),
+            SyntaxKind::NAME_REF => NameOrNameRef::NameRef(ast::NameRef { syntax }),
+            _ => return None,
+        };
+        Some(res)
+    }
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            NameOrNameRef::NameRef(it) => it.syntax(),
+            NameOrNameRef::Name(it) => it.syntax(),
         }
     }
 }

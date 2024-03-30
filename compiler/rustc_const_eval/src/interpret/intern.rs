@@ -13,12 +13,17 @@
 //! but that would require relying on type information, and given how many ways Rust has to lie
 //! about type information, we want to avoid doing that.
 
+use hir::def::DefKind;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
-use rustc_middle::mir::interpret::{CtfeProvenance, InterpResult};
+use rustc_middle::mir::interpret::{ConstAllocation, CtfeProvenance, InterpResult};
+use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::TyAndLayout;
+use rustc_session::lint;
+use rustc_span::def_id::LocalDefId;
+use rustc_span::sym;
 
 use super::{AllocId, Allocation, InterpCx, MPlaceTy, Machine, MemoryKind, PlaceTy};
 use crate::const_eval;
@@ -33,7 +38,19 @@ pub trait CompileTimeMachine<'mir, 'tcx: 'mir, T> = Machine<
         FrameExtra = (),
         AllocExtra = (),
         MemoryMap = FxIndexMap<AllocId, (MemoryKind<T>, Allocation)>,
-    >;
+    > + HasStaticRootDefId;
+
+pub trait HasStaticRootDefId {
+    /// Returns the `DefId` of the static item that is currently being evaluated.
+    /// Used for interning to be able to handle nested allocations.
+    fn static_def_id(&self) -> Option<LocalDefId>;
+}
+
+impl HasStaticRootDefId for const_eval::CompileTimeInterpreter<'_, '_> {
+    fn static_def_id(&self) -> Option<LocalDefId> {
+        Some(self.static_root_ids?.1)
+    }
+}
 
 /// Intern an allocation. Returns `Err` if the allocation does not exist in the local memory.
 ///
@@ -49,7 +66,8 @@ fn intern_shallow<'rt, 'mir, 'tcx, T, M: CompileTimeMachine<'mir, 'tcx, T>>(
 ) -> Result<impl Iterator<Item = CtfeProvenance> + 'tcx, ()> {
     trace!("intern_shallow {:?}", alloc_id);
     // remove allocation
-    let Some((_kind, mut alloc)) = ecx.memory.alloc_map.remove(&alloc_id) else {
+    // FIXME(#120456) - is `swap_remove` correct?
+    let Some((_kind, mut alloc)) = ecx.memory.alloc_map.swap_remove(&alloc_id) else {
         return Err(());
     };
     // Set allocation mutability as appropriate. This is used by LLVM to put things into
@@ -66,8 +84,35 @@ fn intern_shallow<'rt, 'mir, 'tcx, T, M: CompileTimeMachine<'mir, 'tcx, T>>(
     }
     // link the alloc id to the actual allocation
     let alloc = ecx.tcx.mk_const_alloc(alloc);
-    ecx.tcx.set_alloc_id_memory(alloc_id, alloc);
+    if let Some(static_id) = ecx.machine.static_def_id() {
+        intern_as_new_static(ecx.tcx, static_id, alloc_id, alloc);
+    } else {
+        ecx.tcx.set_alloc_id_memory(alloc_id, alloc);
+    }
     Ok(alloc.0.0.provenance().ptrs().iter().map(|&(_, prov)| prov))
+}
+
+/// Creates a new `DefId` and feeds all the right queries to make this `DefId`
+/// appear as if it were a user-written `static` (though it has no HIR).
+fn intern_as_new_static<'tcx>(
+    tcx: TyCtxtAt<'tcx>,
+    static_id: LocalDefId,
+    alloc_id: AllocId,
+    alloc: ConstAllocation<'tcx>,
+) {
+    let feed = tcx.create_def(
+        static_id,
+        sym::nested,
+        DefKind::Static { mutability: alloc.0.mutability, nested: true },
+    );
+    tcx.set_nested_alloc_id_static(alloc_id, feed.def_id());
+    feed.codegen_fn_attrs(tcx.codegen_fn_attrs(static_id).clone());
+    feed.eval_static_initializer(Ok(alloc));
+    feed.generics_of(tcx.generics_of(static_id).clone());
+    feed.def_ident_span(tcx.def_ident_span(static_id));
+    feed.explicit_predicates_of(tcx.explicit_predicates_of(static_id));
+
+    feed.feed_hir()
 }
 
 /// How a constant value should be interned.
@@ -84,6 +129,8 @@ pub enum InternKind {
 ///
 /// This *cannot raise an interpreter error*. Doing so is left to validation, which
 /// tracks where in the value we are and thus can show much better error messages.
+///
+/// For `InternKind::Static` the root allocation will not be interned, but must be handled by the caller.
 #[instrument(level = "debug", skip(ecx))]
 pub fn intern_const_alloc_recursive<
     'mir,
@@ -96,12 +143,12 @@ pub fn intern_const_alloc_recursive<
 ) -> Result<(), ErrorGuaranteed> {
     // We are interning recursively, and for mutability we are distinguishing the "root" allocation
     // that we are starting in, and all other allocations that we are encountering recursively.
-    let (base_mutability, inner_mutability) = match intern_kind {
+    let (base_mutability, inner_mutability, is_static) = match intern_kind {
         InternKind::Constant | InternKind::Promoted => {
             // Completely immutable. Interning anything mutably here can only lead to unsoundness,
             // since all consts are conceptually independent values but share the same underlying
             // memory.
-            (Mutability::Not, Mutability::Not)
+            (Mutability::Not, Mutability::Not, false)
         }
         InternKind::Static(Mutability::Not) => {
             (
@@ -114,22 +161,31 @@ pub fn intern_const_alloc_recursive<
                 // Inner allocations are never mutable. They can only arise via the "tail
                 // expression" / "outer scope" rule, and we treat them consistently with `const`.
                 Mutability::Not,
+                true,
             )
         }
         InternKind::Static(Mutability::Mut) => {
             // Just make everything mutable. We accept code like
             // `static mut X = &mut [42]`, so even inner allocations need to be mutable.
-            (Mutability::Mut, Mutability::Mut)
+            (Mutability::Mut, Mutability::Mut, true)
         }
     };
 
     // Intern the base allocation, and initialize todo list for recursive interning.
     let base_alloc_id = ret.ptr().provenance.unwrap().alloc_id();
+    trace!(?base_alloc_id, ?base_mutability);
     // First we intern the base allocation, as it requires a different mutability.
     // This gives us the initial set of nested allocations, which will then all be processed
     // recursively in the loop below.
-    let mut todo: Vec<_> =
-        intern_shallow(ecx, base_alloc_id, base_mutability).unwrap().map(|prov| prov).collect();
+    let mut todo: Vec<_> = if is_static {
+        // Do not steal the root allocation, we need it later to create the return value of `eval_static_initializer`.
+        // But still change its mutability to match the requested one.
+        let alloc = ecx.memory.alloc_map.get_mut(&base_alloc_id).unwrap();
+        alloc.1.mutability = base_mutability;
+        alloc.1.provenance().ptrs().iter().map(|&(_, prov)| prov).collect()
+    } else {
+        intern_shallow(ecx, base_alloc_id, base_mutability).unwrap().collect()
+    };
     // We need to distinguish "has just been interned" from "was already in `tcx`",
     // so we track this in a separate set.
     let mut just_interned: FxHashSet<_> = std::iter::once(base_alloc_id).collect();
@@ -147,7 +203,17 @@ pub fn intern_const_alloc_recursive<
     // before validation, and interning doesn't know the type of anything, this means we can't show
     // better errors. Maybe we should consider doing validation before interning in the future.
     while let Some(prov) = todo.pop() {
+        trace!(?prov);
         let alloc_id = prov.alloc_id();
+
+        if base_alloc_id == alloc_id && is_static {
+            // This is a pointer to the static itself. It's ok for a static to refer to itself,
+            // even mutably. Whether that mutable pointer is legal at all is checked in validation.
+            // See tests/ui/statics/recursive_interior_mut.rs for how such a situation can occur.
+            // We also already collected all the nested allocations, so there's no need to do that again.
+            continue;
+        }
+
         // Crucially, we check this *before* checking whether the `alloc_id`
         // has already been interned. The point of this check is to ensure that when
         // there are multiple pointers to the same allocation, they are *all* immutable.
@@ -175,6 +241,7 @@ pub fn intern_const_alloc_recursive<
             // `&None::<Cell<i32>>` lead to promotion that can produce mutable pointers. We rely
             // on the promotion analysis not screwing up to ensure that it is sound to intern
             // promoteds as immutable.
+            trace!("found bad mutable pointer");
             found_bad_mutable_pointer = true;
         }
         if ecx.tcx.try_get_global_alloc(alloc_id).is_some() {
@@ -198,10 +265,13 @@ pub fn intern_const_alloc_recursive<
         })?);
     }
     if found_bad_mutable_pointer {
-        return Err(ecx
-            .tcx
-            .dcx()
-            .emit_err(MutablePtrInFinal { span: ecx.tcx.span, kind: intern_kind }));
+        let err_diag = MutablePtrInFinal { span: ecx.tcx.span, kind: intern_kind };
+        ecx.tcx.emit_node_span_lint(
+            lint::builtin::CONST_EVAL_MUTABLE_PTR_IN_FINAL_VALUE,
+            ecx.best_lint_scope(),
+            err_diag.span,
+            err_diag,
+        )
     }
 
     Ok(())
@@ -223,7 +293,9 @@ pub fn intern_const_alloc_for_constprop<
         return Ok(());
     }
     // Move allocation to `tcx`.
-    for _ in intern_shallow(ecx, alloc_id, Mutability::Not).map_err(|()| err_ub!(DeadLocal))? {
+    if let Some(_) =
+        (intern_shallow(ecx, alloc_id, Mutability::Not).map_err(|()| err_ub!(DeadLocal))?).next()
+    {
         // We are not doing recursive interning, so we don't currently support provenance.
         // (If this assertion ever triggers, we should just implement a
         // proper recursive interning loop -- or just call `intern_const_alloc_recursive`.
@@ -254,7 +326,7 @@ impl<'mir, 'tcx: 'mir, M: super::intern::CompileTimeMachine<'mir, 'tcx, !>>
             // We are not doing recursive interning, so we don't currently support provenance.
             // (If this assertion ever triggers, we should just implement a
             // proper recursive interning loop -- or just call `intern_const_alloc_recursive`.
-            if !self.tcx.try_get_global_alloc(prov.alloc_id()).is_some() {
+            if self.tcx.try_get_global_alloc(prov.alloc_id()).is_none() {
                 panic!("`intern_with_temp_alloc` with nested allocations");
             }
         }

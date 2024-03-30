@@ -2,24 +2,21 @@
 //!
 //! Currently, this pass only propagates scalar values.
 
+use rustc_const_eval::const_eval::{throw_machine_stop_str, DummyMachine};
 use rustc_const_eval::interpret::{ImmTy, Immediate, InterpCx, OpTy, PlaceTy, Projectable};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
-use rustc_middle::mir::interpret::{AllocId, ConstAllocation, InterpResult, Scalar};
+use rustc_middle::mir::interpret::{InterpResult, Scalar};
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::*;
-use rustc_middle::query::TyCtxtAt;
-use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{
     Map, PlaceIndex, State, TrackElem, ValueAnalysis, ValueAnalysisWrapper, ValueOrPlace,
 };
 use rustc_mir_dataflow::{lattice::FlatSet, Analysis, Results, ResultsVisitor};
-use rustc_span::def_id::DefId;
 use rustc_span::DUMMY_SP;
 use rustc_target::abi::{Abi, FieldIdx, Size, VariantIdx, FIRST_VARIANT};
-
-use crate::const_prop::throw_machine_stop_str;
 
 // These constants are somewhat random guesses and have not been optimized.
 // If `tcx.sess.mir_opt_level() >= 4`, we ignore the limits (this can become very expensive).
@@ -366,7 +363,9 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
                 }
             }
             Operand::Constant(box constant) => {
-                if let Ok(constant) = self.ecx.eval_mir_constant(&constant.const_, None, None) {
+                if let Ok(constant) =
+                    self.ecx.eval_mir_constant(&constant.const_, constant.span, None)
+                {
                     self.assign_constant(state, place, constant, &[]);
                 }
             }
@@ -857,123 +856,5 @@ impl<'tcx> Visitor<'tcx> for OperandCollector<'tcx, '_, '_, '_> {
                 self.super_operand(operand, location)
             }
         }
-    }
-}
-
-pub(crate) struct DummyMachine;
-
-impl<'mir, 'tcx: 'mir> rustc_const_eval::interpret::Machine<'mir, 'tcx> for DummyMachine {
-    rustc_const_eval::interpret::compile_time_machine!(<'mir, 'tcx>);
-    type MemoryKind = !;
-    const PANIC_ON_ALLOC_FAIL: bool = true;
-
-    #[inline(always)]
-    fn enforce_alignment(_ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
-        false // no reason to enforce alignment
-    }
-
-    fn enforce_validity(_ecx: &InterpCx<'mir, 'tcx, Self>, _layout: TyAndLayout<'tcx>) -> bool {
-        false
-    }
-
-    fn before_access_global(
-        _tcx: TyCtxtAt<'tcx>,
-        _machine: &Self,
-        _alloc_id: AllocId,
-        alloc: ConstAllocation<'tcx>,
-        _static_def_id: Option<DefId>,
-        is_write: bool,
-    ) -> InterpResult<'tcx> {
-        if is_write {
-            throw_machine_stop_str!("can't write to global");
-        }
-
-        // If the static allocation is mutable, then we can't const prop it as its content
-        // might be different at runtime.
-        if alloc.inner().mutability.is_mut() {
-            throw_machine_stop_str!("can't access mutable globals in ConstProp");
-        }
-
-        Ok(())
-    }
-
-    fn find_mir_or_eval_fn(
-        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _instance: ty::Instance<'tcx>,
-        _abi: rustc_target::spec::abi::Abi,
-        _args: &[rustc_const_eval::interpret::FnArg<'tcx, Self::Provenance>],
-        _destination: &rustc_const_eval::interpret::PlaceTy<'tcx, Self::Provenance>,
-        _target: Option<BasicBlock>,
-        _unwind: UnwindAction,
-    ) -> interpret::InterpResult<'tcx, Option<(&'mir Body<'tcx>, ty::Instance<'tcx>)>> {
-        unimplemented!()
-    }
-
-    fn panic_nounwind(
-        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _msg: &str,
-    ) -> interpret::InterpResult<'tcx> {
-        unimplemented!()
-    }
-
-    fn call_intrinsic(
-        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _instance: ty::Instance<'tcx>,
-        _args: &[rustc_const_eval::interpret::OpTy<'tcx, Self::Provenance>],
-        _destination: &rustc_const_eval::interpret::PlaceTy<'tcx, Self::Provenance>,
-        _target: Option<BasicBlock>,
-        _unwind: UnwindAction,
-    ) -> interpret::InterpResult<'tcx> {
-        unimplemented!()
-    }
-
-    fn assert_panic(
-        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _msg: &rustc_middle::mir::AssertMessage<'tcx>,
-        _unwind: UnwindAction,
-    ) -> interpret::InterpResult<'tcx> {
-        unimplemented!()
-    }
-
-    fn binary_ptr_op(
-        _ecx: &InterpCx<'mir, 'tcx, Self>,
-        _bin_op: BinOp,
-        _left: &rustc_const_eval::interpret::ImmTy<'tcx, Self::Provenance>,
-        _right: &rustc_const_eval::interpret::ImmTy<'tcx, Self::Provenance>,
-    ) -> interpret::InterpResult<'tcx, (ImmTy<'tcx, Self::Provenance>, bool)> {
-        throw_machine_stop_str!("can't do pointer arithmetic");
-    }
-
-    fn expose_ptr(
-        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _ptr: interpret::Pointer<Self::Provenance>,
-    ) -> interpret::InterpResult<'tcx> {
-        unimplemented!()
-    }
-
-    fn init_frame_extra(
-        _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _frame: rustc_const_eval::interpret::Frame<'mir, 'tcx, Self::Provenance>,
-    ) -> interpret::InterpResult<
-        'tcx,
-        rustc_const_eval::interpret::Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
-    > {
-        unimplemented!()
-    }
-
-    fn stack<'a>(
-        _ecx: &'a InterpCx<'mir, 'tcx, Self>,
-    ) -> &'a [rustc_const_eval::interpret::Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>]
-    {
-        // Return an empty stack instead of panicking, as `cur_span` uses it to evaluate constants.
-        &[]
-    }
-
-    fn stack_mut<'a>(
-        _ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
-    ) -> &'a mut Vec<
-        rustc_const_eval::interpret::Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
-    > {
-        unimplemented!()
     }
 }

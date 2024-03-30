@@ -86,7 +86,8 @@ rustc_index::newtype_index! {
     pub struct CoroutineSavedLocal {}
 }
 
-#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct CoroutineSavedTy<'tcx> {
     pub ty: Ty<'tcx>,
     /// Source info corresponding to the local in the original MIR body.
@@ -96,7 +97,8 @@ pub struct CoroutineSavedTy<'tcx> {
 }
 
 /// The layout of coroutine state.
-#[derive(Clone, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, PartialEq, Eq)]
+#[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct CoroutineLayout<'tcx> {
     /// The type of every local stored inside the coroutine.
     pub field_tys: IndexVec<CoroutineSavedLocal, CoroutineSavedTy<'tcx>>,
@@ -282,8 +284,15 @@ rustc_data_structures::static_assert_size!(ConstraintCategory<'_>, 16);
 /// order of the category, thereby influencing diagnostic output.
 ///
 /// See also `rustc_const_eval::borrow_check::constraints`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[derive(TyEncodable, TyDecodable, HashStable, TypeVisitable, TypeFoldable)]
+#[derive(derivative::Derivative)]
+#[derivative(
+    PartialOrd,
+    Ord,
+    PartialOrd = "feature_allow_slow_enum",
+    Ord = "feature_allow_slow_enum"
+)]
 pub enum ConstraintCategory<'tcx> {
     Return(ReturnConstraint),
     Yield,
@@ -293,6 +302,7 @@ pub enum ConstraintCategory<'tcx> {
     Cast {
         /// Whether this is an unsizing cast and if yes, this contains the target type.
         /// Region variables are erased to ReErased.
+        #[derivative(PartialOrd = "ignore", Ord = "ignore")]
         unsize_to: Option<Ty<'tcx>>,
     },
 
@@ -302,7 +312,7 @@ pub enum ConstraintCategory<'tcx> {
     ClosureBounds,
 
     /// Contains the function type if available.
-    CallArgument(Option<Ty<'tcx>>),
+    CallArgument(#[derivative(PartialOrd = "ignore", Ord = "ignore")] Option<Ty<'tcx>>),
     CopyBound,
     SizedBound,
     Assignment,

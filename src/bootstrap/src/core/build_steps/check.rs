@@ -4,14 +4,14 @@ use crate::core::build_steps::compile::{
     add_to_sysroot, run_cargo, rustc_cargo, rustc_cargo_env, std_cargo,
 };
 use crate::core::build_steps::tool::{prepare_tool_cargo, SourceType};
-use crate::core::builder::{crate_description, Alias, Builder, Kind, RunConfig, ShouldRun, Step};
+use crate::core::builder::{
+    self, crate_description, Alias, Builder, Kind, RunConfig, ShouldRun, Step,
+};
 use crate::core::config::TargetSelection;
-use crate::utils::cache::Interned;
-use crate::INTERNER;
 use crate::{Compiler, Mode, Subcommand};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Std {
     pub target: TargetSelection,
     /// Whether to build only a subset of crates.
@@ -19,7 +19,7 @@ pub struct Std {
     /// This shouldn't be used from other steps; see the comment on [`compile::Rustc`].
     ///
     /// [`compile::Rustc`]: crate::core::build_steps::compile::Rustc
-    crates: Interned<Vec<String>>,
+    crates: Vec<String>,
 }
 
 /// Returns args for the subcommand itself (not for cargo)
@@ -32,7 +32,7 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
         &builder.config.cmd
     {
         // disable the most spammy clippy lints
-        let ignored_lints = vec![
+        let ignored_lints = [
             "many_single_char_names", // there are a lot in stdarch
             "collapsible_if",
             "type_complexity",
@@ -61,19 +61,47 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
             }
         }
 
-        args.extend(strings(&["--", "--cap-lints", "warn"]));
+        args.extend(strings(&["--"]));
+
+        if deny.is_empty() && forbid.is_empty() {
+            args.extend(strings(&["--cap-lints", "warn"]));
+        }
+
+        let all_args = std::env::args().collect::<Vec<_>>();
+        args.extend(get_clippy_rules_in_order(&all_args, allow, deny, warn, forbid));
+
         args.extend(ignored_lints.iter().map(|lint| format!("-Aclippy::{}", lint)));
-        let mut clippy_lint_levels: Vec<String> = Vec::new();
-        allow.iter().for_each(|v| clippy_lint_levels.push(format!("-A{}", v)));
-        deny.iter().for_each(|v| clippy_lint_levels.push(format!("-D{}", v)));
-        warn.iter().for_each(|v| clippy_lint_levels.push(format!("-W{}", v)));
-        forbid.iter().for_each(|v| clippy_lint_levels.push(format!("-F{}", v)));
-        args.extend(clippy_lint_levels);
         args.extend(builder.config.free_args.clone());
         args
     } else {
         builder.config.free_args.clone()
     }
+}
+
+/// We need to keep the order of the given clippy lint rules before passing them.
+/// Since clap doesn't offer any useful interface for this purpose out of the box,
+/// we have to handle it manually.
+pub(crate) fn get_clippy_rules_in_order(
+    all_args: &[String],
+    allow_rules: &[String],
+    deny_rules: &[String],
+    warn_rules: &[String],
+    forbid_rules: &[String],
+) -> Vec<String> {
+    let mut result = vec![];
+
+    for (prefix, item) in
+        [("-A", allow_rules), ("-D", deny_rules), ("-W", warn_rules), ("-F", forbid_rules)]
+    {
+        item.iter().for_each(|v| {
+            let rule = format!("{prefix}{v}");
+            let position = all_args.iter().position(|t| t == &rule).unwrap();
+            result.push((position, rule));
+        });
+    }
+
+    result.sort_by_key(|&(position, _)| position);
+    result.into_iter().map(|v| v.1).collect()
 }
 
 fn cargo_subcommand(kind: Kind) -> &'static str {
@@ -87,7 +115,7 @@ fn cargo_subcommand(kind: Kind) -> &'static str {
 
 impl Std {
     pub fn new(target: TargetSelection) -> Self {
-        Self { target, crates: INTERNER.intern_list(vec![]) }
+        Self { target, crates: vec![] }
     }
 }
 
@@ -110,13 +138,15 @@ impl Step for Std {
         let target = self.target;
         let compiler = builder.compiler(builder.top_stage, builder.config.build);
 
-        let mut cargo = builder.cargo(
+        let mut cargo = builder::Cargo::new(
+            builder,
             compiler,
             Mode::Std,
             SourceType::InTree,
             target,
             cargo_subcommand(builder.kind),
         );
+
         std_cargo(builder, target, compiler.stage, &mut cargo);
         if matches!(builder.config.cmd, Subcommand::Fix { .. }) {
             // By default, cargo tries to fix all targets. Tell it not to fix tests until we've added `test` to the sysroot.
@@ -146,7 +176,7 @@ impl Step for Std {
         if compiler.stage == 0 {
             let libdir = builder.sysroot_libdir(compiler, target);
             let hostdir = builder.sysroot_libdir(compiler, compiler.host);
-            add_to_sysroot(&builder, &libdir, &hostdir, &libstd_stamp(builder, compiler, target));
+            add_to_sysroot(builder, &libdir, &hostdir, &libstd_stamp(builder, compiler, target));
         }
         drop(_guard);
 
@@ -162,7 +192,8 @@ impl Step for Std {
         // since we initialize with an empty sysroot.
         //
         // Currently only the "libtest" tree of crates does this.
-        let mut cargo = builder.cargo(
+        let mut cargo = builder::Cargo::new(
+            builder,
             compiler,
             Mode::Std,
             SourceType::InTree,
@@ -199,7 +230,7 @@ impl Step for Std {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rustc {
     pub target: TargetSelection,
     /// Whether to build only a subset of crates.
@@ -207,7 +238,7 @@ pub struct Rustc {
     /// This shouldn't be used from other steps; see the comment on [`compile::Rustc`].
     ///
     /// [`compile::Rustc`]: crate::core::build_steps::compile::Rustc
-    crates: Interned<Vec<String>>,
+    crates: Vec<String>,
 }
 
 impl Rustc {
@@ -217,7 +248,7 @@ impl Rustc {
             .into_iter()
             .map(|krate| krate.name.to_string())
             .collect();
-        Self { target, crates: INTERNER.intern_list(crates) }
+        Self { target, crates }
     }
 }
 
@@ -256,13 +287,15 @@ impl Step for Rustc {
             builder.ensure(Std::new(target));
         }
 
-        let mut cargo = builder.cargo(
+        let mut cargo = builder::Cargo::new(
+            builder,
             compiler,
             Mode::Rustc,
             SourceType::InTree,
             target,
             cargo_subcommand(builder.kind),
         );
+
         rustc_cargo(builder, &mut cargo, target, compiler.stage);
 
         // For ./x.py clippy, don't run with --all-targets because
@@ -294,14 +327,14 @@ impl Step for Rustc {
 
         let libdir = builder.sysroot_libdir(compiler, target);
         let hostdir = builder.sysroot_libdir(compiler, compiler.host);
-        add_to_sysroot(&builder, &libdir, &hostdir, &librustc_stamp(builder, compiler, target));
+        add_to_sysroot(builder, &libdir, &hostdir, &librustc_stamp(builder, compiler, target));
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CodegenBackend {
     pub target: TargetSelection,
-    pub backend: Interned<String>,
+    pub backend: &'static str,
 }
 
 impl Step for CodegenBackend {
@@ -314,14 +347,14 @@ impl Step for CodegenBackend {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        for &backend in &[INTERNER.intern_str("cranelift"), INTERNER.intern_str("gcc")] {
+        for &backend in &["cranelift", "gcc"] {
             run.builder.ensure(CodegenBackend { target: run.target, backend });
         }
     }
 
     fn run(self, builder: &Builder<'_>) {
         // FIXME: remove once https://github.com/rust-lang/rust/issues/112393 is resolved
-        if builder.build.config.vendor && &self.backend == "gcc" {
+        if builder.build.config.vendor && self.backend == "gcc" {
             println!("Skipping checking of `rustc_codegen_gcc` with vendoring enabled.");
             return;
         }
@@ -332,19 +365,21 @@ impl Step for CodegenBackend {
 
         builder.ensure(Rustc::new(target, builder));
 
-        let mut cargo = builder.cargo(
+        let mut cargo = builder::Cargo::new(
+            builder,
             compiler,
             Mode::Codegen,
             SourceType::InTree,
             target,
             cargo_subcommand(builder.kind),
         );
+
         cargo
             .arg("--manifest-path")
             .arg(builder.src.join(format!("compiler/rustc_codegen_{backend}/Cargo.toml")));
         rustc_cargo_env(builder, &mut cargo, target, compiler.stage);
 
-        let _guard = builder.msg_check(&backend, target);
+        let _guard = builder.msg_check(backend, target);
 
         run_cargo(
             builder,
@@ -358,7 +393,7 @@ impl Step for CodegenBackend {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RustAnalyzer {
     pub target: TargetSelection,
 }
@@ -432,7 +467,7 @@ impl Step for RustAnalyzer {
 
 macro_rules! tool_check_step {
     ($name:ident, $path:literal, $($alias:literal, )* $source_type:path $(, $default:literal )?) => {
-        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub struct $name {
             pub target: TargetSelection,
         }
@@ -543,7 +578,7 @@ fn codegen_backend_stamp(
     builder: &Builder<'_>,
     compiler: Compiler,
     target: TargetSelection,
-    backend: Interned<String>,
+    backend: &str,
 ) -> PathBuf {
     builder
         .cargo_out(compiler, Mode::Codegen, target)

@@ -2,6 +2,8 @@
 //! injecting code into the crate before it is lowered to HIR.
 
 #![allow(internal_features)]
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![feature(rustdoc_internals)]
 #![doc(rust_logo)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
@@ -13,6 +15,7 @@
 #![feature(lint_reasons)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
+#![feature(try_blocks)]
 
 extern crate proc_macro;
 
@@ -46,7 +49,6 @@ mod log_syntax;
 mod source_util;
 mod test;
 mod trace_macros;
-mod type_ascribe;
 mod util;
 
 pub mod asm;
@@ -96,7 +98,6 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         std_panic: edition_panic::expand_panic,
         stringify: source_util::expand_stringify,
         trace_macros: trace_macros::expand_trace_macros,
-        type_ascribe: type_ascribe::expand_type_ascribe,
         unreachable: edition_panic::expand_unreachable,
         // tidy-alphabetical-end
     }

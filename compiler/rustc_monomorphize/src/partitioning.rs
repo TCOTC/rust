@@ -117,7 +117,7 @@ use rustc_session::CodegenUnits;
 use rustc_span::symbol::Symbol;
 
 use crate::collector::UsageMap;
-use crate::collector::{self, MonoItemCollectionMode};
+use crate::collector::{self, MonoItemCollectionStrategy};
 use crate::errors::{CouldntDumpMonoStats, SymbolAlreadyDefined, UnknownCguCollectionMode};
 
 struct PartitioningCx<'a, 'tcx> {
@@ -175,9 +175,7 @@ where
     }
 
     // Mark one CGU for dead code, if necessary.
-    let instrument_dead_code =
-        tcx.sess.instrument_coverage() && !tcx.sess.instrument_coverage_except_unused_functions();
-    if instrument_dead_code {
+    if tcx.sess.instrument_coverage() {
         mark_code_coverage_dead_code_cgu(&mut codegen_units);
     }
 
@@ -368,7 +366,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `cgu_src` to `cgu_dst`. Some of them may be
         // duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        cgu_dst.items_mut().extend(cgu_src.items_mut().drain());
+        cgu_dst.items_mut().extend(cgu_src.items_mut().drain(..));
         cgu_dst.compute_size_estimate();
 
         // Record that `cgu_dst` now contains all the stuff that was in
@@ -407,7 +405,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `smallest` to `second_smallest`. Some of them
         // may be duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        second_smallest.items_mut().extend(smallest.items_mut().drain());
+        second_smallest.items_mut().extend(smallest.items_mut().drain(..));
         second_smallest.compute_size_estimate();
 
         // Don't update `cgu_contents`, that's only for incremental builds.
@@ -1089,31 +1087,34 @@ where
 }
 
 fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[CodegenUnit<'_>]) {
-    let collection_mode = match tcx.sess.opts.unstable_opts.print_mono_items {
+    let collection_strategy = match tcx.sess.opts.unstable_opts.print_mono_items {
         Some(ref s) => {
             let mode = s.to_lowercase();
             let mode = mode.trim();
             if mode == "eager" {
-                MonoItemCollectionMode::Eager
+                MonoItemCollectionStrategy::Eager
             } else {
                 if mode != "lazy" {
                     tcx.dcx().emit_warn(UnknownCguCollectionMode { mode });
                 }
 
-                MonoItemCollectionMode::Lazy
+                MonoItemCollectionStrategy::Lazy
             }
         }
         None => {
             if tcx.sess.link_dead_code() {
-                MonoItemCollectionMode::Eager
+                MonoItemCollectionStrategy::Eager
             } else {
-                MonoItemCollectionMode::Lazy
+                MonoItemCollectionStrategy::Lazy
             }
         }
     };
 
-    let (items, usage_map) = collector::collect_crate_mono_items(tcx, collection_mode);
+    let (items, usage_map) = collector::collect_crate_mono_items(tcx, collection_strategy);
 
+    // If there was an error during collection (e.g. from one of the constants we evaluated),
+    // then we stop here. This way codegen does not have to worry about failing constants.
+    // (codegen relies on this and ICEs will happen if this is violated.)
     tcx.dcx().abort_if_errors();
 
     let (codegen_units, _) = tcx.sess.time("partition_and_assert_distinct_symbols", || {

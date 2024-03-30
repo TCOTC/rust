@@ -553,7 +553,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::iter::{self, FromIterator, FusedIterator, TrustedLen};
+use crate::iter::{self, FusedIterator, TrustedLen};
 use crate::panicking::{panic, panic_str};
 use crate::pin::Pin;
 use crate::{
@@ -563,10 +563,11 @@ use crate::{
 };
 
 /// The `Option` type. See [the module level documentation](self) for more.
-#[derive(Copy, PartialOrd, Eq, Ord, Debug, Hash)]
+#[derive(Copy, Eq, Debug, Hash)]
 #[rustc_diagnostic_item = "Option"]
 #[lang = "Option"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(clippy::derived_hash_with_manual_eq)] // PartialEq is manually implemented equivalently
 pub enum Option<T> {
     /// No value.
     #[lang = "None"]
@@ -1033,7 +1034,6 @@ impl<T> Option<T> {
     #[stable(feature = "option_result_unwrap_unchecked", since = "1.58.0")]
     #[rustc_const_unstable(feature = "const_option_ext", issue = "91930")]
     pub const unsafe fn unwrap_unchecked(self) -> T {
-        debug_assert!(self.is_some());
         match self {
             Some(val) => val,
             // SAFETY: the safety contract must be upheld by the caller.
@@ -1074,18 +1074,23 @@ impl<T> Option<T> {
         }
     }
 
-    /// Calls the provided closure with a reference to the contained value (if [`Some`]).
+    /// Calls a function with a reference to the contained value if [`Some`].
+    ///
+    /// Returns the original option.
     ///
     /// # Examples
     ///
     /// ```
-    /// let v = vec![1, 2, 3, 4, 5];
+    /// let list = vec![1, 2, 3];
     ///
-    /// // prints "got: 4"
-    /// let x: Option<&usize> = v.get(3).inspect(|x| println!("got: {x}"));
+    /// // prints "got: 2"
+    /// let x = list
+    ///     .get(1)
+    ///     .inspect(|x| println!("got: {x}"))
+    ///     .expect("list should be long enough");
     ///
     /// // prints nothing
-    /// let x: Option<&usize> = v.get(5).inspect(|x| println!("got: {x}"));
+    /// list.get(5).inspect(|x| println!("got: {x}"));
     /// ```
     #[inline]
     #[stable(feature = "result_option_inspect", since = "1.76.0")]
@@ -1398,6 +1403,7 @@ impl<T> Option<T> {
     #[doc(alias = "flatmap")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("flat_map", "flatmap")]
     pub fn and_then<U, F>(self, f: F) -> Option<U>
     where
         F: FnOnce(T) -> Option<U>,
@@ -2139,84 +2145,52 @@ impl<'a, T> From<&'a mut Option<T>> for Option<&'a mut T> {
     }
 }
 
+// Ideally, LLVM should be able to optimize our derive code to this.
+// Once https://github.com/llvm/llvm-project/issues/52622 is fixed, we can
+// go back to deriving `PartialEq`.
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> crate::marker::StructuralPartialEq for Option<T> {}
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: PartialEq> PartialEq for Option<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        SpecOptionPartialEq::eq(self, other)
-    }
-}
-
-/// This specialization trait is a workaround for LLVM not currently (2023-01)
-/// being able to optimize this itself, even though Alive confirms that it would
-/// be legal to do so: <https://github.com/llvm/llvm-project/issues/52622>
-///
-/// Once that's fixed, `Option` should go back to deriving `PartialEq`, as
-/// it used to do before <https://github.com/rust-lang/rust/pull/103556>.
-/// The comment regarding this trait on the `newtype_index` macro should be removed if this is done.
-#[unstable(feature = "spec_option_partial_eq", issue = "none", reason = "exposed only for rustc")]
-#[doc(hidden)]
-pub trait SpecOptionPartialEq: Sized {
-    fn eq(l: &Option<Self>, other: &Option<Self>) -> bool;
-}
-
-#[unstable(feature = "spec_option_partial_eq", issue = "none", reason = "exposed only for rustc")]
-impl<T: PartialEq> SpecOptionPartialEq for T {
-    #[inline]
-    default fn eq(l: &Option<T>, r: &Option<T>) -> bool {
-        match (l, r) {
+        // Spelling out the cases explicitly optimizes better than
+        // `_ => false`
+        match (self, other) {
             (Some(l), Some(r)) => *l == *r,
+            (Some(_), None) => false,
+            (None, Some(_)) => false,
             (None, None) => true,
-            _ => false,
         }
     }
 }
 
-macro_rules! non_zero_option {
-    ( $( #[$stability: meta] $NZ:ty; )+ ) => {
-        $(
-            #[$stability]
-            impl SpecOptionPartialEq for $NZ {
-                #[inline]
-                fn eq(l: &Option<Self>, r: &Option<Self>) -> bool {
-                    l.map(Self::get).unwrap_or(0) == r.map(Self::get).unwrap_or(0)
-                }
-            }
-        )+
-    };
-}
-
-non_zero_option! {
-    #[stable(feature = "nonzero", since = "1.28.0")] crate::num::NonZeroU8;
-    #[stable(feature = "nonzero", since = "1.28.0")] crate::num::NonZeroU16;
-    #[stable(feature = "nonzero", since = "1.28.0")] crate::num::NonZeroU32;
-    #[stable(feature = "nonzero", since = "1.28.0")] crate::num::NonZeroU64;
-    #[stable(feature = "nonzero", since = "1.28.0")] crate::num::NonZeroU128;
-    #[stable(feature = "nonzero", since = "1.28.0")] crate::num::NonZeroUsize;
-    #[stable(feature = "signed_nonzero", since = "1.34.0")] crate::num::NonZeroI8;
-    #[stable(feature = "signed_nonzero", since = "1.34.0")] crate::num::NonZeroI16;
-    #[stable(feature = "signed_nonzero", since = "1.34.0")] crate::num::NonZeroI32;
-    #[stable(feature = "signed_nonzero", since = "1.34.0")] crate::num::NonZeroI64;
-    #[stable(feature = "signed_nonzero", since = "1.34.0")] crate::num::NonZeroI128;
-    #[stable(feature = "signed_nonzero", since = "1.34.0")] crate::num::NonZeroIsize;
-}
-
-#[stable(feature = "nonnull", since = "1.25.0")]
-impl<T> SpecOptionPartialEq for crate::ptr::NonNull<T> {
+// Manually implementing here somewhat improves codegen for
+// https://github.com/rust-lang/rust/issues/49892, although still
+// not optimal.
+#[stable(feature = "rust1", since = "1.0.0")]
+impl<T: PartialOrd> PartialOrd for Option<T> {
     #[inline]
-    fn eq(l: &Option<Self>, r: &Option<Self>) -> bool {
-        l.map(Self::as_ptr).unwrap_or_else(|| crate::ptr::null_mut())
-            == r.map(Self::as_ptr).unwrap_or_else(|| crate::ptr::null_mut())
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        match (self, other) {
+            (Some(l), Some(r)) => l.partial_cmp(r),
+            (Some(_), None) => Some(cmp::Ordering::Greater),
+            (None, Some(_)) => Some(cmp::Ordering::Less),
+            (None, None) => Some(cmp::Ordering::Equal),
+        }
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl SpecOptionPartialEq for cmp::Ordering {
+impl<T: Ord> Ord for Option<T> {
     #[inline]
-    fn eq(l: &Option<Self>, r: &Option<Self>) -> bool {
-        l.map_or(2, |x| x as i8) == r.map_or(2, |x| x as i8)
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        match (self, other) {
+            (Some(l), Some(r)) => l.cmp(r),
+            (Some(_), None) => cmp::Ordering::Greater,
+            (None, Some(_)) => cmp::Ordering::Less,
+            (None, None) => cmp::Ordering::Equal,
+        }
     }
 }
 

@@ -7,16 +7,16 @@ use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
 
 /// An unevaluated (potentially generic) constant used in the type-system.
-#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Eq, PartialEq, TyEncodable, TyDecodable)]
 #[derive(Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct UnevaluatedConst<'tcx> {
     pub def: DefId,
     pub args: GenericArgsRef<'tcx>,
 }
 
-impl rustc_errors::IntoDiagnosticArg for UnevaluatedConst<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
-        format!("{self:?}").into_diagnostic_arg()
+impl rustc_errors::IntoDiagArg for UnevaluatedConst<'_> {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        format!("{self:?}").into_diag_arg()
     }
 }
 
@@ -62,7 +62,7 @@ impl<'tcx> UnevaluatedConst<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
 #[derive(HashStable, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable)]
 pub enum Expr<'tcx> {
     Binop(mir::BinOp, Const<'tcx>, Const<'tcx>),

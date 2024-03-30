@@ -1,12 +1,13 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
 use rustc_hir::def_id::DefId;
-use rustc_session::RemapFileNameExt;
-use rustc_span::Span;
+use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
+use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::{HasDataLayout, Size};
 
 use crate::mir::interpret::{alloc_range, AllocId, ConstAllocation, ErrorHandled, Scalar};
 use crate::mir::{pretty_print_const_value, Promoted};
+use crate::ty::print::with_no_trimmed_paths;
 use crate::ty::GenericArgsRef;
 use crate::ty::ScalarInt;
 use crate::ty::{self, print::pretty_print_const, Ty, TyCtxt};
@@ -272,7 +273,7 @@ impl<'tcx> Const<'tcx> {
         self,
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        span: Option<Span>,
+        span: Span,
     ) -> Result<ConstValue<'tcx>, ErrorHandled> {
         match self {
             Const::Ty(c) => {
@@ -292,7 +293,7 @@ impl<'tcx> Const<'tcx> {
     /// Normalizes the constant to a value or an error if possible.
     #[inline]
     pub fn normalize(self, tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Self {
-        match self.eval(tcx, param_env, None) {
+        match self.eval(tcx, param_env, DUMMY_SP) {
             Ok(val) => Self::Val(val, self.ty()),
             Err(ErrorHandled::Reported(guar, _span)) => {
                 Self::Ty(ty::Const::new_error(tcx, guar.into(), self.ty()))
@@ -312,10 +313,10 @@ impl<'tcx> Const<'tcx> {
                 // Avoid the `valtree_to_const_val` query. Can only be done on primitive types that
                 // are valtree leaves, and *not* on references. (References should return the
                 // pointer here, which valtrees don't represent.)
-                let val = c.eval(tcx, param_env, None).ok()?;
+                let val = c.eval(tcx, param_env, DUMMY_SP).ok()?;
                 Some(val.unwrap_leaf().into())
             }
-            _ => self.eval(tcx, param_env, None).ok()?.try_to_scalar(),
+            _ => self.eval(tcx, param_env, DUMMY_SP).ok()?.try_to_scalar(),
         }
     }
 
@@ -455,7 +456,7 @@ impl<'tcx> Const<'tcx> {
 }
 
 /// An unevaluated (potentially generic) constant used in MIR.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable)]
 #[derive(Hash, HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct UnevaluatedConst<'tcx> {
     pub def: DefId,
@@ -489,9 +490,18 @@ impl<'tcx> Display for Const<'tcx> {
             Const::Ty(c) => pretty_print_const(c, fmt, true),
             Const::Val(val, ty) => pretty_print_const_value(val, ty, fmt),
             // FIXME(valtrees): Correctly print mir constants.
-            Const::Unevaluated(..) => {
-                fmt.write_str("_")?;
-                Ok(())
+            Const::Unevaluated(c, _ty) => {
+                ty::tls::with(move |tcx| {
+                    let c = tcx.lift(c).unwrap();
+                    // Matches `GlobalId` printing.
+                    let instance =
+                        with_no_trimmed_paths!(tcx.def_path_str_with_args(c.def, c.args));
+                    write!(fmt, "{instance}")?;
+                    if let Some(promoted) = c.promoted {
+                        write!(fmt, "::{promoted:?}")?;
+                    }
+                    Ok(())
+                })
             }
         }
     }
@@ -506,7 +516,11 @@ impl<'tcx> TyCtxt<'tcx> {
         let caller = self.sess.source_map().lookup_char_pos(topmost.lo());
         self.const_caller_location(
             rustc_span::symbol::Symbol::intern(
-                &caller.file.name.for_codegen(self.sess).to_string_lossy(),
+                &caller
+                    .file
+                    .name
+                    .for_scope(self.sess, RemapPathScopeComponents::MACRO)
+                    .to_string_lossy(),
             ),
             caller.line as u32,
             caller.col_display as u32 + 1,

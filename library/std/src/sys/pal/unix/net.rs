@@ -272,7 +272,7 @@ impl Socket {
             )
         })?;
         unsafe {
-            buf.advance(ret as usize);
+            buf.advance_unchecked(ret as usize);
         }
         Ok(())
     }
@@ -316,7 +316,7 @@ impl Socket {
                 buf.as_mut_ptr() as *mut c_void,
                 buf.len(),
                 flags,
-                &mut storage as *mut _ as *mut _,
+                core::ptr::addr_of_mut!(storage) as *mut _,
                 &mut addrlen,
             )
         })?;
@@ -441,6 +441,49 @@ impl Socket {
         Ok(raw != 0)
     }
 
+    // bionic libc makes no use of this flag
+    #[cfg(target_os = "linux")]
+    pub fn set_deferaccept(&self, accept: u32) -> io::Result<()> {
+        setsockopt(self, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, accept as c_int)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn deferaccept(&self) -> io::Result<u32> {
+        let raw: c_int = getsockopt(self, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT)?;
+        Ok(raw as u32)
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    pub fn set_acceptfilter(&self, name: &CStr) -> io::Result<()> {
+        if !name.to_bytes().is_empty() {
+            const AF_NAME_MAX: usize = 16;
+            let mut buf = [0; AF_NAME_MAX];
+            for (src, dst) in name.to_bytes().iter().zip(&mut buf[..AF_NAME_MAX - 1]) {
+                *dst = *src as libc::c_char;
+            }
+            let mut arg: libc::accept_filter_arg = unsafe { mem::zeroed() };
+            arg.af_name = buf;
+            setsockopt(self, libc::SOL_SOCKET, libc::SO_ACCEPTFILTER, &mut arg)
+        } else {
+            setsockopt(
+                self,
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTFILTER,
+                core::ptr::null_mut() as *mut c_void,
+            )
+        }
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    pub fn acceptfilter(&self) -> io::Result<&CStr> {
+        let arg: libc::accept_filter_arg =
+            getsockopt(self, libc::SOL_SOCKET, libc::SO_ACCEPTFILTER)?;
+        let s: &[u8] =
+            unsafe { core::slice::from_raw_parts(arg.af_name.as_ptr() as *const u8, 16) };
+        let name = CStr::from_bytes_with_nul(s).unwrap();
+        Ok(name)
+    }
+
     #[cfg(any(target_os = "android", target_os = "linux",))]
     pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
         setsockopt(self, libc::SOL_SOCKET, libc::SO_PASSCRED, passcred as libc::c_int)
@@ -453,25 +496,31 @@ impl Socket {
     }
 
     #[cfg(target_os = "netbsd")]
-    pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
-        setsockopt(self, 0 as libc::c_int, libc::LOCAL_CREDS, passcred as libc::c_int)
+    pub fn set_local_creds(&self, local_creds: bool) -> io::Result<()> {
+        setsockopt(self, 0 as libc::c_int, libc::LOCAL_CREDS, local_creds as libc::c_int)
     }
 
     #[cfg(target_os = "netbsd")]
-    pub fn passcred(&self) -> io::Result<bool> {
-        let passcred: libc::c_int = getsockopt(self, 0 as libc::c_int, libc::LOCAL_CREDS)?;
-        Ok(passcred != 0)
+    pub fn local_creds(&self) -> io::Result<bool> {
+        let local_creds: libc::c_int = getsockopt(self, 0 as libc::c_int, libc::LOCAL_CREDS)?;
+        Ok(local_creds != 0)
     }
 
     #[cfg(target_os = "freebsd")]
-    pub fn set_passcred(&self, passcred: bool) -> io::Result<()> {
-        setsockopt(self, libc::AF_LOCAL, libc::LOCAL_CREDS_PERSISTENT, passcred as libc::c_int)
+    pub fn set_local_creds_persistent(&self, local_creds_persistent: bool) -> io::Result<()> {
+        setsockopt(
+            self,
+            libc::AF_LOCAL,
+            libc::LOCAL_CREDS_PERSISTENT,
+            local_creds_persistent as libc::c_int,
+        )
     }
 
     #[cfg(target_os = "freebsd")]
-    pub fn passcred(&self) -> io::Result<bool> {
-        let passcred: libc::c_int = getsockopt(self, libc::AF_LOCAL, libc::LOCAL_CREDS_PERSISTENT)?;
-        Ok(passcred != 0)
+    pub fn local_creds_persistent(&self) -> io::Result<bool> {
+        let local_creds_persistent: libc::c_int =
+            getsockopt(self, libc::AF_LOCAL, libc::LOCAL_CREDS_PERSISTENT)?;
+        Ok(local_creds_persistent != 0)
     }
 
     #[cfg(not(any(target_os = "solaris", target_os = "illumos", target_os = "vita")))]

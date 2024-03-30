@@ -217,7 +217,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 bug!();
             };
             for stmt in block.stmts {
-                let hir::StmtKind::Local(hir::Local {
+                let hir::StmtKind::Let(hir::LetStmt {
                     init: Some(init),
                     source: hir::LocalSource::AsyncFn,
                     pat,
@@ -410,7 +410,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.demand_eqtype(
                 span,
                 coroutine_args.as_coroutine().kind_ty(),
-                Ty::from_closure_kind(self.tcx, closure_kind),
+                Ty::from_coroutine_closure_kind(self.tcx, closure_kind),
             );
         }
 
@@ -1711,15 +1711,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let bm = *typeck_results.pat_binding_modes().get(var_hir_id).expect("missing binding mode");
 
-        let mut is_mutbl = match bm {
-            ty::BindByValue(mutability) => mutability,
-            ty::BindByReference(_) => hir::Mutability::Not,
-        };
+        let mut is_mutbl = bm.1;
 
         for pointer_ty in place.deref_tys() {
             match pointer_ty.kind() {
                 // We don't capture derefs of raw ptrs
-                ty::RawPtr(_) => unreachable!(),
+                ty::RawPtr(_, _) => unreachable!(),
 
                 // Dereferencing a mut-ref allows us to mut the Place if we don't deref
                 // an immut-ref after on top of this.
@@ -1780,11 +1777,9 @@ fn apply_capture_kind_on_capture_ty<'tcx>(
 ) -> Ty<'tcx> {
     match capture_kind {
         ty::UpvarCapture::ByValue => ty,
-        ty::UpvarCapture::ByRef(kind) => Ty::new_ref(
-            tcx,
-            region.unwrap(),
-            ty::TypeAndMut { ty: ty, mutbl: kind.to_mutbl_lossy() },
-        ),
+        ty::UpvarCapture::ByRef(kind) => {
+            Ty::new_ref(tcx, region.unwrap(), ty, kind.to_mutbl_lossy())
+        }
     }
 }
 

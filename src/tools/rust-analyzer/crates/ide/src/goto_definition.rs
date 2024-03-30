@@ -1,10 +1,10 @@
-use std::mem::discriminant;
+use std::{iter, mem::discriminant};
 
 use crate::{
     doc_links::token_as_doc_comment, navigation_target::ToNav, FilePosition, NavigationTarget,
     RangeInfo, TryToNav,
 };
-use hir::{AsAssocItem, AssocItem, DescendPreference, ModuleDef, Semantics};
+use hir::{AsAssocItem, AssocItem, DescendPreference, MacroFileIdExt, ModuleDef, Semantics};
 use ide_db::{
     base_db::{AnchoredPath, FileId, FileLoader},
     defs::{Definition, IdentClass},
@@ -74,11 +74,13 @@ pub(crate) fn goto_definition(
         .filter_map(|token| {
             let parent = token.parent()?;
 
-            if let Some(tt) = ast::TokenTree::cast(parent.clone()) {
-                if let Some(x) = try_lookup_include_path(sema, tt, token.clone(), file_id) {
+            if let Some(token) = ast::String::cast(token.clone()) {
+                if let Some(x) = try_lookup_include_path(sema, token, file_id) {
                     return Some(vec![x]);
                 }
+            }
 
+            if ast::TokenTree::can_cast(parent.kind()) {
                 if let Some(x) = try_lookup_macro_def_in_macro_use(sema, token) {
                     return Some(vec![x]);
                 }
@@ -111,24 +113,17 @@ pub(crate) fn goto_definition(
 
 fn try_lookup_include_path(
     sema: &Semantics<'_, RootDatabase>,
-    tt: ast::TokenTree,
-    token: SyntaxToken,
+    token: ast::String,
     file_id: FileId,
 ) -> Option<NavigationTarget> {
-    let token = ast::String::cast(token)?;
-    let path = token.value()?.into_owned();
-    let macro_call = tt.syntax().parent().and_then(ast::MacroCall::cast)?;
-    let name = macro_call.path()?.segment()?.name_ref()?;
-    if !matches!(&*name.text(), "include" | "include_str" | "include_bytes") {
+    let file = sema.hir_file_for(&token.syntax().parent()?).macro_file()?;
+    if !iter::successors(Some(file), |file| file.parent(sema.db).macro_file())
+        // Check that we are in the eager argument expansion of an include macro
+        .any(|file| file.is_include_like_macro(sema.db) && file.eager_arg(sema.db).is_none())
+    {
         return None;
     }
-
-    // Ignore non-built-in macros to account for shadowing
-    if let Some(it) = sema.resolve_macro_call(&macro_call) {
-        if !matches!(it.kind(sema.db), hir::MacroKind::BuiltIn) {
-            return None;
-        }
-    }
+    let path = token.value()?;
 
     let file_id = sema.db.resolve_path(AnchoredPath { anchor: file_id, path: &path })?;
     let size = sema.db.file_text(file_id).len().try_into().ok()?;
@@ -182,11 +177,7 @@ fn try_filter_trait_item_definition(
     match assoc {
         AssocItem::Function(..) => None,
         AssocItem::Const(..) | AssocItem::TypeAlias(..) => {
-            let imp = match assoc.container(db) {
-                hir::AssocItemContainer::Impl(imp) => imp,
-                _ => return None,
-            };
-            let trait_ = imp.trait_(db)?;
+            let trait_ = assoc.implemented_trait(db)?;
             let name = def.name(db)?;
             let discri_value = discriminant(&assoc);
             trait_
@@ -534,6 +525,24 @@ macro_rules! foo {() => {0}}
 fn bar() {
     match 0 {
         $0foo!() => {}
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_definition_works_for_consts_inside_range_pattern() {
+        check(
+            r#"
+//- /lib.rs
+const A: u32 = 0;
+    //^
+
+fn bar(v: u32) {
+    match v {
+        0..=$0A => {}
+        _ => {}
     }
 }
 "#,
@@ -1518,6 +1527,26 @@ fn main() {
     }
 
     #[test]
+    fn goto_include_has_eager_input() {
+        check(
+            r#"
+//- /main.rs
+#[rustc_builtin_macro]
+macro_rules! include_str {}
+#[rustc_builtin_macro]
+macro_rules! concat {}
+
+fn main() {
+    let str = include_str!(concat!("foo", ".tx$0t"));
+}
+//- /foo.txt
+// empty
+//^file
+"#,
+        );
+    }
+
+    #[test]
     fn goto_doc_include_str() {
         check(
             r#"
@@ -1960,6 +1989,34 @@ fn f() {
     }
 
     #[test]
+    fn goto_index_mut_op() {
+        check(
+            r#"
+//- minicore: index
+
+struct Foo;
+struct Bar;
+
+impl core::ops::Index<usize> for Foo {
+    type Output = Bar;
+
+    fn index(&self, index: usize) -> &Self::Output {}
+}
+
+impl core::ops::IndexMut<usize> for Foo {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {}
+     //^^^^^^^^^
+}
+
+fn f() {
+    let mut foo = Foo;
+    foo[0]$0 = Bar;
+}
+"#,
+        );
+    }
+
+    #[test]
     fn goto_prefix_op() {
         check(
             r#"
@@ -1976,6 +2033,33 @@ impl core::ops::Deref for Struct {
 
 fn f() {
     $0*Struct;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_deref_mut() {
+        check(
+            r#"
+//- minicore: deref, deref_mut
+
+struct Foo;
+struct Bar;
+
+impl core::ops::Deref for Foo {
+    type Target = Bar;
+    fn deref(&self) -> &Self::Target {}
+}
+
+impl core::ops::DerefMut for Foo {
+    fn deref_mut(&mut self) -> &mut Self::Target {}
+     //^^^^^^^^^
+}
+
+fn f() {
+    let a = Foo;
+    $0*a = Bar;
 }
 "#,
         );

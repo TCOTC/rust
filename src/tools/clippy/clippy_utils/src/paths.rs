@@ -11,7 +11,7 @@ pub const APPLICABILITY_VALUES: [[&str; 3]; 4] = [
     ["rustc_lint_defs", "Applicability", "MaybeIncorrect"],
     ["rustc_lint_defs", "Applicability", "MachineApplicable"],
 ];
-pub const DIAGNOSTIC_BUILDER: [&str; 3] = ["rustc_errors", "diagnostic_builder", "DiagnosticBuilder"];
+pub const DIAG: [&str; 2] = ["rustc_errors", "Diag"];
 pub const BINARYHEAP_ITER: [&str; 5] = ["alloc", "collections", "binary_heap", "BinaryHeap", "iter"];
 pub const BTREEMAP_CONTAINS_KEY: [&str; 6] = ["alloc", "collections", "btree", "map", "BTreeMap", "contains_key"];
 pub const BTREEMAP_INSERT: [&str; 6] = ["alloc", "collections", "btree", "map", "BTreeMap", "insert"];
@@ -19,6 +19,8 @@ pub const BTREESET_ITER: [&str; 6] = ["alloc", "collections", "btree", "set", "B
 pub const CLONE_TRAIT_METHOD: [&str; 4] = ["core", "clone", "Clone", "clone"];
 pub const CORE_ITER_CLONED: [&str; 6] = ["core", "iter", "traits", "iterator", "Iterator", "cloned"];
 pub const CORE_ITER_COPIED: [&str; 6] = ["core", "iter", "traits", "iterator", "Iterator", "copied"];
+pub const CORE_ITER_ENUMERATE_METHOD: [&str; 6] = ["core", "iter", "traits", "iterator", "Iterator", "enumerate"];
+pub const CORE_ITER_ENUMERATE_STRUCT: [&str; 5] = ["core", "iter", "adapters", "enumerate", "Enumerate"];
 pub const CORE_ITER_FILTER: [&str; 6] = ["core", "iter", "traits", "iterator", "Iterator", "filter"];
 pub const CORE_RESULT_OK_METHOD: [&str; 4] = ["core", "result", "Result", "ok"];
 pub const CSTRING_AS_C_STR: [&str; 5] = ["alloc", "ffi", "c_str", "CString", "as_c_str"];
@@ -115,4 +117,3 @@ pub const OPTION_UNWRAP: [&str; 4] = ["core", "option", "Option", "unwrap"];
 pub const OPTION_EXPECT: [&str; 4] = ["core", "option", "Option", "expect"];
 #[expect(clippy::invalid_paths)] // not sure why it thinks this, it works so
 pub const BOOL_THEN: [&str; 4] = ["core", "bool", "<impl bool>", "then"];
-pub const ALLOCATOR_GLOBAL: [&str; 3] = ["alloc", "alloc", "Global"];

@@ -135,16 +135,18 @@ pub struct FulfillmentError<'tcx> {
 
 #[derive(Clone)]
 pub enum FulfillmentErrorCode<'tcx> {
-    /// Inherently impossible to fulfill; this trait is implemented if and only if it is already implemented.
+    /// Inherently impossible to fulfill; this trait is implemented if and only
+    /// if it is already implemented.
     Cycle(Vec<PredicateObligation<'tcx>>),
     SelectionError(SelectionError<'tcx>),
     ProjectionError(MismatchedProjectionTypes<'tcx>),
     SubtypeError(ExpectedFound<Ty<'tcx>>, TypeError<'tcx>), // always comes from a SubtypePredicate
     ConstEquateError(ExpectedFound<Const<'tcx>>, TypeError<'tcx>),
     Ambiguity {
-        /// Overflow reported from the new solver `-Znext-solver`, which will
-        /// be reported as an regular error as opposed to a fatal error.
-        overflow: bool,
+        /// Overflow is only `Some(suggest_recursion_limit)` when using the next generation
+        /// trait solver `-Znext-solver`. With the old solver overflow is eagerly handled by
+        /// emitting a fatal error instead.
+        overflow: Option<bool>,
     },
 }
 
@@ -207,7 +209,7 @@ impl<'tcx> FulfillmentError<'tcx> {
 }
 
 impl<'tcx> PolyTraitObligation<'tcx> {
-    pub fn polarity(&self) -> ty::ImplPolarity {
+    pub fn polarity(&self) -> ty::PredicatePolarity {
         self.predicate.skip_binder().polarity
     }
 

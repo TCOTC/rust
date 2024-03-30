@@ -10,10 +10,12 @@ use crate::{
     hygiene::span_with_def_site_ctxt,
     name::{AsName, Name},
     quote::dollar_crate,
-    span_map::SpanMapRef,
+    span_map::ExpansionSpanMap,
     tt,
 };
-use syntax::ast::{self, AstNode, FieldList, HasAttrs, HasGenericParams, HasName, HasTypeBounds};
+use syntax::ast::{
+    self, AstNode, FieldList, HasAttrs, HasGenericParams, HasModuleItem, HasName, HasTypeBounds,
+};
 
 use crate::{db::ExpandDatabase, name, quote, ExpandError, ExpandResult};
 
@@ -25,20 +27,10 @@ macro_rules! register_builtin {
         }
 
         impl BuiltinDeriveExpander {
-            pub fn expand(
-                &self,
-                db: &dyn ExpandDatabase,
-                id: MacroCallId,
-                tt: &ast::Adt,
-                token_map: SpanMapRef<'_>,
-            ) -> ExpandResult<tt::Subtree> {
-                let expander = match *self {
+            pub fn expander(&self) -> fn(Span, &tt::Subtree) -> ExpandResult<tt::Subtree>  {
+                match *self {
                     $( BuiltinDeriveExpander::$trait => $expand, )*
-                };
-
-                let span = db.lookup_intern_macro_call(id).call_site;
-                let span = span_with_def_site_ctxt(db, span, id);
-                expander(span, tt, token_map)
+                }
             }
 
             fn find_by_name(name: &name::Name) -> Option<Self> {
@@ -50,6 +42,19 @@ macro_rules! register_builtin {
         }
 
     };
+}
+
+impl BuiltinDeriveExpander {
+    pub fn expand(
+        &self,
+        db: &dyn ExpandDatabase,
+        id: MacroCallId,
+        tt: &tt::Subtree,
+        span: Span,
+    ) -> ExpandResult<tt::Subtree> {
+        let span = span_with_def_site_ctxt(db, span, id);
+        self.expander()(span, tt)
+    }
 }
 
 register_builtin! {
@@ -122,7 +127,7 @@ impl VariantShape {
         }
     }
 
-    fn from(tm: SpanMapRef<'_>, value: Option<FieldList>) -> Result<Self, ExpandError> {
+    fn from(tm: &ExpansionSpanMap, value: Option<FieldList>) -> Result<Self, ExpandError> {
         let r = match value {
             None => VariantShape::Unit,
             Some(FieldList::RecordFieldList(it)) => VariantShape::Struct(
@@ -194,18 +199,22 @@ struct BasicAdtInfo {
     /// second field is `Some(ty)` if it's a const param of type `ty`, `None` if it's a type param.
     /// third fields is where bounds, if any
     param_types: Vec<(tt::Subtree, Option<tt::Subtree>, Option<tt::Subtree>)>,
+    where_clause: Vec<tt::Subtree>,
     associated_types: Vec<tt::Subtree>,
 }
 
-fn parse_adt(
-    tm: SpanMapRef<'_>,
-    adt: &ast::Adt,
-    call_site: Span,
-) -> Result<BasicAdtInfo, ExpandError> {
-    let (name, generic_param_list, shape) = match adt {
+fn parse_adt(tt: &tt::Subtree, call_site: Span) -> Result<BasicAdtInfo, ExpandError> {
+    let (parsed, tm) = &mbe::token_tree_to_syntax_node(tt, mbe::TopEntryPoint::MacroItems);
+    let macro_items = ast::MacroItems::cast(parsed.syntax_node())
+        .ok_or_else(|| ExpandError::other("invalid item definition"))?;
+    let item = macro_items.items().next().ok_or_else(|| ExpandError::other("no item found"))?;
+    let adt = &ast::Adt::cast(item.syntax().clone())
+        .ok_or_else(|| ExpandError::other("expected struct, enum or union"))?;
+    let (name, generic_param_list, where_clause, shape) = match adt {
         ast::Adt::Struct(it) => (
             it.name(),
             it.generic_param_list(),
+            it.where_clause(),
             AdtShape::Struct(VariantShape::from(tm, it.field_list())?),
         ),
         ast::Adt::Enum(it) => {
@@ -217,6 +226,7 @@ fn parse_adt(
             (
                 it.name(),
                 it.generic_param_list(),
+                it.where_clause(),
                 AdtShape::Enum {
                     default_variant,
                     variants: it
@@ -233,7 +243,9 @@ fn parse_adt(
                 },
             )
         }
-        ast::Adt::Union(it) => (it.name(), it.generic_param_list(), AdtShape::Union),
+        ast::Adt::Union(it) => {
+            (it.name(), it.generic_param_list(), it.where_clause(), AdtShape::Union)
+        }
     };
 
     let mut param_type_set: FxHashSet<Name> = FxHashSet::default();
@@ -274,6 +286,14 @@ fn parse_adt(
         })
         .collect();
 
+    let where_clause = if let Some(w) = where_clause {
+        w.predicates()
+            .map(|it| mbe::syntax_node_to_token_tree(it.syntax(), tm, call_site))
+            .collect()
+    } else {
+        vec![]
+    };
+
     // For a generic parameter `T`, when shorthand associated type `T::Assoc` appears in field
     // types (of any variant for enums), we generate trait bound for it. It sounds reasonable to
     // also generate trait bound for qualified associated type `<T as Trait>::Assoc`, but rustc
@@ -301,18 +321,18 @@ fn parse_adt(
         .map(|it| mbe::syntax_node_to_token_tree(it.syntax(), tm, call_site))
         .collect();
     let name_token = name_to_token(tm, name)?;
-    Ok(BasicAdtInfo { name: name_token, shape, param_types, associated_types })
+    Ok(BasicAdtInfo { name: name_token, shape, param_types, where_clause, associated_types })
 }
 
 fn name_to_token(
-    token_map: SpanMapRef<'_>,
+    token_map: &ExpansionSpanMap,
     name: Option<ast::Name>,
 ) -> Result<tt::Ident, ExpandError> {
     let name = name.ok_or_else(|| {
         debug!("parsed item has no name");
         ExpandError::other("missing name")
     })?;
-    let span = token_map.span_for_range(name.syntax().text_range());
+    let span = token_map.span_at(name.syntax().text_range().start());
     let name_token = tt::Ident { span, text: name.text().into() };
     Ok(name_token)
 }
@@ -349,14 +369,12 @@ fn name_to_token(
 /// where B1, ..., BN are the bounds given by `bounds_paths`. Z is a phantom type, and
 /// therefore does not get bound by the derived trait.
 fn expand_simple_derive(
-    // FIXME: use
     invoc_span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
+    tt: &tt::Subtree,
     trait_path: tt::Subtree,
     make_trait_body: impl FnOnce(&BasicAdtInfo) -> tt::Subtree,
 ) -> ExpandResult<tt::Subtree> {
-    let info = match parse_adt(tm, tt, invoc_span) {
+    let info = match parse_adt(tt, invoc_span) {
         Ok(info) => info,
         Err(e) => {
             return ExpandResult::new(
@@ -366,7 +384,8 @@ fn expand_simple_derive(
         }
     };
     let trait_body = make_trait_body(&info);
-    let mut where_block = vec![];
+    let mut where_block: Vec<_> =
+        info.where_clause.into_iter().map(|w| quote! {invoc_span => #w , }).collect();
     let (params, args): (Vec<_>, Vec<_>) = info
         .param_types
         .into_iter()
@@ -398,14 +417,14 @@ fn expand_simple_derive(
     ExpandResult::ok(expanded)
 }
 
-fn copy_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn copy_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::marker::Copy }, |_| quote! {span =>})
+    expand_simple_derive(span, tt, quote! {span => #krate::marker::Copy }, |_| quote! {span =>})
 }
 
-fn clone_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn clone_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::clone::Clone }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::clone::Clone }, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
@@ -454,9 +473,9 @@ fn and_and(span: Span) -> tt::Subtree {
     quote! {span => #and& }
 }
 
-fn default_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn default_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::default::Default }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::default::Default }, |adt| {
         let body = match &adt.shape {
             AdtShape::Struct(fields) => {
                 let name = &adt.name;
@@ -493,9 +512,9 @@ fn default_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult
     })
 }
 
-fn debug_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn debug_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::fmt::Debug }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::fmt::Debug }, |adt| {
         let for_variant = |name: String, v: &VariantShape| match v {
             VariantShape::Struct(fields) => {
                 let for_fields = fields.iter().map(|it| {
@@ -565,9 +584,9 @@ fn debug_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<t
     })
 }
 
-fn hash_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn hash_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::hash::Hash }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::hash::Hash }, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             // FIXME: Return expand error here
             return quote! {span =>};
@@ -612,14 +631,14 @@ fn hash_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt
     })
 }
 
-fn eq_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn eq_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::Eq }, |_| quote! {span =>})
+    expand_simple_derive(span, tt, quote! {span => #krate::cmp::Eq }, |_| quote! {span =>})
 }
 
-fn partial_eq_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn partial_eq_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::PartialEq }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::cmp::PartialEq }, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             // FIXME: Return expand error here
             return quote! {span =>};
@@ -689,9 +708,9 @@ fn self_and_other_patterns(
     (self_patterns, other_patterns)
 }
 
-fn ord_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn ord_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::Ord }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::cmp::Ord }, |adt| {
         fn compare(
             krate: &tt::Ident,
             left: tt::Subtree,
@@ -747,9 +766,9 @@ fn ord_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt:
     })
 }
 
-fn partial_ord_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+fn partial_ord_expand(span: Span, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::PartialOrd }, |adt| {
+    expand_simple_derive(span, tt, quote! {span => #krate::cmp::PartialOrd }, |adt| {
         fn compare(
             krate: &tt::Ident,
             left: tt::Subtree,

@@ -10,9 +10,9 @@ mod regression;
 mod simple;
 mod traits;
 
-use std::{collections::HashMap, env};
+use std::env;
 
-use base_db::{FileRange, SourceDatabaseExt};
+use base_db::{FileRange, SourceDatabaseExt2 as _};
 use expect_test::Expect;
 use hir_def::{
     body::{Body, BodySourceMap, SyntheticSyntax},
@@ -25,6 +25,7 @@ use hir_def::{
 };
 use hir_expand::{db::ExpandDatabase, InFile};
 use once_cell::race::OnceBool;
+use rustc_hash::FxHashMap;
 use stdx::format_to;
 use syntax::{
     ast::{self, AstNode, HasName},
@@ -90,16 +91,16 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
     let (db, files) = TestDB::with_many_files(ra_fixture);
 
     let mut had_annotations = false;
-    let mut mismatches = HashMap::new();
-    let mut types = HashMap::new();
-    let mut adjustments = HashMap::<_, Vec<_>>::new();
+    let mut mismatches = FxHashMap::default();
+    let mut types = FxHashMap::default();
+    let mut adjustments = FxHashMap::<_, Vec<_>>::default();
     for (file_id, annotations) in db.extract_annotations() {
         for (range, expected) in annotations {
             let file_range = FileRange { file_id, range };
             if only_types {
                 types.insert(file_range, expected);
             } else if expected.starts_with("type: ") {
-                types.insert(file_range, expected.trim_start_matches("type: ").to_string());
+                types.insert(file_range, expected.trim_start_matches("type: ").to_owned());
             } else if expected.starts_with("expected") {
                 mismatches.insert(file_range, expected);
             } else if expected.starts_with("adjustments:") {
@@ -109,7 +110,7 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
                         .trim_start_matches("adjustments:")
                         .trim()
                         .split(',')
-                        .map(|it| it.trim().to_string())
+                        .map(|it| it.trim().to_owned())
                         .filter(|it| !it.is_empty())
                         .collect(),
                 );
@@ -163,7 +164,7 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
                 Some(value) => value,
                 None => continue,
             };
-            let range = node.as_ref().original_file_range(&db);
+            let range = node.as_ref().original_file_range_rooted(&db);
             if let Some(expected) = types.remove(&range) {
                 let actual = if display_source {
                     ty.display_source_code(&db, def.module(&db), true).unwrap()
@@ -179,7 +180,7 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
                 Some(value) => value,
                 None => continue,
             };
-            let range = node.as_ref().original_file_range(&db);
+            let range = node.as_ref().original_file_range_rooted(&db);
             if let Some(expected) = types.remove(&range) {
                 let actual = if display_source {
                     ty.display_source_code(&db, def.module(&db), true).unwrap()
@@ -210,7 +211,7 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
             }) else {
                 continue;
             };
-            let range = node.as_ref().original_file_range(&db);
+            let range = node.as_ref().original_file_range_rooted(&db);
             let actual = format!(
                 "expected {}, got {}",
                 mismatch.expected.display_test(&db),
@@ -292,20 +293,29 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
         let mut types: Vec<(InFile<SyntaxNode>, &Ty)> = Vec::new();
         let mut mismatches: Vec<(InFile<SyntaxNode>, &TypeMismatch)> = Vec::new();
 
+        if let Some(self_param) = body.self_param {
+            let ty = &inference_result.type_of_binding[self_param];
+            if let Some(syntax_ptr) = body_source_map.self_param_syntax() {
+                let root = db.parse_or_expand(syntax_ptr.file_id);
+                let node = syntax_ptr.map(|ptr| ptr.to_node(&root).syntax().clone());
+                types.push((node.clone(), ty));
+            }
+        }
+
         for (pat, mut ty) in inference_result.type_of_pat.iter() {
             if let Pat::Bind { id, .. } = body.pats[pat] {
                 ty = &inference_result.type_of_binding[id];
             }
-            let syntax_ptr = match body_source_map.pat_syntax(pat) {
+            let node = match body_source_map.pat_syntax(pat) {
                 Ok(sp) => {
                     let root = db.parse_or_expand(sp.file_id);
                     sp.map(|ptr| ptr.to_node(&root).syntax().clone())
                 }
                 Err(SyntheticSyntax) => continue,
             };
-            types.push((syntax_ptr.clone(), ty));
+            types.push((node.clone(), ty));
             if let Some(mismatch) = inference_result.type_mismatch_for_pat(pat) {
-                mismatches.push((syntax_ptr, mismatch));
+                mismatches.push((node, mismatch));
             }
         }
 
@@ -330,7 +340,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
         });
         for (node, ty) in &types {
             let (range, text) = if let Some(self_param) = ast::SelfParam::cast(node.value.clone()) {
-                (self_param.name().unwrap().syntax().text_range(), "self".to_string())
+                (self_param.name().unwrap().syntax().text_range(), "self".to_owned())
             } else {
                 (node.value.text_range(), node.value.text().to_string().replace('\n', " "))
             };
@@ -574,7 +584,7 @@ fn salsa_bug() {
         }
     ";
 
-    db.set_file_text(pos.file_id, Arc::from(new_text));
+    db.set_file_text(pos.file_id, new_text);
 
     let module = db.module_for_file(pos.file_id);
     let crate_def_map = module.def_map(&db);

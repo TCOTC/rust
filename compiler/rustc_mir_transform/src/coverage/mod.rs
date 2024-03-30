@@ -13,11 +13,9 @@ use self::spans::{BcbMapping, BcbMappingKind, CoverageSpans};
 
 use crate::MirPass;
 
-use rustc_middle::hir;
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::coverage::*;
 use rustc_middle::mir::{
-    self, BasicBlock, BasicBlockData, Coverage, SourceInfo, Statement, StatementKind, Terminator,
+    self, BasicBlock, BasicBlockData, SourceInfo, Statement, StatementKind, Terminator,
     TerminatorKind,
 };
 use rustc_middle::ty::TyCtxt;
@@ -44,7 +42,7 @@ impl<'tcx> MirPass<'tcx> for InstrumentCoverage {
 
         let def_id = mir_source.def_id().expect_local();
 
-        if !is_eligible_for_coverage(tcx, def_id) {
+        if !tcx.is_eligible_for_coverage(def_id) {
             trace!("InstrumentCoverage skipped for {def_id:?} (not eligible)");
             return;
         }
@@ -125,8 +123,11 @@ fn create_mappings<'tcx>(
     let body_span = hir_info.body_span;
 
     let source_file = source_map.lookup_source_file(body_span.lo());
-    use rustc_session::RemapFileNameExt;
-    let file_name = Symbol::intern(&source_file.name.for_codegen(tcx.sess).to_string_lossy());
+
+    use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
+    let file_name = Symbol::intern(
+        &source_file.name.for_scope(tcx.sess, RemapPathScopeComponents::MACRO).to_string_lossy(),
+    );
 
     let term_for_bcb = |bcb| {
         coverage_counters
@@ -140,6 +141,10 @@ fn create_mappings<'tcx>(
         .filter_map(|&BcbMapping { kind: bcb_mapping_kind, span }| {
             let kind = match bcb_mapping_kind {
                 BcbMappingKind::Code(bcb) => MappingKind::Code(term_for_bcb(bcb)),
+                BcbMappingKind::Branch { true_bcb, false_bcb } => MappingKind::Branch {
+                    true_term: term_for_bcb(true_bcb),
+                    false_term: term_for_bcb(false_bcb),
+                },
             };
             let code_region = make_code_region(source_map, file_name, span, body_span)?;
             Some(Mapping { kind, code_region })
@@ -228,10 +233,7 @@ fn inject_statement(mir_body: &mut mir::Body<'_>, counter_kind: CoverageKind, bb
     debug!("  injecting statement {counter_kind:?} for {bb:?}");
     let data = &mut mir_body[bb];
     let source_info = data.terminator().source_info;
-    let statement = Statement {
-        source_info,
-        kind: StatementKind::Coverage(Box::new(Coverage { kind: counter_kind })),
-    };
+    let statement = Statement { source_info, kind: StatementKind::Coverage(counter_kind) };
     data.statements.insert(0, statement);
 }
 
@@ -349,37 +351,6 @@ fn check_code_region(code_region: CodeRegion) -> Option<CodeRegion> {
     }
 }
 
-fn is_eligible_for_coverage(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-    // Only instrument functions, methods, and closures (not constants since they are evaluated
-    // at compile time by Miri).
-    // FIXME(#73156): Handle source code coverage in const eval, but note, if and when const
-    // expressions get coverage spans, we will probably have to "carve out" space for const
-    // expressions from coverage spans in enclosing MIR's, like we do for closures. (That might
-    // be tricky if const expressions have no corresponding statements in the enclosing MIR.
-    // Closures are carved out by their initial `Assign` statement.)
-    if !tcx.def_kind(def_id).is_fn_like() {
-        trace!("InstrumentCoverage skipped for {def_id:?} (not an fn-like)");
-        return false;
-    }
-
-    // Don't instrument functions with `#[automatically_derived]` on their
-    // enclosing impl block, on the assumption that most users won't care about
-    // coverage for derived impls.
-    if let Some(impl_of) = tcx.impl_of_method(def_id.to_def_id())
-        && tcx.is_automatically_derived(impl_of)
-    {
-        trace!("InstrumentCoverage skipped for {def_id:?} (automatically derived)");
-        return false;
-    }
-
-    if tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::NO_COVERAGE) {
-        trace!("InstrumentCoverage skipped for {def_id:?} (`#[coverage(off)]`)");
-        return false;
-    }
-
-    true
-}
-
 /// Function information extracted from HIR by the coverage instrumentor.
 #[derive(Debug)]
 struct ExtractedHirInfo {
@@ -396,8 +367,7 @@ fn extract_hir_info<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ExtractedHir
     // to HIR for it.
 
     let hir_node = tcx.hir_node_by_def_id(def_id);
-    let (_, fn_body_id) =
-        hir::map::associated_body(hir_node).expect("HIR node is a function with body");
+    let fn_body_id = hir_node.body_id().expect("HIR node is a function with body");
     let hir_body = tcx.hir().body(fn_body_id);
 
     let maybe_fn_sig = hir_node.fn_sig();

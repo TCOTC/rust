@@ -1,10 +1,8 @@
-error[E0700]: hidden type for `impl Sized + 'a` captures lifetime that does not appear in bounds
+error[E0792]: expected generic lifetime parameter, found `'_`
   --> $DIR/early_bound.rs:7:17
    |
 LL | fn test<'a: 'a>(n: bool) -> impl Sized + 'a {
-   |         --                  --------------- opaque type defined here
-   |         |
-   |         hidden type `&'a ()` captures the lifetime `'a` as defined here
+   |                                          -- this generic parameter must be used with a generic lifetime parameter
 ...
 LL |         let _ = identity::<&'a ()>(test(false));
    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -23,4 +21,4 @@ LL |         let _ = identity::<&'a ()>(test(false));
 
 error: aborting due to 2 previous errors
 
-For more information about this error, try `rustc --explain E0700`.
+For more information about this error, try `rustc --explain E0792`.

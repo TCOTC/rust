@@ -6,8 +6,8 @@ use itertools::Itertools;
 
 use crate::{
     hir::{
-        Array, BindingAnnotation, BindingId, CaptureBy, ClosureKind, Literal, LiteralOrConst,
-        Movability, Statement,
+        Array, BindingAnnotation, CaptureBy, ClosureKind, Literal, LiteralOrConst, Movability,
+        Statement,
     },
     pretty::{print_generic_args, print_path, print_type_ref},
     type_ref::TypeRef,
@@ -29,11 +29,11 @@ pub(super) fn print_body_hir(db: &dyn DefDatabase, body: &Body, owner: DefWithBo
                 "const {} = ",
                 match &it.name {
                     Some(name) => name.display(db.upcast()).to_string(),
-                    None => "_".to_string(),
+                    None => "_".to_owned(),
                 }
             )
         }),
-        DefWithBodyId::InTypeConstId(_) => "In type const = ".to_string(),
+        DefWithBodyId::InTypeConstId(_) => "In type const = ".to_owned(),
         DefWithBodyId::VariantId(it) => {
             let loc = it.lookup(db);
             let enum_loc = loc.parent.lookup(db);
@@ -48,7 +48,16 @@ pub(super) fn print_body_hir(db: &dyn DefDatabase, body: &Body, owner: DefWithBo
     let mut p = Printer { db, body, buf: header, indent_level: 0, needs_indent: false };
     if let DefWithBodyId::FunctionId(it) = owner {
         p.buf.push('(');
-        body.params.iter().zip(db.function_data(it).params.iter()).for_each(|(&param, ty)| {
+        let params = &db.function_data(it).params;
+        let mut params = params.iter();
+        if let Some(self_param) = body.self_param {
+            p.print_binding(self_param);
+            p.buf.push(':');
+            if let Some(ty) = params.next() {
+                p.print_type_ref(ty);
+            }
+        }
+        body.params.iter().zip(params).for_each(|(&param, ty)| {
             p.print_pat(param);
             p.buf.push(':');
             p.print_type_ref(ty);
@@ -123,7 +132,7 @@ impl Printer<'_> {
         wln!(self);
         f(self);
         self.indent_level -= 1;
-        self.buf = self.buf.trim_end_matches('\n').to_string();
+        self.buf = self.buf.trim_end_matches('\n').to_owned();
     }
 
     fn whitespace(&mut self) {
@@ -260,6 +269,11 @@ impl Printer<'_> {
                     self.whitespace();
                     self.print_expr(*expr);
                 }
+            }
+            Expr::Become { expr } => {
+                w!(self, "become");
+                self.whitespace();
+                self.print_expr(*expr);
             }
             Expr::Yield { expr } => {
                 w!(self, "yield");
@@ -623,13 +637,14 @@ impl Printer<'_> {
                 }
                 wln!(self);
             }
+            Statement::Item => (),
         }
     }
 
     fn print_literal_or_const(&mut self, literal_or_const: &LiteralOrConst) {
         match literal_or_const {
             LiteralOrConst::Literal(l) => self.print_literal(l),
-            LiteralOrConst::Const(c) => self.print_path(c),
+            LiteralOrConst::Const(c) => self.print_pat(*c),
         }
     }
 

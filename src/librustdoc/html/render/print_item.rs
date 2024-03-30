@@ -33,6 +33,7 @@ use crate::html::format::{
 };
 use crate::html::layout::Page;
 use crate::html::markdown::{HeadingOffset, MarkdownSummaryLine};
+use crate::html::render::{document_full, document_item_info};
 use crate::html::url_parts_builder::UrlPartsBuilder;
 use crate::html::{highlight, static_files};
 
@@ -444,14 +445,14 @@ fn item_module(w: &mut Buffer, cx: &mut Context<'_>, item: &clean::Item, items: 
                     Some(src) => write!(
                         w,
                         "<div class=\"item-name\"><code>{}extern crate {} as {};",
-                        visibility_print_with_space(myitem.visibility(tcx), myitem.item_id, cx),
+                        visibility_print_with_space(myitem, cx),
                         anchor(myitem.item_id.expect_def_id(), src, cx),
                         myitem.name.unwrap(),
                     ),
                     None => write!(
                         w,
                         "<div class=\"item-name\"><code>{}extern crate {};",
-                        visibility_print_with_space(myitem.visibility(tcx), myitem.item_id, cx),
+                        visibility_print_with_space(myitem, cx),
                         anchor(myitem.item_id.expect_def_id(), myitem.name.unwrap(), cx),
                     ),
                 }
@@ -490,7 +491,7 @@ fn item_module(w: &mut Buffer, cx: &mut Context<'_>, item: &clean::Item, items: 
                          <code>{vis}{imp}</code>\
                      </div>\
                      {stab_tags_before}{stab_tags}{stab_tags_after}",
-                    vis = visibility_print_with_space(myitem.visibility(tcx), myitem.item_id, cx),
+                    vis = visibility_print_with_space(myitem, cx),
                     imp = import.print(cx),
                 );
                 w.write_str(ITEM_TABLE_ROW_CLOSE);
@@ -510,10 +511,16 @@ fn item_module(w: &mut Buffer, cx: &mut Context<'_>, item: &clean::Item, items: 
                     _ => "",
                 };
 
-                let visibility_emoji = match myitem.visibility(tcx) {
+                let visibility_and_hidden = match myitem.visibility(tcx) {
                     Some(ty::Visibility::Restricted(_)) => {
-                        "<span title=\"Restricted Visibility\">&nbsp;🔒</span> "
+                        if myitem.is_doc_hidden() {
+                            // Don't separate with a space when there are two of them
+                            "<span title=\"Restricted Visibility\">&nbsp;🔒</span><span title=\"Hidden item\">👻</span> "
+                        } else {
+                            "<span title=\"Restricted Visibility\">&nbsp;🔒</span> "
+                        }
                     }
+                    _ if myitem.is_doc_hidden() => "<span title=\"Hidden item\">&nbsp;👻</span> ",
                     _ => "",
                 };
 
@@ -529,13 +536,13 @@ fn item_module(w: &mut Buffer, cx: &mut Context<'_>, item: &clean::Item, items: 
                     w,
                     "<div class=\"item-name\">\
                         <a class=\"{class}\" href=\"{href}\" title=\"{title}\">{name}</a>\
-                        {visibility_emoji}\
+                        {visibility_and_hidden}\
                         {unsafety_flag}\
                         {stab_tags}\
                      </div>\
                      {docs_before}{docs}{docs_after}",
                     name = myitem.name.unwrap(),
-                    visibility_emoji = visibility_emoji,
+                    visibility_and_hidden = visibility_and_hidden,
                     stab_tags = extra_info_tags(myitem, item, tcx),
                     class = myitem.type_(),
                     unsafety_flag = unsafety_flag,
@@ -624,7 +631,7 @@ fn item_function(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, f: &cle
     let unsafety = header.unsafety.print_with_space();
     let abi = print_abi_with_space(header.abi).to_string();
     let asyncness = header.asyncness.print_with_space();
-    let visibility = visibility_print_with_space(it.visibility(tcx), it.item_id, cx).to_string();
+    let visibility = visibility_print_with_space(it, cx).to_string();
     let name = it.name.unwrap();
 
     let generics_len = format!("{:#}", f.generics.print(cx)).len();
@@ -681,7 +688,7 @@ fn item_trait(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, t: &clean:
             w,
             "{attrs}{vis}{unsafety}{is_auto}trait {name}{generics}{bounds}",
             attrs = render_attributes_in_pre(it, "", cx),
-            vis = visibility_print_with_space(it.visibility(tcx), it.item_id, cx),
+            vis = visibility_print_with_space(it, cx),
             unsafety = t.unsafety(tcx).print_with_space(),
             is_auto = if t.is_auto(tcx) { "auto " } else { "" },
             name = it.name.unwrap(),
@@ -818,8 +825,10 @@ fn item_trait(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, t: &clean:
         info!("Documenting {name} on {ty_name:?}", ty_name = t.name);
         let item_type = m.type_();
         let id = cx.derive_id(format!("{item_type}.{name}"));
+
         let mut content = Buffer::empty_from(w);
-        write!(&mut content, "{}", document(cx, m, Some(t), HeadingOffset::H5));
+        write!(content, "{}", document_full(m, cx, HeadingOffset::H5));
+
         let toggled = !content.is_empty();
         if toggled {
             let method_toggle_class = if item_type.is_method() { " method-toggle" } else { "" };
@@ -836,8 +845,8 @@ fn item_trait(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, t: &clean:
             cx,
             RenderMode::Normal,
         );
-        w.write_str("</h4>");
-        w.write_str("</section>");
+        w.write_str("</h4></section>");
+        document_item_info(cx, m, Some(t)).render_into(w).unwrap();
         if toggled {
             write!(w, "</summary>");
             w.push_buffer(content);
@@ -1234,7 +1243,7 @@ fn item_type_alias(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, t: &c
                 w,
                 "{attrs}{vis}type {name}{generics}{where_clause} = {type_};",
                 attrs = render_attributes_in_pre(it, "", cx),
-                vis = visibility_print_with_space(it.visibility(cx.tcx()), it.item_id, cx),
+                vis = visibility_print_with_space(it, cx),
                 name = it.name.unwrap(),
                 generics = t.generics.print(cx),
                 where_clause = print_where_clause(&t.generics, cx, 0, Ending::Newline),
@@ -1513,14 +1522,13 @@ fn print_tuple_struct_fields<'a, 'cx: 'a>(
 }
 
 fn item_enum(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, e: &clean::Enum) {
-    let tcx = cx.tcx();
     let count_variants = e.variants().count();
     wrap_item(w, |w| {
         render_attributes_in_code(w, it, cx);
         write!(
             w,
             "{}enum {}{}",
-            visibility_print_with_space(it.visibility(tcx), it.item_id, cx),
+            visibility_print_with_space(it, cx),
             it.name.unwrap(),
             e.generics.print(cx),
         );
@@ -1720,6 +1728,8 @@ fn item_variants(
         }
         w.write_str("</h3></section>");
 
+        write!(w, "{}", document(cx, variant, Some(it), HeadingOffset::H4));
+
         let heading_and_fields = match &variant_data.kind {
             clean::VariantKind::Struct(s) => {
                 // If there is no field to display, no need to add the heading.
@@ -1781,8 +1791,6 @@ fn item_variants(
             }
             w.write_str("</div>");
         }
-
-        write!(w, "{}", document(cx, variant, Some(it), HeadingOffset::H4));
     }
     write!(w, "</div>");
 }
@@ -1851,7 +1859,7 @@ fn item_constant(w: &mut Buffer, cx: &mut Context<'_>, it: &clean::Item, c: &cle
         write!(
             w,
             "{vis}const {name}{generics}: {typ}{where_clause}",
-            vis = visibility_print_with_space(it.visibility(tcx), it.item_id, cx),
+            vis = visibility_print_with_space(it, cx),
             name = it.name.unwrap(),
             generics = c.generics.print(cx),
             typ = c.type_.print(cx),
@@ -1955,7 +1963,7 @@ fn item_static(w: &mut impl fmt::Write, cx: &mut Context<'_>, it: &clean::Item, 
         write!(
             buffer,
             "{vis}static {mutability}{name}: {typ}",
-            vis = visibility_print_with_space(it.visibility(cx.tcx()), it.item_id, cx),
+            vis = visibility_print_with_space(it, cx),
             mutability = s.mutability.print_with_space(),
             name = it.name.unwrap(),
             typ = s.type_.print(cx)
@@ -1973,7 +1981,7 @@ fn item_foreign_type(w: &mut impl fmt::Write, cx: &mut Context<'_>, it: &clean::
         write!(
             buffer,
             "    {}type {};\n}}",
-            visibility_print_with_space(it.visibility(cx.tcx()), it.item_id, cx),
+            visibility_print_with_space(it, cx),
             it.name.unwrap(),
         )
         .unwrap();
@@ -2130,13 +2138,7 @@ fn render_union<'a, 'cx: 'a>(
     cx: &'a Context<'cx>,
 ) -> impl fmt::Display + 'a + Captures<'cx> {
     display_fn(move |mut f| {
-        let tcx = cx.tcx();
-        write!(
-            f,
-            "{}union {}",
-            visibility_print_with_space(it.visibility(tcx), it.item_id, cx),
-            it.name.unwrap(),
-        )?;
+        write!(f, "{}union {}", visibility_print_with_space(it, cx), it.name.unwrap(),)?;
 
         let where_displayed = g
             .map(|g| {
@@ -2166,7 +2168,7 @@ fn render_union<'a, 'cx: 'a>(
                 write!(
                     f,
                     "    {}{}: {},\n",
-                    visibility_print_with_space(field.visibility(tcx), field.item_id, cx),
+                    visibility_print_with_space(field, cx),
                     field.name.unwrap(),
                     ty.print(cx)
                 )?;
@@ -2194,11 +2196,10 @@ fn render_struct(
     structhead: bool,
     cx: &Context<'_>,
 ) {
-    let tcx = cx.tcx();
     write!(
         w,
         "{}{}{}",
-        visibility_print_with_space(it.visibility(tcx), it.item_id, cx),
+        visibility_print_with_space(it, cx),
         if structhead { "struct " } else { "" },
         it.name.unwrap()
     );
@@ -2227,7 +2228,6 @@ fn render_struct_fields(
     has_stripped_entries: bool,
     cx: &Context<'_>,
 ) {
-    let tcx = cx.tcx();
     match ty {
         None => {
             let where_displayed =
@@ -2251,7 +2251,7 @@ fn render_struct_fields(
                     write!(
                         w,
                         "\n{tab}    {vis}{name}: {ty},",
-                        vis = visibility_print_with_space(field.visibility(tcx), field.item_id, cx),
+                        vis = visibility_print_with_space(field, cx),
                         name = field.name.unwrap(),
                         ty = ty.print(cx),
                     );
@@ -2287,16 +2287,7 @@ fn render_struct_fields(
                     match *field.kind {
                         clean::StrippedItem(box clean::StructFieldItem(..)) => write!(w, "_"),
                         clean::StructFieldItem(ref ty) => {
-                            write!(
-                                w,
-                                "{}{}",
-                                visibility_print_with_space(
-                                    field.visibility(tcx),
-                                    field.item_id,
-                                    cx
-                                ),
-                                ty.print(cx),
-                            )
+                            write!(w, "{}{}", visibility_print_with_space(field, cx), ty.print(cx),)
                         }
                         _ => unreachable!(),
                     }

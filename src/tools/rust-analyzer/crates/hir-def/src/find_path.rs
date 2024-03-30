@@ -171,6 +171,7 @@ fn find_path_inner(ctx: FindPathCtx<'_>, item: ItemInNs, from: ModuleId) -> Opti
     .map(|(item, _)| item)
 }
 
+#[tracing::instrument(skip_all)]
 fn find_path_for_module(
     ctx: FindPathCtx<'_>,
     def_map: &DefMap,
@@ -312,6 +313,7 @@ fn find_self_super(def_map: &DefMap, item: ModuleId, from: ModuleId) -> Option<M
     }
 }
 
+#[tracing::instrument(skip_all)]
 fn calculate_best_path(
     ctx: FindPathCtx<'_>,
     def_map: &DefMap,
@@ -445,18 +447,25 @@ fn select_best_path(
     }
     const STD_CRATES: [Name; 3] = [known::std, known::core, known::alloc];
 
-    let choose = |new_path: (ModPath, _), old_path: (ModPath, _)| {
-        let new_has_prelude = new_path.0.segments().iter().any(|seg| seg == &known::prelude);
-        let old_has_prelude = old_path.0.segments().iter().any(|seg| seg == &known::prelude);
+    let choose = |new: (ModPath, _), old: (ModPath, _)| {
+        let (new_path, _) = &new;
+        let (old_path, _) = &old;
+        let new_has_prelude = new_path.segments().iter().any(|seg| seg == &known::prelude);
+        let old_has_prelude = old_path.segments().iter().any(|seg| seg == &known::prelude);
         match (new_has_prelude, old_has_prelude, prefer_prelude) {
-            (true, false, true) | (false, true, false) => new_path,
-            (true, false, false) | (false, true, true) => old_path,
-            // no prelude difference in the paths, so pick the smaller one
+            (true, false, true) | (false, true, false) => new,
+            (true, false, false) | (false, true, true) => old,
+            // no prelude difference in the paths, so pick the shorter one
             (true, true, _) | (false, false, _) => {
-                if new_path.0.len() < old_path.0.len() {
-                    new_path
+                let new_path_is_shorter = new_path
+                    .len()
+                    .cmp(&old_path.len())
+                    .then_with(|| new_path.textual_len().cmp(&old_path.textual_len()))
+                    .is_lt();
+                if new_path_is_shorter {
+                    new
                 } else {
-                    old_path
+                    old
                 }
             }
         }
@@ -467,8 +476,8 @@ fn select_best_path(
             let rank = match prefer_no_std {
                 false => |name: &Name| match name {
                     name if name == &known::core => 0,
-                    name if name == &known::alloc => 0,
-                    name if name == &known::std => 1,
+                    name if name == &known::alloc => 1,
+                    name if name == &known::std => 2,
                     _ => unreachable!(),
                 },
                 true => |name: &Name| match name {
@@ -602,8 +611,10 @@ mod tests {
         let parsed_path_file = syntax::SourceFile::parse(&format!("use {path};"));
         let ast_path =
             parsed_path_file.syntax_node().descendants().find_map(syntax::ast::Path::cast).unwrap();
-        let mod_path =
-            ModPath::from_src(&db, ast_path, db.span_map(pos.file_id.into()).as_ref()).unwrap();
+        let mod_path = ModPath::from_src(&db, ast_path, &mut |range| {
+            db.span_map(pos.file_id.into()).as_ref().span_for_range(range).ctx
+        })
+        .unwrap();
 
         let def_map = module.def_map(&db);
         let resolved = def_map
@@ -1535,6 +1546,40 @@ pub mod foo {
             "krate::prelude::Foo",
             "krate::prelude::Foo",
             "krate::prelude::Foo",
+        );
+    }
+
+    #[test]
+    fn respect_segment_length() {
+        check_found_path(
+            r#"
+//- /main.rs crate:main deps:petgraph
+$0
+//- /petgraph.rs crate:petgraph
+pub mod graph {
+    pub use crate::graph_impl::{
+        NodeIndex
+    };
+}
+
+mod graph_impl {
+    pub struct NodeIndex<Ix>(Ix);
+}
+
+pub mod stable_graph {
+    #[doc(no_inline)]
+    pub use crate::graph::{NodeIndex};
+}
+
+pub mod prelude {
+    #[doc(no_inline)]
+    pub use crate::graph::{NodeIndex};
+}
+"#,
+            "petgraph::graph::NodeIndex",
+            "petgraph::graph::NodeIndex",
+            "petgraph::graph::NodeIndex",
+            "petgraph::graph::NodeIndex",
         );
     }
 }

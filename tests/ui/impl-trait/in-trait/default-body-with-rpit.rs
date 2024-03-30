@@ -1,7 +1,5 @@
-// edition:2021
-// check-pass
-
-#![allow(incomplete_features)]
+//@ edition:2021
+//@ check-pass
 
 use std::fmt::Debug;
 

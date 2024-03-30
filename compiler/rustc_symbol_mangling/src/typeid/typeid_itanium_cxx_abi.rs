@@ -11,6 +11,7 @@ use rustc_data_structures::base_n;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_middle::ty::layout::IntegerExt;
+use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{
     self, Const, ExistentialPredicate, FloatTy, FnSig, Instance, IntTy, List, Region, RegionKind,
     TermKind, Ty, TyCtxt, UintTy,
@@ -18,10 +19,12 @@ use rustc_middle::ty::{
 use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef};
 use rustc_span::def_id::DefId;
 use rustc_span::sym;
-use rustc_target::abi::call::{Conv, FnAbi};
+use rustc_target::abi::call::{Conv, FnAbi, PassMode};
 use rustc_target::abi::Integer;
 use rustc_target::spec::abi::Abi;
+use rustc_trait_selection::traits;
 use std::fmt::Write as _;
+use std::iter;
 
 use crate::typeid::TypeIdOptions;
 
@@ -178,14 +181,14 @@ fn encode_fnsig<'tcx>(
     // Encode the return type
     let transform_ty_options = TransformTyOptions::from_bits(options.bits())
         .unwrap_or_else(|| bug!("encode_fnsig: invalid option(s) `{:?}`", options.bits()));
-    let ty = transform_ty(tcx, fn_sig.output(), transform_ty_options);
+    let ty = transform_ty(tcx, fn_sig.output(), &mut Vec::new(), transform_ty_options);
     s.push_str(&encode_ty(tcx, ty, dict, encode_ty_options));
 
     // Encode the parameter types
     let tys = fn_sig.inputs();
     if !tys.is_empty() {
         for ty in tys {
-            let ty = transform_ty(tcx, *ty, transform_ty_options);
+            let ty = transform_ty(tcx, *ty, &mut Vec::new(), transform_ty_options);
             s.push_str(&encode_ty(tcx, ty, dict, encode_ty_options));
         }
 
@@ -261,12 +264,7 @@ fn encode_predicates<'tcx>(
 }
 
 /// Encodes a region using the Itanium C++ ABI as a vendor extended type.
-fn encode_region<'tcx>(
-    _tcx: TyCtxt<'tcx>,
-    region: Region<'tcx>,
-    dict: &mut FxHashMap<DictKey<'tcx>, usize>,
-    _options: EncodeTyOptions,
-) -> String {
+fn encode_region<'tcx>(region: Region<'tcx>, dict: &mut FxHashMap<DictKey<'tcx>, usize>) -> String {
     // u6region[I[<region-disambiguator>][<region-index>]E] as vendor extended type
     let mut s = String::new();
     match region.kind() {
@@ -314,7 +312,7 @@ fn encode_args<'tcx>(
         for arg in args {
             match arg.unpack() {
                 GenericArgKind::Lifetime(region) => {
-                    s.push_str(&encode_region(tcx, region, dict, options));
+                    s.push_str(&encode_region(region, dict));
                 }
                 GenericArgKind::Type(ty) => {
                     s.push_str(&encode_ty(tcx, ty, dict, options));
@@ -387,7 +385,8 @@ fn encode_ty_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
             | hir::definitions::DefPathData::Use
             | hir::definitions::DefPathData::GlobalAsm
             | hir::definitions::DefPathData::MacroNs(..)
-            | hir::definitions::DefPathData::LifetimeNs(..) => {
+            | hir::definitions::DefPathData::LifetimeNs(..)
+            | hir::definitions::DefPathData::AnonAdt => {
                 bug!("encode_ty_name: unexpected `{:?}`", disambiguated_data.data);
             }
         });
@@ -468,14 +467,17 @@ fn encode_ty<'tcx>(
             typeid.push_str(&s);
         }
 
-        // Rust's f32 and f64 single (32-bit) and double (64-bit) precision floating-point types
-        // have IEEE-754 binary32 and binary64 floating-point layouts, respectively.
+        // Rust's f16, f32, f64, and f126 half (16-bit), single (32-bit), double (64-bit), and
+        // quad (128-bit)  precision floating-point types have IEEE-754 binary16, binary32,
+        // binary64, and binary128 floating-point layouts, respectively.
         //
         // (See https://rust-lang.github.io/unsafe-code-guidelines/layout/scalars.html#fixed-width-floating-point-types.)
         ty::Float(float_ty) => {
-            typeid.push(match float_ty {
-                FloatTy::F32 => 'f',
-                FloatTy::F64 => 'd',
+            typeid.push_str(match float_ty {
+                FloatTy::F16 => "Dh",
+                FloatTy::F32 => "f",
+                FloatTy::F64 => "d",
+                FloatTy::F128 => "g",
             });
         }
 
@@ -526,8 +528,8 @@ fn encode_ty<'tcx>(
                 "{}",
                 &len.try_to_scalar()
                     .unwrap()
-                    .to_u64()
-                    .unwrap_or_else(|_| panic!("failed to convert length to u64"))
+                    .to_target_usize(&tcx.data_layout)
+                    .expect("Array lens are defined in usize")
             );
             s.push_str(&encode_ty(tcx, *ty0, dict, options));
             compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
@@ -550,8 +552,20 @@ fn encode_ty<'tcx>(
             if let Some(cfi_encoding) = tcx.get_attr(def_id, sym::cfi_encoding) {
                 // Use user-defined CFI encoding for type
                 if let Some(value_str) = cfi_encoding.value_str() {
-                    if !value_str.to_string().trim().is_empty() {
-                        s.push_str(value_str.to_string().trim());
+                    let value_str = value_str.to_string();
+                    let str = value_str.trim();
+                    if !str.is_empty() {
+                        s.push_str(str);
+                        // Don't compress user-defined builtin types (see
+                        // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-builtin and
+                        // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
+                        let builtin_types = [
+                            "v", "w", "b", "c", "a", "h", "s", "t", "i", "j", "l", "m", "x", "y",
+                            "n", "o", "f", "d", "e", "g", "z", "Dh",
+                        ];
+                        if !builtin_types.contains(&str) {
+                            compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
+                        }
                     } else {
                         #[allow(
                             rustc::diagnostic_outside_of_impl,
@@ -567,7 +581,6 @@ fn encode_ty<'tcx>(
                 } else {
                     bug!("encode_ty: invalid `cfi_encoding` for `{:?}`", ty.kind());
                 }
-                compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
             } else if options.contains(EncodeTyOptions::GENERALIZE_REPR_C) && adt_def.repr().c() {
                 // For cross-language LLVM CFI support, the encoding must be compatible at the FFI
                 // boundary. For instance:
@@ -673,13 +686,14 @@ fn encode_ty<'tcx>(
             typeid.push_str(&s);
         }
 
-        ty::RawPtr(tm) => {
+        ty::RawPtr(ptr_ty, _mutbl) => {
+            // FIXME: This can definitely not be so spaghettified.
             // P[K]<element-type>
             let mut s = String::new();
-            s.push_str(&encode_ty(tcx, tm.ty, dict, options));
+            s.push_str(&encode_ty(tcx, *ptr_ty, dict, options));
             if !ty.is_mutable_ptr() {
                 s = format!("{}{}", "K", &s);
-                compress(dict, DictKey::Ty(tm.ty, TyQ::Const), &mut s);
+                compress(dict, DictKey::Ty(*ptr_ty, TyQ::Const), &mut s);
             };
             s = format!("{}{}", "P", &s);
             compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
@@ -703,7 +717,7 @@ fn encode_ty<'tcx>(
                 ty::DynStar => "u7dynstarI",
             });
             s.push_str(&encode_predicates(tcx, predicates, dict, options));
-            s.push_str(&encode_region(tcx, *region, dict, options));
+            s.push_str(&encode_region(*region, dict));
             s.push('E');
             compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
             typeid.push_str(&s);
@@ -735,11 +749,9 @@ fn encode_ty<'tcx>(
 fn transform_predicates<'tcx>(
     tcx: TyCtxt<'tcx>,
     predicates: &List<ty::PolyExistentialPredicate<'tcx>>,
-    _options: EncodeTyOptions,
 ) -> &'tcx List<ty::PolyExistentialPredicate<'tcx>> {
-    let predicates: Vec<ty::PolyExistentialPredicate<'tcx>> = predicates
-        .iter()
-        .filter_map(|predicate| match predicate.skip_binder() {
+    tcx.mk_poly_existential_predicates_from_iter(predicates.iter().filter_map(|predicate| {
+        match predicate.skip_binder() {
             ty::ExistentialPredicate::Trait(trait_ref) => {
                 let trait_ref = ty::TraitRef::identity(tcx, trait_ref.def_id);
                 Some(ty::Binder::dummy(ty::ExistentialPredicate::Trait(
@@ -748,20 +760,20 @@ fn transform_predicates<'tcx>(
             }
             ty::ExistentialPredicate::Projection(..) => None,
             ty::ExistentialPredicate::AutoTrait(..) => Some(predicate),
-        })
-        .collect();
-    tcx.mk_poly_existential_predicates(&predicates)
+        }
+    }))
 }
 
 /// Transforms args for being encoded and used in the substitution dictionary.
 fn transform_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     args: GenericArgsRef<'tcx>,
+    parents: &mut Vec<Ty<'tcx>>,
     options: TransformTyOptions,
 ) -> GenericArgsRef<'tcx> {
     let args = args.iter().map(|arg| match arg.unpack() {
         GenericArgKind::Type(ty) if ty.is_c_void(tcx) => Ty::new_unit(tcx).into(),
-        GenericArgKind::Type(ty) => transform_ty(tcx, ty, options).into(),
+        GenericArgKind::Type(ty) => transform_ty(tcx, ty, parents, options).into(),
         _ => arg,
     });
     tcx.mk_args_from_iter(args)
@@ -771,9 +783,12 @@ fn transform_args<'tcx>(
 // c_void types into unit types unconditionally, generalizes pointers if
 // TransformTyOptions::GENERALIZE_POINTERS option is set, and normalizes integers if
 // TransformTyOptions::NORMALIZE_INTEGERS option is set.
-fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptions) -> Ty<'tcx> {
-    let mut ty = ty;
-
+fn transform_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mut ty: Ty<'tcx>,
+    parents: &mut Vec<Ty<'tcx>>,
+    options: TransformTyOptions,
+) -> Ty<'tcx> {
     match ty.kind() {
         ty::Float(..) | ty::Str | ty::Never | ty::Foreign(..) | ty::CoroutineWitness(..) => {}
 
@@ -833,17 +848,20 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
         _ if ty.is_unit() => {}
 
         ty::Tuple(tys) => {
-            ty = Ty::new_tup_from_iter(tcx, tys.iter().map(|ty| transform_ty(tcx, ty, options)));
+            ty = Ty::new_tup_from_iter(
+                tcx,
+                tys.iter().map(|ty| transform_ty(tcx, ty, parents, options)),
+            );
         }
 
         ty::Array(ty0, len) => {
             let len = len.eval_target_usize(tcx, ty::ParamEnv::reveal_all());
 
-            ty = Ty::new_array(tcx, transform_ty(tcx, *ty0, options), len);
+            ty = Ty::new_array(tcx, transform_ty(tcx, *ty0, parents, options), len);
         }
 
         ty::Slice(ty0) => {
-            ty = Ty::new_slice(tcx, transform_ty(tcx, *ty0, options));
+            ty = Ty::new_slice(tcx, transform_ty(tcx, *ty0, parents, options));
         }
 
         ty::Adt(adt_def, args) => {
@@ -852,7 +870,8 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
             } else if options.contains(TransformTyOptions::GENERALIZE_REPR_C) && adt_def.repr().c()
             {
                 ty = Ty::new_adt(tcx, *adt_def, ty::List::empty());
-            } else if adt_def.repr().transparent() && adt_def.is_struct() {
+            } else if adt_def.repr().transparent() && adt_def.is_struct() && !parents.contains(&ty)
+            {
                 // Don't transform repr(transparent) types with an user-defined CFI encoding to
                 // preserve the user-defined CFI encoding.
                 if let Some(_) = tcx.get_attr(adt_def.did(), sym::cfi_encoding) {
@@ -871,38 +890,48 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
                     // Generalize any repr(transparent) user-defined type that is either a pointer
                     // or reference, and either references itself or any other type that contains or
                     // references itself, to avoid a reference cycle.
+
+                    // If the self reference is not through a pointer, for example, due
+                    // to using `PhantomData`, need to skip normalizing it if we hit it again.
+                    parents.push(ty);
                     if ty0.is_any_ptr() && ty0.contains(ty) {
                         ty = transform_ty(
                             tcx,
                             ty0,
+                            parents,
                             options | TransformTyOptions::GENERALIZE_POINTERS,
                         );
                     } else {
-                        ty = transform_ty(tcx, ty0, options);
+                        ty = transform_ty(tcx, ty0, parents, options);
                     }
+                    parents.pop();
                 } else {
                     // Transform repr(transparent) types without non-ZST field into ()
                     ty = Ty::new_unit(tcx);
                 }
             } else {
-                ty = Ty::new_adt(tcx, *adt_def, transform_args(tcx, args, options));
+                ty = Ty::new_adt(tcx, *adt_def, transform_args(tcx, args, parents, options));
             }
         }
 
         ty::FnDef(def_id, args) => {
-            ty = Ty::new_fn_def(tcx, *def_id, transform_args(tcx, args, options));
+            ty = Ty::new_fn_def(tcx, *def_id, transform_args(tcx, args, parents, options));
         }
 
         ty::Closure(def_id, args) => {
-            ty = Ty::new_closure(tcx, *def_id, transform_args(tcx, args, options));
+            ty = Ty::new_closure(tcx, *def_id, transform_args(tcx, args, parents, options));
         }
 
         ty::CoroutineClosure(def_id, args) => {
-            ty = Ty::new_coroutine_closure(tcx, *def_id, transform_args(tcx, args, options));
+            ty = Ty::new_coroutine_closure(
+                tcx,
+                *def_id,
+                transform_args(tcx, args, parents, options),
+            );
         }
 
         ty::Coroutine(def_id, args) => {
-            ty = Ty::new_coroutine(tcx, *def_id, transform_args(tcx, args, options));
+            ty = Ty::new_coroutine(tcx, *def_id, transform_args(tcx, args, parents, options));
         }
 
         ty::Ref(region, ty0, ..) => {
@@ -914,14 +943,14 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
                 }
             } else {
                 if ty.is_mutable_ptr() {
-                    ty = Ty::new_mut_ref(tcx, *region, transform_ty(tcx, *ty0, options));
+                    ty = Ty::new_mut_ref(tcx, *region, transform_ty(tcx, *ty0, parents, options));
                 } else {
-                    ty = Ty::new_imm_ref(tcx, *region, transform_ty(tcx, *ty0, options));
+                    ty = Ty::new_imm_ref(tcx, *region, transform_ty(tcx, *ty0, parents, options));
                 }
             }
         }
 
-        ty::RawPtr(tm) => {
+        ty::RawPtr(ptr_ty, _) => {
             if options.contains(TransformTyOptions::GENERALIZE_POINTERS) {
                 if ty.is_mutable_ptr() {
                     ty = Ty::new_mut_ptr(tcx, Ty::new_unit(tcx));
@@ -930,9 +959,9 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
                 }
             } else {
                 if ty.is_mutable_ptr() {
-                    ty = Ty::new_mut_ptr(tcx, transform_ty(tcx, tm.ty, options));
+                    ty = Ty::new_mut_ptr(tcx, transform_ty(tcx, *ptr_ty, parents, options));
                 } else {
-                    ty = Ty::new_imm_ptr(tcx, transform_ty(tcx, tm.ty, options));
+                    ty = Ty::new_imm_ptr(tcx, transform_ty(tcx, *ptr_ty, parents, options));
                 }
             }
         }
@@ -945,9 +974,9 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
                     .skip_binder()
                     .inputs()
                     .iter()
-                    .map(|ty| transform_ty(tcx, *ty, options))
+                    .map(|ty| transform_ty(tcx, *ty, parents, options))
                     .collect();
-                let output = transform_ty(tcx, fn_sig.skip_binder().output(), options);
+                let output = transform_ty(tcx, fn_sig.skip_binder().output(), parents, options);
                 ty = Ty::new_fn_ptr(
                     tcx,
                     ty::Binder::bind_with_vars(
@@ -967,7 +996,7 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
         ty::Dynamic(predicates, _region, kind) => {
             ty = Ty::new_dynamic(
                 tcx,
-                transform_predicates(tcx, predicates, options),
+                transform_predicates(tcx, predicates),
                 tcx.lifetimes.re_erased,
                 *kind,
             );
@@ -977,6 +1006,7 @@ fn transform_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, options: TransformTyOptio
             ty = transform_ty(
                 tcx,
                 tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), ty),
+                parents,
                 options,
             );
         }
@@ -1027,24 +1057,33 @@ pub fn typeid_for_fnabi<'tcx>(
     // Encode the return type
     let transform_ty_options = TransformTyOptions::from_bits(options.bits())
         .unwrap_or_else(|| bug!("typeid_for_fnabi: invalid option(s) `{:?}`", options.bits()));
-    let ty = transform_ty(tcx, fn_abi.ret.layout.ty, transform_ty_options);
+    let ty = transform_ty(tcx, fn_abi.ret.layout.ty, &mut Vec::new(), transform_ty_options);
     typeid.push_str(&encode_ty(tcx, ty, &mut dict, encode_ty_options));
 
     // Encode the parameter types
+
+    // We erase ZSTs as we go if the argument is skipped. This is an implementation detail of how
+    // MIR is currently treated by rustc, and subject to change in the future. Specifically, MIR
+    // interpretation today will allow skipped arguments to simply not be passed at a call-site.
     if !fn_abi.c_variadic {
-        if !fn_abi.args.is_empty() {
-            for arg in fn_abi.args.iter() {
-                let ty = transform_ty(tcx, arg.layout.ty, transform_ty_options);
-                typeid.push_str(&encode_ty(tcx, ty, &mut dict, encode_ty_options));
-            }
-        } else {
+        let mut pushed_arg = false;
+        for arg in fn_abi.args.iter().filter(|arg| arg.mode != PassMode::Ignore) {
+            pushed_arg = true;
+            let ty = transform_ty(tcx, arg.layout.ty, &mut Vec::new(), transform_ty_options);
+            typeid.push_str(&encode_ty(tcx, ty, &mut dict, encode_ty_options));
+        }
+        if !pushed_arg {
             // Empty parameter lists, whether declared as () or conventionally as (void), are
             // encoded with a void parameter specifier "v".
             typeid.push('v');
         }
     } else {
         for n in 0..fn_abi.fixed_count as usize {
-            let ty = transform_ty(tcx, fn_abi.args[n].layout.ty, transform_ty_options);
+            if fn_abi.args[n].mode == PassMode::Ignore {
+                continue;
+            }
+            let ty =
+                transform_ty(tcx, fn_abi.args[n].layout.ty, &mut Vec::new(), transform_ty_options);
             typeid.push_str(&encode_ty(tcx, ty, &mut dict, encode_ty_options));
         }
 
@@ -1066,92 +1105,150 @@ pub fn typeid_for_fnabi<'tcx>(
     typeid
 }
 
-/// Returns a type metadata identifier for the specified FnSig using the Itanium C++ ABI with vendor
-/// extended type qualifiers and types for Rust types that are not used at the FFI boundary.
-pub fn typeid_for_fnsig<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    fn_sig: &FnSig<'tcx>,
-    options: TypeIdOptions,
-) -> String {
-    // A name is mangled by prefixing "_Z" to an encoding of its name, and in the case of functions
-    // its type.
-    let mut typeid = String::from("_Z");
-
-    // Clang uses the Itanium C++ ABI's virtual tables and RTTI typeinfo structure name as type
-    // metadata identifiers for function pointers. The typeinfo name encoding is a two-character
-    // code (i.e., 'TS') prefixed to the type encoding for the function.
-    typeid.push_str("TS");
-
-    // A dictionary of substitution candidates used for compression (see
-    // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
-    let mut dict: FxHashMap<DictKey<'tcx>, usize> = FxHashMap::default();
-
-    // Encode the function signature
-    typeid.push_str(&encode_fnsig(tcx, fn_sig, &mut dict, options));
-
-    // Add encoding suffixes
-    if options.contains(EncodeTyOptions::NORMALIZE_INTEGERS) {
-        typeid.push_str(".normalized");
-    }
-
-    if options.contains(EncodeTyOptions::GENERALIZE_POINTERS) {
-        typeid.push_str(".generalized");
-    }
-
-    typeid
-}
-
 /// Returns a type metadata identifier for the specified Instance using the Itanium C++ ABI with
 /// vendor extended type qualifiers and types for Rust types that are not used at the FFI boundary.
 pub fn typeid_for_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: &Instance<'tcx>,
+    mut instance: Instance<'tcx>,
     options: TypeIdOptions,
 ) -> String {
-    let fn_abi = tcx
-        .fn_abi_of_instance(tcx.param_env(instance.def_id()).and((*instance, ty::List::empty())))
-        .unwrap_or_else(|instance| {
-            bug!("typeid_for_instance: couldn't get fn_abi of instance {:?}", instance)
+    if (matches!(instance.def, ty::InstanceDef::Virtual(..))
+        && Some(instance.def_id()) == tcx.lang_items().drop_in_place_fn())
+        || matches!(instance.def, ty::InstanceDef::DropGlue(..))
+    {
+        // Adjust the type ids of DropGlues
+        //
+        // DropGlues may have indirect calls to one or more given types drop function. Rust allows
+        // for types to be erased to any trait object and retains the drop function for the original
+        // type, which means at the indirect call sites in DropGlues, when typeid_for_fnabi is
+        // called a second time, it only has information after type erasure and it could be a call
+        // on any arbitrary trait object. Normalize them to a synthesized Drop trait object, both on
+        // declaration/definition, and during code generation at call sites so they have the same
+        // type id and match.
+        //
+        // FIXME(rcvalle): This allows a drop call on any trait object to call the drop function of
+        //   any other type.
+        //
+        let def_id = tcx
+            .lang_items()
+            .drop_trait()
+            .unwrap_or_else(|| bug!("typeid_for_instance: couldn't get drop_trait lang item"));
+        let predicate = ty::ExistentialPredicate::Trait(ty::ExistentialTraitRef {
+            def_id: def_id,
+            args: List::empty(),
         });
+        let predicates = tcx.mk_poly_existential_predicates(&[ty::Binder::dummy(predicate)]);
+        let self_ty = Ty::new_dynamic(tcx, predicates, tcx.lifetimes.re_erased, ty::Dyn);
+        instance.args = tcx.mk_args_trait(self_ty, List::empty());
+    } else if let ty::InstanceDef::Virtual(def_id, _) = instance.def {
+        let upcast_ty = match tcx.trait_of_item(def_id) {
+            Some(trait_id) => trait_object_ty(
+                tcx,
+                ty::Binder::dummy(ty::TraitRef::from_method(tcx, trait_id, instance.args)),
+            ),
+            // drop_in_place won't have a defining trait, skip the upcast
+            None => instance.args.type_at(0),
+        };
+        let stripped_ty = strip_receiver_auto(tcx, upcast_ty);
+        instance.args = tcx.mk_args_trait(stripped_ty, instance.args.into_iter().skip(1));
+    }
 
-    // If this instance is a method and self is a reference, get the impl it belongs to
-    let impl_def_id = tcx.impl_of_method(instance.def_id());
-    if impl_def_id.is_some() && !fn_abi.args.is_empty() && fn_abi.args[0].layout.ty.is_ref() {
-        // If this impl is not an inherent impl, get the trait it implements
-        if let Some(trait_ref) = tcx.impl_trait_ref(impl_def_id.unwrap()) {
-            // Transform the concrete self into a reference to a trait object
-            let existential_predicate = trait_ref.map_bound(|trait_ref| {
-                ty::ExistentialPredicate::Trait(ty::ExistentialTraitRef::erase_self_ty(
-                    tcx, trait_ref,
-                ))
-            });
-            let existential_predicates = tcx.mk_poly_existential_predicates(&[ty::Binder::dummy(
-                existential_predicate.skip_binder(),
-            )]);
-            // Is the concrete self mutable?
-            let self_ty = if fn_abi.args[0].layout.ty.is_mutable_ptr() {
-                Ty::new_mut_ref(
-                    tcx,
-                    tcx.lifetimes.re_erased,
-                    Ty::new_dynamic(tcx, existential_predicates, tcx.lifetimes.re_erased, ty::Dyn),
-                )
-            } else {
-                Ty::new_imm_ref(
-                    tcx,
-                    tcx.lifetimes.re_erased,
-                    Ty::new_dynamic(tcx, existential_predicates, tcx.lifetimes.re_erased, ty::Dyn),
-                )
-            };
+    if !options.contains(EncodeTyOptions::NO_SELF_TYPE_ERASURE)
+        && let Some(impl_id) = tcx.impl_of_method(instance.def_id())
+        && let Some(trait_ref) = tcx.impl_trait_ref(impl_id)
+    {
+        let impl_method = tcx.associated_item(instance.def_id());
+        let method_id = impl_method
+            .trait_item_def_id
+            .expect("Part of a trait implementation, but not linked to the def_id?");
+        let trait_method = tcx.associated_item(method_id);
+        let trait_id = trait_ref.skip_binder().def_id;
+        if traits::is_vtable_safe_method(tcx, trait_id, trait_method)
+            && tcx.object_safety_violations(trait_id).is_empty()
+        {
+            // Trait methods will have a Self polymorphic parameter, where the concreteized
+            // implementatation will not. We need to walk back to the more general trait method
+            let trait_ref = tcx.instantiate_and_normalize_erasing_regions(
+                instance.args,
+                ty::ParamEnv::reveal_all(),
+                trait_ref,
+            );
+            let invoke_ty = trait_object_ty(tcx, ty::Binder::dummy(trait_ref));
 
-            // Replace the concrete self in an fn_abi clone by the reference to a trait object
-            let mut fn_abi = fn_abi.clone();
-            // HACK(rcvalle): It is okay to not replace or update the entire ArgAbi here because the
-            //   other fields are never used.
-            fn_abi.args[0].layout.ty = self_ty;
-
-            return typeid_for_fnabi(tcx, &fn_abi, options);
+            // At the call site, any call to this concrete function through a vtable will be
+            // `Virtual(method_id, idx)` with appropriate arguments for the method. Since we have the
+            // original method id, and we've recovered the trait arguments, we can make the callee
+            // instance we're computing the alias set for match the caller instance.
+            //
+            // Right now, our code ignores the vtable index everywhere, so we use 0 as a placeholder.
+            // If we ever *do* start encoding the vtable index, we will need to generate an alias set
+            // based on which vtables we are putting this method into, as there will be more than one
+            // index value when supertraits are involved.
+            instance.def = ty::InstanceDef::Virtual(method_id, 0);
+            let abstract_trait_args =
+                tcx.mk_args_trait(invoke_ty, trait_ref.args.into_iter().skip(1));
+            instance.args = instance.args.rebase_onto(tcx, impl_id, abstract_trait_args);
         }
     }
 
+    let fn_abi = tcx
+        .fn_abi_of_instance(tcx.param_env(instance.def_id()).and((instance, ty::List::empty())))
+        .unwrap_or_else(|error| {
+            bug!("typeid_for_instance: couldn't get fn_abi of instance {instance:?}: {error:?}")
+        });
+
     typeid_for_fnabi(tcx, fn_abi, options)
+}
+
+fn strip_receiver_auto<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
+    let ty::Dynamic(preds, lifetime, kind) = ty.kind() else {
+        bug!("Tried to strip auto traits from non-dynamic type {ty}");
+    };
+    if preds.principal().is_some() {
+        let filtered_preds =
+            tcx.mk_poly_existential_predicates_from_iter(preds.into_iter().filter(|pred| {
+                !matches!(pred.skip_binder(), ty::ExistentialPredicate::AutoTrait(..))
+            }));
+        Ty::new_dynamic(tcx, filtered_preds, *lifetime, *kind)
+    } else {
+        // If there's no principal type, re-encode it as a unit, since we don't know anything
+        // about it. This technically discards the knowledge that it was a type that was made
+        // into a trait object at some point, but that's not a lot.
+        tcx.types.unit
+    }
+}
+
+#[instrument(skip(tcx), ret)]
+fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tcx>) -> Ty<'tcx> {
+    assert!(!poly_trait_ref.has_non_region_param());
+    let principal_pred = poly_trait_ref.map_bound(|trait_ref| {
+        ty::ExistentialPredicate::Trait(ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref))
+    });
+    let mut assoc_preds: Vec<_> = traits::supertraits(tcx, poly_trait_ref)
+        .flat_map(|super_poly_trait_ref| {
+            tcx.associated_items(super_poly_trait_ref.def_id())
+                .in_definition_order()
+                .filter(|item| item.kind == ty::AssocKind::Type)
+                .map(move |assoc_ty| {
+                    super_poly_trait_ref.map_bound(|super_trait_ref| {
+                        let alias_ty = ty::AliasTy::new(tcx, assoc_ty.def_id, super_trait_ref.args);
+                        let resolved = tcx.normalize_erasing_regions(
+                            ty::ParamEnv::reveal_all(),
+                            alias_ty.to_ty(tcx),
+                        );
+                        debug!("Resolved {:?} -> {resolved}", alias_ty.to_ty(tcx));
+                        ty::ExistentialPredicate::Projection(ty::ExistentialProjection {
+                            def_id: assoc_ty.def_id,
+                            args: ty::ExistentialTraitRef::erase_self_ty(tcx, super_trait_ref).args,
+                            term: resolved.into(),
+                        })
+                    })
+                })
+        })
+        .collect();
+    assoc_preds.sort_by(|a, b| a.skip_binder().stable_cmp(tcx, &b.skip_binder()));
+    let preds = tcx.mk_poly_existential_predicates_from_iter(
+        iter::once(principal_pred).chain(assoc_preds.into_iter()),
+    );
+    Ty::new_dynamic(tcx, preds, tcx.lifetimes.re_erased, ty::Dyn)
 }

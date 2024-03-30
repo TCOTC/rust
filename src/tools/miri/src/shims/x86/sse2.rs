@@ -17,7 +17,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
         link_name: Symbol,
         abi: Abi,
         args: &[OpTy<'tcx, Provenance>],
-        dest: &PlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx, EmulateForeignItemResult> {
         let this = self.eval_context_mut();
         this.expect_target_feature_for_intrinsic(link_name, "sse2")?;
@@ -46,7 +46,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(left_len, right_len);
                 assert_eq!(dest_len.checked_mul(2).unwrap(), left_len);
@@ -85,7 +85,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are u8x16, dest is u64x2
                 assert_eq!(left_len, right_len);
@@ -122,7 +122,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -172,7 +172,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -223,7 +223,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
                 assert_eq!(dest_len, right_len);
@@ -306,7 +306,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are i16x8, dest is i8x16
                 assert_eq!(left_len, 8);
@@ -337,7 +337,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are i16x8, dest is u8x16
                 assert_eq!(left_len, 8);
@@ -367,7 +367,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 // left and right are i32x4, dest is i16x8
                 assert_eq!(left_len, 4);
@@ -430,7 +430,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
                 let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, op_len);
 
@@ -440,11 +440,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 this.write_scalar(res0, &this.project_index(&dest, 0)?)?;
 
                 for i in 1..dest_len {
-                    this.copy_op(
-                        &this.project_index(&op, i)?,
-                        &this.project_index(&dest, i)?,
-                        /*allow_transmute*/ false,
-                    )?;
+                    this.copy_op(&this.project_index(&op, i)?, &this.project_index(&dest, i)?)?;
                 }
             }
             // Used to implement _mm_sqrt_pd functions.
@@ -453,7 +449,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
                 let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, op_len);
 
@@ -567,7 +563,7 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 let (left, left_len) = this.operand_to_simd(left)?;
                 let (right, _) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.place_to_simd(dest)?;
+                let (dest, dest_len) = this.mplace_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
 
@@ -581,18 +577,8 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
 
                 // Copy remianing from `left`
                 for i in 1..dest_len {
-                    this.copy_op(
-                        &this.project_index(&left, i)?,
-                        &this.project_index(&dest, i)?,
-                        /*allow_transmute*/ false,
-                    )?;
+                    this.copy_op(&this.project_index(&left, i)?, &this.project_index(&dest, i)?)?;
                 }
-            }
-            // Used to implement the `_mm_pause` function.
-            // The intrinsic is used to hint the processor that the code is in a spin-loop.
-            "pause" => {
-                let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.yield_active_thread();
             }
             _ => return Ok(EmulateForeignItemResult::NotSupported),
         }

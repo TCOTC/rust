@@ -16,9 +16,10 @@ use crate::{CachedModuleCodegen, CompiledModule, CrateInfo, MemFlags, ModuleCode
 
 use rustc_ast::expand::allocator::{global_fn_name, AllocatorKind, ALLOCATOR_METHODS};
 use rustc_attr as attr;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
 use rustc_data_structures::sync::par_map;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::lang_items::LangItem;
@@ -164,14 +165,11 @@ pub fn unsized_info<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 cx.tcx().vtable_trait_upcasting_coercion_new_vptr_slot((source, target));
 
             if let Some(entry_idx) = vptr_entry_idx {
-                let ptr_ty = cx.type_ptr();
-                let ptr_align = cx.tcx().data_layout.pointer_align.abi;
-                let gep = bx.inbounds_gep(
-                    ptr_ty,
-                    old_info,
-                    &[bx.const_usize(u64::try_from(entry_idx).unwrap())],
-                );
-                let new_vptr = bx.load(ptr_ty, gep, ptr_align);
+                let ptr_size = bx.data_layout().pointer_size;
+                let ptr_align = bx.data_layout().pointer_align.abi;
+                let vtable_byte_offset = u64::try_from(entry_idx).unwrap() * ptr_size.bytes();
+                let gep = bx.inbounds_ptradd(old_info, bx.const_usize(vtable_byte_offset));
+                let new_vptr = bx.load(bx.type_ptr(), gep, ptr_align);
                 bx.nonnull_metadata(new_vptr);
                 // VTable loads are invariant.
                 bx.set_invariant_load(new_vptr);
@@ -195,8 +193,8 @@ pub fn unsize_ptr<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 ) -> (Bx::Value, Bx::Value) {
     debug!("unsize_ptr: {:?} => {:?}", src_ty, dst_ty);
     match (src_ty.kind(), dst_ty.kind()) {
-        (&ty::Ref(_, a, _), &ty::Ref(_, b, _) | &ty::RawPtr(ty::TypeAndMut { ty: b, .. }))
-        | (&ty::RawPtr(ty::TypeAndMut { ty: a, .. }), &ty::RawPtr(ty::TypeAndMut { ty: b, .. })) => {
+        (&ty::Ref(_, a, _), &ty::Ref(_, b, _) | &ty::RawPtr(b, _))
+        | (&ty::RawPtr(a, _), &ty::RawPtr(b, _)) => {
             assert_eq!(bx.cx().type_is_sized(a), old_info.is_none());
             (src, unsized_info(bx, a, b, old_info))
         }
@@ -448,10 +446,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         let Some(llfn) = cx.declare_c_main(llfty) else {
             // FIXME: We should be smart and show a better diagnostic here.
             let span = cx.tcx().def_span(rust_main_def_id);
-            let dcx = cx.tcx().dcx();
-            dcx.emit_err(errors::MultipleMainFunctions { span });
-            dcx.abort_if_errors();
-            bug!();
+            cx.tcx().dcx().emit_fatal(errors::MultipleMainFunctions { span });
         };
 
         // `main` should respect same config for frame pointer elimination as rest of code
@@ -467,31 +462,34 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         let ptr_ty = cx.type_ptr();
         let (arg_argc, arg_argv) = get_argc_argv(cx, &mut bx);
 
-        let (start_fn, start_ty, args) = if let EntryFnType::Main { sigpipe } = entry_type {
+        let (start_fn, start_ty, args, instance) = if let EntryFnType::Main { sigpipe } = entry_type
+        {
             let start_def_id = cx.tcx().require_lang_item(LangItem::Start, None);
-            let start_fn = cx.get_fn_addr(
-                ty::Instance::resolve(
-                    cx.tcx(),
-                    ty::ParamEnv::reveal_all(),
-                    start_def_id,
-                    cx.tcx().mk_args(&[main_ret_ty.into()]),
-                )
-                .unwrap()
-                .unwrap(),
+            let start_instance = ty::Instance::expect_resolve(
+                cx.tcx(),
+                ty::ParamEnv::reveal_all(),
+                start_def_id,
+                cx.tcx().mk_args(&[main_ret_ty.into()]),
             );
+            let start_fn = cx.get_fn_addr(start_instance);
 
             let i8_ty = cx.type_i8();
             let arg_sigpipe = bx.const_u8(sigpipe);
 
             let start_ty = cx.type_func(&[cx.val_ty(rust_main), isize_ty, ptr_ty, i8_ty], isize_ty);
-            (start_fn, start_ty, vec![rust_main, arg_argc, arg_argv, arg_sigpipe])
+            (
+                start_fn,
+                start_ty,
+                vec![rust_main, arg_argc, arg_argv, arg_sigpipe],
+                Some(start_instance),
+            )
         } else {
             debug!("using user-defined start fn");
             let start_ty = cx.type_func(&[isize_ty, ptr_ty], isize_ty);
-            (rust_main, start_ty, vec![arg_argc, arg_argv])
+            (rust_main, start_ty, vec![arg_argc, arg_argv], None)
         };
 
-        let result = bx.call(start_ty, None, None, start_fn, &args, None);
+        let result = bx.call(start_ty, None, None, start_fn, &args, None, instance);
         if cx.sess().target.os.contains("uefi") {
             bx.ret(result);
         } else {
@@ -512,11 +510,13 @@ fn get_argc_argv<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         // Params for UEFI
         let param_handle = bx.get_param(0);
         let param_system_table = bx.get_param(1);
+        let ptr_size = bx.tcx().data_layout.pointer_size;
+        let ptr_align = bx.tcx().data_layout.pointer_align.abi;
         let arg_argc = bx.const_int(cx.type_isize(), 2);
-        let arg_argv = bx.alloca(cx.type_array(cx.type_ptr(), 2), Align::ONE);
-        bx.store(param_handle, arg_argv, Align::ONE);
-        let arg_argv_el1 = bx.gep(cx.type_ptr(), arg_argv, &[bx.const_int(cx.type_int(), 1)]);
-        bx.store(param_system_table, arg_argv_el1, Align::ONE);
+        let arg_argv = bx.alloca(cx.type_array(cx.type_ptr(), 2), ptr_align);
+        bx.store(param_handle, arg_argv, ptr_align);
+        let arg_argv_el1 = bx.inbounds_ptradd(arg_argv, bx.const_usize(ptr_size.bytes()));
+        bx.store(param_system_table, arg_argv_el1, ptr_align);
         (arg_argc, arg_argv)
     } else if cx.sess().target.main_needs_argc_argv {
         // Params from native `main()` used as args for rust start function
@@ -851,6 +851,8 @@ impl CrateInfo {
         // `compiler_builtins` are always placed last to ensure that they're linked correctly.
         used_crates.extend(compiler_builtins);
 
+        let crates = tcx.crates(());
+        let n_crates = crates.len();
         let mut info = CrateInfo {
             target_cpu,
             crate_types,
@@ -862,19 +864,15 @@ impl CrateInfo {
             is_no_builtins: Default::default(),
             native_libraries: Default::default(),
             used_libraries: tcx.native_libraries(LOCAL_CRATE).iter().map(Into::into).collect(),
-            crate_name: Default::default(),
+            crate_name: UnordMap::with_capacity(n_crates),
             used_crates,
-            used_crate_source: Default::default(),
+            used_crate_source: UnordMap::with_capacity(n_crates),
             dependency_formats: tcx.dependency_formats(()).clone(),
             windows_subsystem,
             natvis_debugger_visualizers: Default::default(),
         };
-        let crates = tcx.crates(());
 
-        let n_crates = crates.len();
         info.native_libraries.reserve(n_crates);
-        info.crate_name.reserve(n_crates);
-        info.used_crate_source.reserve(n_crates);
 
         for &cnum in crates.iter() {
             info.native_libraries
@@ -901,7 +899,7 @@ impl CrateInfo {
         // by the compiler, but that's ok because all this stuff is unstable anyway.
         let target = &tcx.sess.target;
         if !are_upstream_rust_objects_already_included(tcx.sess) {
-            let missing_weak_lang_items: FxHashSet<Symbol> = info
+            let missing_weak_lang_items: FxIndexSet<Symbol> = info
                 .used_crates
                 .iter()
                 .flat_map(|&cnum| tcx.missing_lang_items(cnum))
@@ -911,7 +909,11 @@ impl CrateInfo {
                     lang_items::required(tcx, l).then_some(name)
                 })
                 .collect();
-            let prefix = if target.is_like_windows && target.arch == "x86" { "_" } else { "" };
+            let prefix = match (target.is_like_windows, target.arch.as_ref()) {
+                (true, "x86") => "_",
+                (true, "arm64ec") => "#",
+                _ => "",
+            };
 
             // This loop only adds new items to values of the hash map, so the order in which we
             // iterate over the values is not important.

@@ -1,32 +1,23 @@
-warning: the feature `min_exhaustive_patterns` is incomplete and may not be safe to use and/or cause compiler crashes
-  --> $DIR/empty-types.rs:13:35
-   |
-LL | #![cfg_attr(min_exh_pats, feature(min_exhaustive_patterns))]
-   |                                   ^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: see issue #119612 <https://github.com/rust-lang/rust/issues/119612> for more information
-   = note: `#[warn(incomplete_features)]` on by default
-
 error: unreachable pattern
-  --> $DIR/empty-types.rs:50:9
+  --> $DIR/empty-types.rs:51:9
    |
 LL |         _ => {}
    |         ^
    |
 note: the lint level is defined here
-  --> $DIR/empty-types.rs:16:9
+  --> $DIR/empty-types.rs:17:9
    |
 LL | #![deny(unreachable_patterns)]
    |         ^^^^^^^^^^^^^^^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:53:9
+  --> $DIR/empty-types.rs:54:9
    |
 LL |         _x => {}
    |         ^^
 
 error[E0004]: non-exhaustive patterns: type `&!` is non-empty
-  --> $DIR/empty-types.rs:57:11
+  --> $DIR/empty-types.rs:58:11
    |
 LL |     match ref_never {}
    |           ^^^^^^^^^
@@ -41,31 +32,31 @@ LL +     }
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:72:9
+  --> $DIR/empty-types.rs:73:9
    |
 LL |         (_, _) => {}
    |         ^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:79:9
+  --> $DIR/empty-types.rs:80:9
    |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:82:9
+  --> $DIR/empty-types.rs:83:9
    |
 LL |         (_, _) => {}
    |         ^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:86:9
+  --> $DIR/empty-types.rs:87:9
    |
 LL |         _ => {}
    |         ^
 
 error[E0004]: non-exhaustive patterns: `Ok(_)` not covered
-  --> $DIR/empty-types.rs:90:11
+  --> $DIR/empty-types.rs:91:11
    |
 LL |     match res_u32_never {}
    |           ^^^^^^^^^^^^^ pattern `Ok(_)` not covered
@@ -84,19 +75,19 @@ LL +     }
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:98:9
+  --> $DIR/empty-types.rs:99:9
    |
 LL |         Err(_) => {}
    |         ^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:103:9
+  --> $DIR/empty-types.rs:104:9
    |
 LL |         Err(_) => {}
    |         ^^^^^^
 
 error[E0004]: non-exhaustive patterns: `Ok(1_u32..=u32::MAX)` not covered
-  --> $DIR/empty-types.rs:100:11
+  --> $DIR/empty-types.rs:101:11
    |
 LL |     match res_u32_never {
    |           ^^^^^^^^^^^^^ pattern `Ok(1_u32..=u32::MAX)` not covered
@@ -114,7 +105,7 @@ LL ~         Ok(1_u32..=u32::MAX) => todo!()
    |
 
 error[E0005]: refutable pattern in local binding
-  --> $DIR/empty-types.rs:107:9
+  --> $DIR/empty-types.rs:108:9
    |
 LL |     let Ok(_x) = res_u32_never.as_ref();
    |         ^^^^^^ pattern `Err(_)` not covered
@@ -128,7 +119,7 @@ LL |     let Ok(_x) = res_u32_never.as_ref() else { todo!() };
    |                                         ++++++++++++++++
 
 error[E0005]: refutable pattern in local binding
-  --> $DIR/empty-types.rs:111:9
+  --> $DIR/empty-types.rs:112:9
    |
 LL |     let Ok(_x) = &res_u32_never;
    |         ^^^^^^ pattern `&Err(_)` not covered
@@ -142,19 +133,13 @@ LL |     let Ok(_x) = &res_u32_never else { todo!() };
    |                                 ++++++++++++++++
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:118:9
+  --> $DIR/empty-types.rs:119:9
    |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:122:9
-   |
-LL |         Ok(_) => {}
-   |         ^^^^^
-
-error: unreachable pattern
-  --> $DIR/empty-types.rs:125:9
+  --> $DIR/empty-types.rs:123:9
    |
 LL |         Ok(_) => {}
    |         ^^^^^
@@ -162,47 +147,53 @@ LL |         Ok(_) => {}
 error: unreachable pattern
   --> $DIR/empty-types.rs:126:9
    |
+LL |         Ok(_) => {}
+   |         ^^^^^
+
+error: unreachable pattern
+  --> $DIR/empty-types.rs:127:9
+   |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:129:9
+  --> $DIR/empty-types.rs:130:9
    |
 LL |         Ok(_) => {}
    |         ^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:130:9
+  --> $DIR/empty-types.rs:131:9
    |
 LL |         Err(_) => {}
    |         ^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:139:13
+  --> $DIR/empty-types.rs:140:13
    |
 LL |             _ => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:142:13
+  --> $DIR/empty-types.rs:143:13
    |
 LL |             _ if false => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:151:13
+  --> $DIR/empty-types.rs:152:13
    |
 LL |             Some(_) => {}
    |             ^^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:155:13
+  --> $DIR/empty-types.rs:156:13
    |
 LL |             _ => {}
    |             ^
 
 error[E0004]: non-exhaustive patterns: `Some(_)` not covered
-  --> $DIR/empty-types.rs:164:15
+  --> $DIR/empty-types.rs:165:15
    |
 LL |         match *ref_opt_void {
    |               ^^^^^^^^^^^^^ pattern `Some(_)` not covered
@@ -220,61 +211,61 @@ LL +             Some(_) => todo!()
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:207:13
+  --> $DIR/empty-types.rs:208:13
    |
 LL |             _ => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:212:13
+  --> $DIR/empty-types.rs:213:13
    |
 LL |             _ => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:217:13
+  --> $DIR/empty-types.rs:218:13
    |
 LL |             _ => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:222:13
+  --> $DIR/empty-types.rs:223:13
    |
 LL |             _ => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:228:13
+  --> $DIR/empty-types.rs:229:13
    |
 LL |             _ => {}
    |             ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:287:9
+  --> $DIR/empty-types.rs:288:9
    |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:290:9
+  --> $DIR/empty-types.rs:291:9
    |
 LL |         (_, _) => {}
    |         ^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:293:9
+  --> $DIR/empty-types.rs:294:9
    |
 LL |         Ok(_) => {}
    |         ^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:294:9
+  --> $DIR/empty-types.rs:295:9
    |
 LL |         Err(_) => {}
    |         ^^^^^^
 
 error[E0004]: non-exhaustive patterns: type `(u32, !)` is non-empty
-  --> $DIR/empty-types.rs:315:11
+  --> $DIR/empty-types.rs:316:11
    |
 LL |     match *x {}
    |           ^^
@@ -288,7 +279,7 @@ LL ~     }
    |
 
 error[E0004]: non-exhaustive patterns: type `(!, !)` is non-empty
-  --> $DIR/empty-types.rs:317:11
+  --> $DIR/empty-types.rs:318:11
    |
 LL |     match *x {}
    |           ^^
@@ -302,7 +293,7 @@ LL ~     }
    |
 
 error[E0004]: non-exhaustive patterns: `Ok(_)` and `Err(_)` not covered
-  --> $DIR/empty-types.rs:319:11
+  --> $DIR/empty-types.rs:320:11
    |
 LL |     match *x {}
    |           ^^ patterns `Ok(_)` and `Err(_)` not covered
@@ -324,7 +315,7 @@ LL ~     }
    |
 
 error[E0004]: non-exhaustive patterns: type `[!; 3]` is non-empty
-  --> $DIR/empty-types.rs:321:11
+  --> $DIR/empty-types.rs:322:11
    |
 LL |     match *x {}
    |           ^^
@@ -338,7 +329,7 @@ LL ~     }
    |
 
 error[E0004]: non-exhaustive patterns: type `&[!]` is non-empty
-  --> $DIR/empty-types.rs:326:11
+  --> $DIR/empty-types.rs:327:11
    |
 LL |     match slice_never {}
    |           ^^^^^^^^^^^
@@ -352,7 +343,7 @@ LL +     }
    |
 
 error[E0004]: non-exhaustive patterns: `&[_, ..]` not covered
-  --> $DIR/empty-types.rs:328:11
+  --> $DIR/empty-types.rs:329:11
    |
 LL |     match slice_never {
    |           ^^^^^^^^^^^ pattern `&[_, ..]` not covered
@@ -365,7 +356,7 @@ LL +         &[_, ..] => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: `&[]`, `&[_]` and `&[_, _]` not covered
-  --> $DIR/empty-types.rs:337:11
+  --> $DIR/empty-types.rs:338:11
    |
 LL |     match slice_never {
    |           ^^^^^^^^^^^ patterns `&[]`, `&[_]` and `&[_, _]` not covered
@@ -378,7 +369,7 @@ LL +         &[] | &[_] | &[_, _] => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: `&[]` and `&[_, ..]` not covered
-  --> $DIR/empty-types.rs:350:11
+  --> $DIR/empty-types.rs:352:11
    |
 LL |     match slice_never {
    |           ^^^^^^^^^^^ patterns `&[]` and `&[_, ..]` not covered
@@ -392,7 +383,7 @@ LL +         &[] | &[_, ..] => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: type `[!]` is non-empty
-  --> $DIR/empty-types.rs:356:11
+  --> $DIR/empty-types.rs:359:11
    |
 LL |     match *slice_never {}
    |           ^^^^^^^^^^^^
@@ -406,25 +397,25 @@ LL +     }
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:366:9
+  --> $DIR/empty-types.rs:369:9
    |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:369:9
+  --> $DIR/empty-types.rs:372:9
    |
 LL |         [_, _, _] => {}
    |         ^^^^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:372:9
+  --> $DIR/empty-types.rs:375:9
    |
 LL |         [_, ..] => {}
    |         ^^^^^^^
 
 error[E0004]: non-exhaustive patterns: type `[!; 0]` is non-empty
-  --> $DIR/empty-types.rs:386:11
+  --> $DIR/empty-types.rs:389:11
    |
 LL |     match array_0_never {}
    |           ^^^^^^^^^^^^^
@@ -438,13 +429,13 @@ LL +     }
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:393:9
+  --> $DIR/empty-types.rs:396:9
    |
 LL |         _ => {}
    |         ^
 
 error[E0004]: non-exhaustive patterns: `[]` not covered
-  --> $DIR/empty-types.rs:395:11
+  --> $DIR/empty-types.rs:398:11
    |
 LL |     match array_0_never {
    |           ^^^^^^^^^^^^^ pattern `[]` not covered
@@ -458,31 +449,31 @@ LL +         [] => todo!()
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:414:9
+  --> $DIR/empty-types.rs:417:9
    |
 LL |         Some(_) => {}
    |         ^^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:419:9
+  --> $DIR/empty-types.rs:422:9
    |
 LL |         Some(_a) => {}
    |         ^^^^^^^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:424:9
+  --> $DIR/empty-types.rs:427:9
    |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:429:9
+  --> $DIR/empty-types.rs:432:9
    |
 LL |         _a => {}
    |         ^^
 
 error[E0004]: non-exhaustive patterns: `&Some(_)` not covered
-  --> $DIR/empty-types.rs:449:11
+  --> $DIR/empty-types.rs:452:11
    |
 LL |     match ref_opt_never {
    |           ^^^^^^^^^^^^^ pattern `&Some(_)` not covered
@@ -500,7 +491,7 @@ LL +         &Some(_) => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: `Some(_)` not covered
-  --> $DIR/empty-types.rs:490:11
+  --> $DIR/empty-types.rs:493:11
    |
 LL |     match *ref_opt_never {
    |           ^^^^^^^^^^^^^^ pattern `Some(_)` not covered
@@ -518,7 +509,7 @@ LL +         Some(_) => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: `Err(_)` not covered
-  --> $DIR/empty-types.rs:538:11
+  --> $DIR/empty-types.rs:541:11
    |
 LL |     match *ref_res_never {
    |           ^^^^^^^^^^^^^^ pattern `Err(_)` not covered
@@ -536,7 +527,7 @@ LL +         Err(_) => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: `Err(_)` not covered
-  --> $DIR/empty-types.rs:549:11
+  --> $DIR/empty-types.rs:552:11
    |
 LL |     match *ref_res_never {
    |           ^^^^^^^^^^^^^^ pattern `Err(_)` not covered
@@ -554,7 +545,7 @@ LL +         Err(_) => todo!()
    |
 
 error[E0004]: non-exhaustive patterns: type `(u32, !)` is non-empty
-  --> $DIR/empty-types.rs:568:11
+  --> $DIR/empty-types.rs:571:11
    |
 LL |     match *ref_tuple_half_never {}
    |           ^^^^^^^^^^^^^^^^^^^^^
@@ -568,31 +559,31 @@ LL +     }
    |
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:601:9
+  --> $DIR/empty-types.rs:604:9
    |
 LL |         _ => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:604:9
+  --> $DIR/empty-types.rs:607:9
    |
 LL |         _x => {}
    |         ^^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:607:9
+  --> $DIR/empty-types.rs:610:9
    |
 LL |         _ if false => {}
    |         ^
 
 error: unreachable pattern
-  --> $DIR/empty-types.rs:610:9
+  --> $DIR/empty-types.rs:613:9
    |
 LL |         _x if false => {}
    |         ^^
 
 error[E0004]: non-exhaustive patterns: `&_` not covered
-  --> $DIR/empty-types.rs:635:11
+  --> $DIR/empty-types.rs:638:11
    |
 LL |     match ref_never {
    |           ^^^^^^^^^ pattern `&_` not covered
@@ -606,8 +597,26 @@ LL ~         &_a if false => {},
 LL +         &_ => todo!()
    |
 
+error[E0004]: non-exhaustive patterns: `Ok(_)` not covered
+  --> $DIR/empty-types.rs:654:11
+   |
+LL |     match *ref_result_never {
+   |           ^^^^^^^^^^^^^^^^^ pattern `Ok(_)` not covered
+   |
+note: `Result<!, !>` defined here
+  --> $SRC_DIR/core/src/result.rs:LL:COL
+  ::: $SRC_DIR/core/src/result.rs:LL:COL
+   |
+   = note: not covered
+   = note: the matched value is of type `Result<!, !>`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+   |
+LL ~         Err(_) => {},
+LL +         Ok(_) => todo!()
+   |
+
 error[E0004]: non-exhaustive patterns: `Some(_)` not covered
-  --> $DIR/empty-types.rs:663:11
+  --> $DIR/empty-types.rs:674:11
    |
 LL |     match *x {
    |           ^^ pattern `Some(_)` not covered
@@ -624,7 +633,7 @@ LL ~         None => {},
 LL +         Some(_) => todo!()
    |
 
-error: aborting due to 63 previous errors; 1 warning emitted
+error: aborting due to 64 previous errors
 
 Some errors have detailed explanations: E0004, E0005.
 For more information about an error, try `rustc --explain E0004`.

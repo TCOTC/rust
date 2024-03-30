@@ -1,6 +1,6 @@
 use crate::fluent_generated as fluent;
 use crate::infer::error_reporting::nice_region_error::find_anon_type;
-use rustc_errors::{AddToDiagnostic, Diagnostic, IntoDiagnosticArg, SubdiagnosticMessageOp};
+use rustc_errors::{Diag, EmissionGuarantee, IntoDiagArg, SubdiagMessageOp, Subdiagnostic};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::{symbol::kw, Span};
 
@@ -107,8 +107,8 @@ pub enum SuffixKind {
     ReqByBinding,
 }
 
-impl IntoDiagnosticArg for PrefixKind {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
+impl IntoDiagArg for PrefixKind {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
         let kind = match self {
             Self::Empty => "empty",
             Self::RefValidFor => "ref_valid_for",
@@ -125,19 +125,19 @@ impl IntoDiagnosticArg for PrefixKind {
             Self::DataValidFor => "data_valid_for",
         }
         .into();
-        rustc_errors::DiagnosticArgValue::Str(kind)
+        rustc_errors::DiagArgValue::Str(kind)
     }
 }
 
-impl IntoDiagnosticArg for SuffixKind {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
+impl IntoDiagArg for SuffixKind {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
         let kind = match self {
             Self::Empty => "empty",
             Self::Continues => "continues",
             Self::ReqByBinding => "req_by_binding",
         }
         .into();
-        rustc_errors::DiagnosticArgValue::Str(kind)
+        rustc_errors::DiagArgValue::Str(kind)
     }
 }
 
@@ -159,8 +159,12 @@ impl RegionExplanation<'_> {
     }
 }
 
-impl AddToDiagnostic for RegionExplanation<'_> {
-    fn add_to_diagnostic_with<F: SubdiagnosticMessageOp>(self, diag: &mut Diagnostic, f: F) {
+impl Subdiagnostic for RegionExplanation<'_> {
+    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
+        self,
+        diag: &mut Diag<'_, G>,
+        f: F,
+    ) {
         diag.arg("pref_kind", self.prefix);
         diag.arg("suff_kind", self.suffix);
         diag.arg("desc_kind", self.desc.kind);

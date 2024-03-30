@@ -1,7 +1,8 @@
 use crate::rustc_lint::LintContext;
-use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
+use clippy_utils::diagnostics::{span_lint_and_then, span_lint_hir};
 use clippy_utils::get_parent_expr;
 use clippy_utils::sugg::Sugg;
+use hir::Param;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::intravisit::{Visitor as HirVisitor, Visitor};
@@ -13,6 +14,7 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
 use rustc_session::declare_lint_pass;
+use rustc_span::ExpnKind;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -89,7 +91,12 @@ fn find_innermost_closure<'tcx>(
     cx: &LateContext<'tcx>,
     mut expr: &'tcx hir::Expr<'tcx>,
     mut steps: usize,
-) -> Option<(&'tcx hir::Expr<'tcx>, &'tcx hir::FnDecl<'tcx>, ty::Asyncness)> {
+) -> Option<(
+    &'tcx hir::Expr<'tcx>,
+    &'tcx hir::FnDecl<'tcx>,
+    ty::Asyncness,
+    &'tcx [Param<'tcx>],
+)> {
     let mut data = None;
 
     while let hir::ExprKind::Closure(closure) = expr.kind
@@ -110,6 +117,7 @@ fn find_innermost_closure<'tcx>(
             } else {
                 ty::Asyncness::No
             },
+            body.params,
         ));
         steps -= 1;
     }
@@ -151,8 +159,19 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClosureCall {
             //           ^^  we only want to lint for this call (but we walk up the calls to consider both calls).
             // without this check, we'd end up linting twice.
             && !matches!(recv.kind, hir::ExprKind::Call(..))
+            // Check if `recv` comes from a macro expansion. If it does, make sure that it's an expansion that is
+            // the same as the one the call is in.
+            // For instance, let's assume `x!()` returns a closure:
+            //    B ---v
+            //      x!()()
+            //          ^- A
+            // The call happens in the expansion `A`, while the closure originates from the expansion `B`.
+            // We don't want to suggest replacing `x!()()` with `x!()`.
+            && recv.span.ctxt().outer_expn() == expr.span.ctxt().outer_expn()
             && let (full_expr, call_depth) = get_parent_call_exprs(cx, expr)
-            && let Some((body, fn_decl, coroutine_kind)) = find_innermost_closure(cx, recv, call_depth)
+            && let Some((body, fn_decl, coroutine_kind, params)) = find_innermost_closure(cx, recv, call_depth)
+            // outside macros we lint properly. Inside macros, we lint only ||() style closures.
+            && (!matches!(expr.span.ctxt().outer_expn_data().kind, ExpnKind::Macro(_, _)) || params.is_empty())
         {
             span_lint_and_then(
                 cx,
@@ -190,11 +209,11 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClosureCall {
                             hint = hint.asyncify();
                         }
 
-                        let is_in_fn_call_arg =
-                            clippy_utils::get_parent_node(cx.tcx, expr.hir_id).is_some_and(|x| match x {
-                                Node::Expr(expr) => matches!(expr.kind, hir::ExprKind::Call(_, _)),
-                                _ => false,
-                            });
+                        let is_in_fn_call_arg = if let Node::Expr(expr) = cx.tcx.parent_hir_node(expr.hir_id) {
+                            matches!(expr.kind, hir::ExprKind::Call(_, _))
+                        } else {
+                            false
+                        };
 
                         // avoid clippy::double_parens
                         if !is_in_fn_call_arg {
@@ -243,7 +262,7 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClosureCall {
         }
 
         for w in block.stmts.windows(2) {
-            if let hir::StmtKind::Local(local) = w[0].kind
+            if let hir::StmtKind::Let(local) = w[0].kind
                 && let Option::Some(t) = local.init
                 && let hir::ExprKind::Closure { .. } = t.kind
                 && let hir::PatKind::Binding(_, _, ident, _) = local.pat.kind
@@ -254,9 +273,10 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClosureCall {
                 && ident == path.segments[0].ident
                 && count_closure_usage(cx, block, path) == 1
             {
-                span_lint(
+                span_lint_hir(
                     cx,
                     REDUNDANT_CLOSURE_CALL,
+                    second.hir_id,
                     second.span,
                     "closure called just once immediately after it was declared",
                 );

@@ -181,9 +181,10 @@ impl FlagComputation {
 
             &ty::Alias(kind, data) => {
                 self.add_flags(match kind {
-                    ty::Weak | ty::Projection => TypeFlags::HAS_TY_PROJECTION,
-                    ty::Inherent => TypeFlags::HAS_TY_INHERENT,
+                    ty::Projection => TypeFlags::HAS_TY_PROJECTION,
+                    ty::Weak => TypeFlags::HAS_TY_WEAK,
                     ty::Opaque => TypeFlags::HAS_TY_OPAQUE,
+                    ty::Inherent => TypeFlags::HAS_TY_INHERENT,
                 });
 
                 self.add_alias_ty(data);
@@ -210,8 +211,8 @@ impl FlagComputation {
 
             &ty::Slice(tt) => self.add_ty(tt),
 
-            ty::RawPtr(m) => {
-                self.add_ty(m.ty);
+            &ty::RawPtr(ty, _) => {
+                self.add_ty(ty);
             }
 
             &ty::Ref(r, ty, _) => {

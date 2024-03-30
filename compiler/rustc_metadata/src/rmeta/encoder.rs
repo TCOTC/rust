@@ -172,11 +172,19 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
                 // previously saved offset must be smaller than the current position.
                 let offset = self.opaque.position() - last_location;
                 if offset < last_location {
-                    SpanTag::indirect(true).encode(self);
-                    offset.encode(self);
+                    let needed = bytes_needed(offset);
+                    SpanTag::indirect(true, needed as u8).encode(self);
+                    self.opaque.write_with(|dest| {
+                        *dest = offset.to_le_bytes();
+                        needed
+                    });
                 } else {
-                    SpanTag::indirect(false).encode(self);
-                    last_location.encode(self);
+                    let needed = bytes_needed(last_location);
+                    SpanTag::indirect(false, needed as u8).encode(self);
+                    self.opaque.write_with(|dest| {
+                        *dest = last_location.to_le_bytes();
+                        needed
+                    });
                 }
             }
             Entry::Vacant(v) => {
@@ -210,6 +218,10 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
             }
         }
     }
+}
+
+fn bytes_needed(n: usize) -> usize {
+    (usize::BITS - n.leading_zeros()).div_ceil(u8::BITS) as usize
 }
 
 impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for SpanData {
@@ -421,7 +433,7 @@ macro_rules! record_defaulted_array {
 }
 
 impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
-    fn emit_lazy_distance(&mut self, position: NonZeroUsize) {
+    fn emit_lazy_distance(&mut self, position: NonZero<usize>) {
         let pos = position.get();
         let distance = match self.lazy_state {
             LazyState::NoNode => bug!("emit_lazy_distance: outside of a metadata node"),
@@ -439,7 +451,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 position.get() - last_pos.get()
             }
         };
-        self.lazy_state = LazyState::Previous(NonZeroUsize::new(pos).unwrap());
+        self.lazy_state = LazyState::Previous(NonZero::new(pos).unwrap());
         self.emit_usize(distance);
     }
 
@@ -447,7 +459,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     where
         T::Value<'tcx>: Encodable<EncodeContext<'a, 'tcx>>,
     {
-        let pos = NonZeroUsize::new(self.position()).unwrap();
+        let pos = NonZero::new(self.position()).unwrap();
 
         assert_eq!(self.lazy_state, LazyState::NoNode);
         self.lazy_state = LazyState::NodeStart(pos);
@@ -466,7 +478,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     where
         T::Value<'tcx>: Encodable<EncodeContext<'a, 'tcx>>,
     {
-        let pos = NonZeroUsize::new(self.position()).unwrap();
+        let pos = NonZero::new(self.position()).unwrap();
 
         assert_eq!(self.lazy_state, LazyState::NoNode);
         self.lazy_state = LazyState::NodeStart(pos);
@@ -537,17 +549,11 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
             match source_file.name {
                 FileName::Real(ref original_file_name) => {
-                    let adapted_file_name = if self.tcx.sess.should_prefer_remapped_for_codegen() {
-                        source_map.path_mapping().to_embeddable_absolute_path(
-                            original_file_name.clone(),
-                            working_directory,
-                        )
-                    } else {
-                        source_map.path_mapping().to_local_embeddable_absolute_path(
-                            original_file_name.clone(),
-                            working_directory,
-                        )
-                    };
+                    // FIXME: This should probably to conditionally remapped under
+                    // a RemapPathScopeComponents but which one?
+                    let adapted_file_name = source_map
+                        .path_mapping()
+                        .to_embeddable_absolute_path(original_file_name.clone(), working_directory);
 
                     adapted_source_file.name = FileName::Real(adapted_file_name);
                 }
@@ -805,8 +811,8 @@ struct AnalyzeAttrState {
 #[inline]
 fn analyze_attr(attr: &Attribute, state: &mut AnalyzeAttrState) -> bool {
     let mut should_encode = false;
-    if rustc_feature::is_builtin_only_local(attr.name_or_empty()) {
-        // Attributes marked local-only don't need to be encoded for downstream crates.
+    if !rustc_feature::encode_cross_crate(attr.name_or_empty()) {
+        // Attributes not marked encode-cross-crate don't need to be encoded for downstream crates.
     } else if attr.doc_str().is_some() {
         // We keep all doc comments reachable to rustdoc because they might be "imported" into
         // downstream crates if they use `#[doc(inline)]` to copy an item's documentation into
@@ -851,7 +857,7 @@ fn should_encode_span(def_kind: DefKind) -> bool {
         | DefKind::LifetimeParam
         | DefKind::Fn
         | DefKind::Const
-        | DefKind::Static(_)
+        | DefKind::Static { .. }
         | DefKind::Ctor(..)
         | DefKind::AssocFn
         | DefKind::AssocConst
@@ -882,7 +888,7 @@ fn should_encode_attrs(def_kind: DefKind) -> bool {
         | DefKind::AssocTy
         | DefKind::Fn
         | DefKind::Const
-        | DefKind::Static(_)
+        | DefKind::Static { nested: false, .. }
         | DefKind::AssocFn
         | DefKind::AssocConst
         | DefKind::Macro(_)
@@ -903,6 +909,7 @@ fn should_encode_attrs(def_kind: DefKind) -> bool {
         | DefKind::InlineConst
         | DefKind::OpaqueTy
         | DefKind::LifetimeParam
+        | DefKind::Static { nested: true, .. }
         | DefKind::GlobalAsm => false,
     }
 }
@@ -924,7 +931,7 @@ fn should_encode_expn_that_defined(def_kind: DefKind) -> bool {
         | DefKind::Fn
         | DefKind::Const
         | DefKind::ConstParam
-        | DefKind::Static(_)
+        | DefKind::Static { .. }
         | DefKind::Ctor(..)
         | DefKind::AssocFn
         | DefKind::AssocConst
@@ -956,7 +963,7 @@ fn should_encode_visibility(def_kind: DefKind) -> bool {
         | DefKind::AssocTy
         | DefKind::Fn
         | DefKind::Const
-        | DefKind::Static(..)
+        | DefKind::Static { nested: false, .. }
         | DefKind::Ctor(..)
         | DefKind::AssocFn
         | DefKind::AssocConst
@@ -969,6 +976,7 @@ fn should_encode_visibility(def_kind: DefKind) -> bool {
         | DefKind::LifetimeParam
         | DefKind::AnonConst
         | DefKind::InlineConst
+        | DefKind::Static { nested: true, .. }
         | DefKind::OpaqueTy
         | DefKind::GlobalAsm
         | DefKind::Impl { .. }
@@ -989,7 +997,7 @@ fn should_encode_stability(def_kind: DefKind) -> bool {
         | DefKind::AssocConst
         | DefKind::TyParam
         | DefKind::ConstParam
-        | DefKind::Static(..)
+        | DefKind::Static { .. }
         | DefKind::Const
         | DefKind::Fn
         | DefKind::ForeignMod
@@ -1045,11 +1053,9 @@ fn should_encode_mir(
             (true, mir_opt_base)
         }
         // Constants
-        DefKind::AnonConst
-        | DefKind::InlineConst
-        | DefKind::AssocConst
-        | DefKind::Static(..)
-        | DefKind::Const => (true, false),
+        DefKind::AnonConst | DefKind::InlineConst | DefKind::AssocConst | DefKind::Const => {
+            (true, false)
+        }
         // Coroutines require optimized MIR to compute layout.
         DefKind::Closure if tcx.is_coroutine(def_id.to_def_id()) => (false, true),
         // Full-fledged functions + closures
@@ -1086,7 +1092,7 @@ fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: Def
         | DefKind::AssocConst
         | DefKind::TyParam
         | DefKind::ConstParam
-        | DefKind::Static(..)
+        | DefKind::Static { .. }
         | DefKind::Const
         | DefKind::ForeignMod
         | DefKind::Impl { .. }
@@ -1118,7 +1124,7 @@ fn should_encode_generics(def_kind: DefKind) -> bool {
         | DefKind::AssocTy
         | DefKind::Fn
         | DefKind::Const
-        | DefKind::Static(..)
+        | DefKind::Static { .. }
         | DefKind::Ctor(..)
         | DefKind::AssocFn
         | DefKind::AssocConst
@@ -1150,7 +1156,7 @@ fn should_encode_type(tcx: TyCtxt<'_>, def_id: LocalDefId, def_kind: DefKind) ->
         | DefKind::Field
         | DefKind::Fn
         | DefKind::Const
-        | DefKind::Static(..)
+        | DefKind::Static { nested: false, .. }
         | DefKind::TyAlias
         | DefKind::ForeignTy
         | DefKind::Impl { .. }
@@ -1192,6 +1198,7 @@ fn should_encode_type(tcx: TyCtxt<'_>, def_id: LocalDefId, def_kind: DefKind) ->
         | DefKind::Mod
         | DefKind::ForeignMod
         | DefKind::Macro(..)
+        | DefKind::Static { nested: true, .. }
         | DefKind::Use
         | DefKind::LifetimeParam
         | DefKind::GlobalAsm
@@ -1209,7 +1216,7 @@ fn should_encode_fn_sig(def_kind: DefKind) -> bool {
         | DefKind::Variant
         | DefKind::Field
         | DefKind::Const
-        | DefKind::Static(..)
+        | DefKind::Static { .. }
         | DefKind::Ctor(..)
         | DefKind::TyAlias
         | DefKind::OpaqueTy
@@ -1250,7 +1257,7 @@ fn should_encode_constness(def_kind: DefKind) -> bool {
         | DefKind::Const
         | DefKind::AssocConst
         | DefKind::AnonConst
-        | DefKind::Static(..)
+        | DefKind::Static { .. }
         | DefKind::TyAlias
         | DefKind::OpaqueTy
         | DefKind::Impl { of_trait: false }
@@ -1282,7 +1289,7 @@ fn should_encode_const(def_kind: DefKind) -> bool {
         | DefKind::Ctor(..)
         | DefKind::Field
         | DefKind::Fn
-        | DefKind::Static(..)
+        | DefKind::Static { .. }
         | DefKind::TyAlias
         | DefKind::OpaqueTy
         | DefKind::ForeignTy
@@ -1323,8 +1330,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             is_doc_hidden: false,
         };
         let attr_iter = tcx
-            .opt_local_def_id_to_hir_id(def_id)
-            .map_or(Default::default(), |hir_id| tcx.hir().attrs(hir_id))
+            .hir()
+            .attrs(tcx.local_def_id_to_hir_id(def_id))
             .iter()
             .filter(|attr| analyze_attr(attr, &mut state));
 
@@ -1411,7 +1418,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             if let DefKind::Fn | DefKind::AssocFn = def_kind {
                 self.tables.asyncness.set_some(def_id.index, tcx.asyncness(def_id));
                 record_array!(self.tables.fn_arg_names[def_id] <- tcx.fn_arg_names(def_id));
-                self.tables.is_intrinsic.set(def_id.index, tcx.is_intrinsic(def_id));
+            }
+            if let Some(name) = tcx.intrinsic(def_id) {
+                record!(self.tables.intrinsic[def_id] <- name);
             }
             if let DefKind::TyParam = def_kind {
                 let default = self.tcx.object_lifetime_default(def_id);
@@ -1420,6 +1429,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             if let DefKind::Trait = def_kind {
                 record!(self.tables.trait_def[def_id] <- self.tcx.trait_def(def_id));
                 record!(self.tables.super_predicates_of[def_id] <- self.tcx.super_predicates_of(def_id));
+                record!(self.tables.implied_predicates_of[def_id] <- self.tcx.implied_predicates_of(def_id));
 
                 let module_children = self.tcx.module_children_local(local_id);
                 record_array!(self.tables.module_children_non_reexports[def_id] <-
@@ -1447,6 +1457,19 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             {
                 self.tables.coroutine_kind.set(def_id.index, Some(coroutine_kind))
             }
+            if def_kind == DefKind::Closure
+                && tcx.type_of(def_id).skip_binder().is_coroutine_closure()
+            {
+                self.tables
+                    .coroutine_for_closure
+                    .set_some(def_id.index, self.tcx.coroutine_for_closure(def_id).into());
+            }
+            if let DefKind::Static { .. } = def_kind {
+                if !self.tcx.is_foreign_item(def_id) {
+                    let data = self.tcx.eval_static_initializer(def_id).unwrap();
+                    record!(self.tables.eval_static_initializer[def_id] <- data);
+                }
+            }
             if let DefKind::Enum | DefKind::Struct | DefKind::Union = def_kind {
                 self.encode_info_for_adt(local_id);
             }
@@ -1463,6 +1486,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             }
             if let DefKind::OpaqueTy = def_kind {
                 self.encode_explicit_item_bounds(def_id);
+                self.encode_explicit_item_super_predicates(def_id);
                 self.tables
                     .is_type_alias_impl_trait
                     .set(def_id.index, self.tcx.is_type_alias_impl_trait(def_id));
@@ -1571,6 +1595,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         record_defaulted_array!(self.tables.explicit_item_bounds[def_id] <- bounds);
     }
 
+    fn encode_explicit_item_super_predicates(&mut self, def_id: DefId) {
+        debug!("EncodeContext::encode_explicit_item_super_predicates({:?})", def_id);
+        let bounds = self.tcx.explicit_item_super_predicates(def_id).skip_binder();
+        record_defaulted_array!(self.tables.explicit_item_super_predicates[def_id] <- bounds);
+    }
+
     #[instrument(level = "debug", skip(self))]
     fn encode_info_for_assoc_item(&mut self, def_id: DefId) {
         let tcx = self.tcx;
@@ -1583,6 +1613,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             AssocItemContainer::TraitContainer => {
                 if let ty::AssocKind::Type = item.kind {
                     self.encode_explicit_item_bounds(def_id);
+                    self.encode_explicit_item_super_predicates(def_id);
                 }
             }
             AssocItemContainer::ImplContainer => {
@@ -1776,7 +1807,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             let stability = tcx.lookup_stability(CRATE_DEF_ID);
             let macros =
                 self.lazy_array(tcx.resolutions(()).proc_macros.iter().map(|p| p.local_def_index));
-            for (i, span) in self.tcx.sess.parse_sess.proc_macro_quoted_spans() {
+            for (i, span) in self.tcx.sess.psess.proc_macro_quoted_spans() {
                 let span = self.lazy(span);
                 self.tables.proc_macro_quoted_spans.set_some(i, span);
             }
@@ -1962,12 +1993,11 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             let def_id = id.owner_id.to_def_id();
 
             self.tables.defaultness.set_some(def_id.index, tcx.defaultness(def_id));
-            self.tables.impl_polarity.set_some(def_id.index, tcx.impl_polarity(def_id));
 
-            if of_trait && let Some(trait_ref) = tcx.impl_trait_ref(def_id) {
-                record!(self.tables.impl_trait_ref[def_id] <- trait_ref);
+            if of_trait && let Some(header) = tcx.impl_trait_header(def_id) {
+                record!(self.tables.impl_trait_header[def_id] <- header);
 
-                let trait_ref = trait_ref.instantiate_identity();
+                let trait_ref = header.trait_ref.instantiate_identity();
                 let simplified_self_ty = fast_reject::simplify_type(
                     self.tcx,
                     trait_ref.self_ty(),
@@ -2171,7 +2201,7 @@ impl<D: Decoder> Decodable<D> for EncodedMetadata {
         let mmap = if len > 0 {
             let mut mmap = MmapMut::map_anon(len).unwrap();
             for _ in 0..len {
-                (&mut mmap[..]).write(&[d.read_u8()]).unwrap();
+                (&mut mmap[..]).write_all(&[d.read_u8()]).unwrap();
             }
             mmap.flush().unwrap();
             Some(mmap.make_read_only().unwrap())

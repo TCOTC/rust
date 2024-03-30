@@ -107,6 +107,15 @@ jobs:
     - name: Prepare dependencies
       run: ./y.sh prepare
 
+    # The Wine version shipped with Ubuntu 22.04 doesn't implement bcryptprimitives.dll
+    - name: Build bcryptprimitives.dll shim for Wine
+      if: matrix.os == 'ubuntu-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
+      run: |
+        rustup target add x86_64-pc-windows-gnu
+        mkdir wine_shims
+        rustc patches/bcryptprimitives.rs -Copt-level=3 -Clto=fat --out-dir wine_shims --target x86_64-pc-windows-gnu
+        echo "WINEPATH=$(pwd)/wine_shims" >> $GITHUB_ENV
+
     - name: Build
       run: ./y.sh build --sysroot none
 
@@ -233,11 +242,11 @@ jobs:
       if: matrix.os == 'windows-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
       run: rustup set default-host x86_64-pc-windows-gnu
 
-    - name: Install MinGW toolchain and wine
+    - name: Install MinGW toolchain
       if: matrix.os == 'ubuntu-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
       run: |
         sudo apt-get update
-        sudo apt-get install -y gcc-mingw-w64-x86-64 wine-stable
+        sudo apt-get install -y gcc-mingw-w64-x86-64
 
     - name: Prepare dependencies
       run: ./y.sh prepare

@@ -13,7 +13,7 @@ use rustc_data_structures::unhash::UnhashMap;
 use rustc_expand::base::{SyntaxExtension, SyntaxExtensionKind};
 use rustc_expand::proc_macro::{AttrProcMacro, BangProcMacro, DeriveProcMacro};
 use rustc_hir::def::Res;
-use rustc_hir::def_id::{DefIdMap, CRATE_DEF_INDEX, LOCAL_CRATE};
+use rustc_hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_hir::definitions::{DefPath, DefPathData};
 use rustc_hir::diagnostic_items::DiagnosticItems;
 use rustc_index::Idx;
@@ -327,7 +327,7 @@ impl<'a, 'tcx> DecodeContext<'a, 'tcx> {
     }
 
     #[inline]
-    fn read_lazy_offset_then<T>(&mut self, f: impl Fn(NonZeroUsize) -> T) -> T {
+    fn read_lazy_offset_then<T>(&mut self, f: impl Fn(NonZero<usize>) -> T) -> T {
         let distance = self.read_usize();
         let position = match self.lazy_state {
             LazyState::NoNode => bug!("read_lazy_with_meta: outside of a metadata node"),
@@ -338,7 +338,7 @@ impl<'a, 'tcx> DecodeContext<'a, 'tcx> {
             }
             LazyState::Previous(last_pos) => last_pos.get() + distance,
         };
-        let position = NonZeroUsize::new(position).unwrap();
+        let position = NonZero::new(position).unwrap();
         self.lazy_state = LazyState::Previous(position);
         f(position)
     }
@@ -420,7 +420,7 @@ impl<'a, 'tcx> Decodable<DecodeContext<'a, 'tcx>> for ExpnIndex {
 impl<'a, 'tcx> SpanDecoder for DecodeContext<'a, 'tcx> {
     fn decode_attr_id(&mut self) -> rustc_span::AttrId {
         let sess = self.sess.expect("can't decode AttrId without Session");
-        sess.parse_sess.attr_id_generator.mk_attr_id()
+        sess.psess.attr_id_generator.mk_attr_id()
     }
 
     fn decode_crate_num(&mut self) -> CrateNum {
@@ -504,7 +504,11 @@ impl<'a, 'tcx> SpanDecoder for DecodeContext<'a, 'tcx> {
         let data = if tag.kind() == SpanKind::Indirect {
             // Skip past the tag we just peek'd.
             self.read_u8();
-            let offset_or_position = self.read_usize();
+            // indirect tag lengths are safe to access, since they're (0, 8)
+            let bytes_needed = tag.length().unwrap().0 as usize;
+            let mut total = [0u8; usize::BITS as usize / 8];
+            total[..bytes_needed].copy_from_slice(self.read_raw_bytes(bytes_needed));
+            let offset_or_position = usize::from_le_bytes(total);
             let position = if tag.is_relative_offset() {
                 start - offset_or_position
             } else {
@@ -680,20 +684,32 @@ impl<'a, 'tcx, I: Idx, T> Decodable<DecodeContext<'a, 'tcx>> for LazyTable<I, T>
 implement_ty_decoder!(DecodeContext<'a, 'tcx>);
 
 impl MetadataBlob {
-    pub(crate) fn is_compatible(&self) -> bool {
-        self.blob().starts_with(METADATA_HEADER)
+    pub(crate) fn check_compatibility(
+        &self,
+        cfg_version: &'static str,
+    ) -> Result<(), Option<String>> {
+        if !self.blob().starts_with(METADATA_HEADER) {
+            if self.blob().starts_with(b"rust") {
+                return Err(Some("<unknown rustc version>".to_owned()));
+            }
+            return Err(None);
+        }
+
+        let found_version =
+            LazyValue::<String>::from_position(NonZero::new(METADATA_HEADER.len() + 8).unwrap())
+                .decode(self);
+        if rustc_version(cfg_version) != found_version {
+            return Err(Some(found_version));
+        }
+
+        Ok(())
     }
 
-    pub(crate) fn get_rustc_version(&self) -> String {
-        LazyValue::<String>::from_position(NonZeroUsize::new(METADATA_HEADER.len() + 8).unwrap())
-            .decode(self)
-    }
-
-    fn root_pos(&self) -> NonZeroUsize {
+    fn root_pos(&self) -> NonZero<usize> {
         let offset = METADATA_HEADER.len();
         let pos_bytes = self.blob()[offset..][..8].try_into().unwrap();
         let pos = u64::from_le_bytes(pos_bytes);
-        NonZeroUsize::new(pos as usize).unwrap()
+        NonZero::new(pos as usize).unwrap()
     }
 
     pub(crate) fn get_header(&self) -> CrateHeader {
@@ -1047,6 +1063,20 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
         ty::EarlyBinder::bind(&*output)
     }
 
+    fn get_explicit_item_super_predicates(
+        self,
+        index: DefIndex,
+        tcx: TyCtxt<'tcx>,
+    ) -> ty::EarlyBinder<&'tcx [(ty::Clause<'tcx>, Span)]> {
+        let lazy = self.root.tables.explicit_item_super_predicates.get(self, index);
+        let output = if lazy.is_default() {
+            &mut []
+        } else {
+            tcx.arena.alloc_from_iter(lazy.decode((self, tcx)))
+        };
+        ty::EarlyBinder::bind(&*output)
+    }
+
     fn get_variant(
         self,
         kind: DefKind,
@@ -1084,6 +1114,8 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
                 parent_did,
                 false,
                 data.is_non_exhaustive,
+                // FIXME: unnamed fields in crate metadata is unimplemented yet.
+                false,
             ),
         )
     }
@@ -1126,6 +1158,7 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
             adt_kind,
             variants.into_iter().map(|(_, variant)| variant).collect(),
             repr,
+            false,
         )
     }
 
@@ -1571,17 +1604,17 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
             })
         }
 
-        // Translate the virtual `/rustc/$hash` prefix back to a real directory
-        // that should hold actual sources, where possible.
-        //
-        // NOTE: if you update this, you might need to also update bootstrap's code for generating
-        // the `rust-src` component in `Src::run` in `src/bootstrap/dist.rs`.
-        let virtual_rust_source_base_dir = [
-            filter(sess, option_env!("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR").map(Path::new)),
-            filter(sess, sess.opts.unstable_opts.simulate_remapped_rust_src_base.as_deref()),
-        ];
-
         let try_to_translate_virtual_to_real = |name: &mut rustc_span::FileName| {
+            // Translate the virtual `/rustc/$hash` prefix back to a real directory
+            // that should hold actual sources, where possible.
+            //
+            // NOTE: if you update this, you might need to also update bootstrap's code for generating
+            // the `rust-src` component in `Src::run` in `src/bootstrap/dist.rs`.
+            let virtual_rust_source_base_dir = [
+                filter(sess, option_env!("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR").map(Path::new)),
+                filter(sess, sess.opts.unstable_opts.simulate_remapped_rust_src_base.as_deref()),
+            ];
+
             debug!(
                 "try_to_translate_virtual_to_real(name={:?}): \
                  virtual_rust_source_base_dir={:?}, real_rust_source_base_dir={:?}",
@@ -1746,8 +1779,8 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
         self.root.tables.attr_flags.get(self, index)
     }
 
-    fn get_is_intrinsic(self, index: DefIndex) -> bool {
-        self.root.tables.is_intrinsic.get(self, index)
+    fn get_intrinsic(self, index: DefIndex) -> Option<ty::IntrinsicDef> {
+        self.root.tables.intrinsic.get(self, index).map(|d| d.decode(self))
     }
 
     fn get_doc_link_resolutions(self, index: DefIndex) -> DocLinkResMap {

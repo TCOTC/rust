@@ -1,4 +1,4 @@
-// unit-test: DataflowConstProp
+//@ unit-test: DataflowConstProp
 // EMIT_MIR_FOR_EACH_BIT_WIDTH
 
 #![feature(custom_mir, core_intrinsics, rustc_attrs)]
@@ -20,7 +20,7 @@ fn simple() {
     // CHECK: [[e]] = const E::V1(0_i32);
     let e = E::V1(0);
 
-    // CHECK: switchInt(const 0_isize) -> [0: [[target_bb:bb.*]], 1: bb1, otherwise: bb2];
+    // CHECK: switchInt(const 0_isize) -> [0: [[target_bb:bb.*]], 1: bb2, otherwise: bb1];
     // CHECK: [[target_bb]]: {
     // CHECK:     [[x]] = const 0_i32;
     let x = match e { E::V1(x1) => x1, E::V2(x2) => x2 };
@@ -34,9 +34,9 @@ fn constant() {
     // CHECK: debug x => [[x:_.*]];
     const C: E = E::V1(0);
 
-    // CHECK: [[e]] = const _;
+    // CHECK: [[e]] = const constant::C;
     let e = C;
-    // CHECK: switchInt(const 0_isize) -> [0: [[target_bb:bb.*]], 1: bb1, otherwise: bb2];
+    // CHECK: switchInt(const 0_isize) -> [0: [[target_bb:bb.*]], 1: bb2, otherwise: bb1];
     // CHECK: [[target_bb]]: {
     // CHECK:     [[x]] = const 0_i32;
     let x = match e { E::V1(x1) => x1, E::V2(x2) => x2 };
@@ -55,14 +55,14 @@ fn statics() {
 
     // CHECK: [[e1]] = const E::V1(0_i32);
     let e1 = C;
-    // CHECK: switchInt(const 0_isize) -> [0: [[target_bb:bb.*]], 1: bb1, otherwise: bb2];
+    // CHECK: switchInt(const 0_isize) -> [0: [[target_bb:bb.*]], 1: bb2, otherwise: bb1];
     // CHECK: [[target_bb]]: {
     // CHECK:     [[x1]] = const 0_i32;
     let x1 = match e1 { E::V1(x11) => x11, E::V2(x12) => x12 };
 
     static RC: &E = &E::V2(4);
 
-    // CHECK: [[t:_.*]] = const {alloc2: &&E};
+    // CHECK: [[t:_.*]] = const {alloc5: &&E};
     // CHECK: [[e2]] = (*[[t]]);
     let e2 = RC;
 

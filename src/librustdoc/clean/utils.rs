@@ -295,12 +295,16 @@ pub(crate) fn build_deref_target_impls(
         if let Some(prim) = target.primitive_type() {
             let _prof_timer = tcx.sess.prof.generic_activity("build_primitive_inherent_impls");
             for did in prim.impls(tcx).filter(|did| !did.is_local()) {
-                inline::build_impl(cx, did, None, ret);
+                cx.with_param_env(did, |cx| {
+                    inline::build_impl(cx, did, None, ret);
+                });
             }
         } else if let Type::Path { path } = target {
             let did = path.def_id();
             if !did.is_local() {
-                inline::build_impls(cx, did, None, ret);
+                cx.with_param_env(did, |cx| {
+                    inline::build_impls(cx, did, None, ret);
+                });
             }
         }
     }
@@ -325,6 +329,7 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             elts.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(", ")
         ),
         PatKind::Box(p) => return name_from_pat(&*p),
+        PatKind::Deref(p) => format!("deref!({})", name_from_pat(&*p)),
         PatKind::Ref(p, _) => return name_from_pat(&*p),
         PatKind::Lit(..) => {
             warn!(
@@ -522,7 +527,7 @@ pub(crate) fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
             | Mod
             | ForeignTy
             | Const
-            | Static(_)
+            | Static { .. }
             | Macro(..)
             | TraitAlias),
             did,
@@ -594,7 +599,7 @@ pub(crate) fn has_doc_flag(tcx: TyCtxt<'_>, did: DefId, flag: Symbol) -> bool {
 /// Set by `bootstrap::Builder::doc_rust_lang_org_channel` in order to keep tests passing on beta/stable.
 pub(crate) const DOC_RUST_LANG_ORG_CHANNEL: &str = env!("DOC_RUST_LANG_ORG_CHANNEL");
 pub(crate) static DOC_CHANNEL: Lazy<&'static str> =
-    Lazy::new(|| DOC_RUST_LANG_ORG_CHANNEL.rsplit('/').filter(|c| !c.is_empty()).next().unwrap());
+    Lazy::new(|| DOC_RUST_LANG_ORG_CHANNEL.rsplit('/').find(|c| !c.is_empty()).unwrap());
 
 /// Render a sequence of macro arms in a format suitable for displaying to the user
 /// as part of an item declaration.
@@ -621,6 +626,7 @@ pub(super) fn display_macro_source(
     def: &ast::MacroDef,
     def_id: DefId,
     vis: ty::Visibility<DefId>,
+    is_doc_hidden: bool,
 ) -> String {
     // Extract the spans of all matchers. They represent the "interface" of the macro.
     let matchers = def.body.tokens.chunks(4).map(|arm| &arm[0]);
@@ -631,7 +637,7 @@ pub(super) fn display_macro_source(
         if matchers.len() <= 1 {
             format!(
                 "{vis}macro {name}{matchers} {{\n    ...\n}}",
-                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id),
+                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id, is_doc_hidden),
                 matchers = matchers
                     .map(|matcher| render_macro_matcher(cx.tcx, matcher))
                     .collect::<String>(),
@@ -639,7 +645,7 @@ pub(super) fn display_macro_source(
         } else {
             format!(
                 "{vis}macro {name} {{\n{arms}}}",
-                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id),
+                vis = visibility_to_src_with_space(Some(vis), cx.tcx, def_id, is_doc_hidden),
                 arms = render_macro_arms(cx.tcx, matchers, ","),
             )
         }
@@ -660,9 +666,10 @@ pub(crate) fn inherits_doc_hidden(
         def_id = id;
         if tcx.is_doc_hidden(def_id.to_def_id()) {
             return true;
-        } else if let Some(node) = tcx.opt_hir_node_by_def_id(def_id)
-            && matches!(node, hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. }),)
-        {
+        } else if matches!(
+            tcx.hir_node_by_def_id(def_id),
+            hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(_), .. })
+        ) {
             // `impl` blocks stand a bit on their own: unless they have `#[doc(hidden)]` directly
             // on them, they don't inherit it from the parent context.
             return false;

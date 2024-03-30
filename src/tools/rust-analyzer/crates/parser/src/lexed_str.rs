@@ -31,6 +31,7 @@ struct LexError {
 
 impl<'a> LexedStr<'a> {
     pub fn new(text: &'a str) -> LexedStr<'a> {
+        let _p = tracing::span!(tracing::Level::INFO, "LexedStr::new").entered();
         let mut conv = Converter::new(text);
         if let Some(shebang_len) = rustc_lexer::strip_shebang(text) {
             conv.res.push(SHEBANG, conv.offset);
@@ -149,7 +150,7 @@ impl<'a> Converter<'a> {
 
         if let Some(err) = err {
             let token = self.res.len() as u32;
-            let msg = err.to_string();
+            let msg = err.to_owned();
             self.res.error.push(LexError { msg, token });
         }
     }

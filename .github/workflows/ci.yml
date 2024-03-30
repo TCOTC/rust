@@ -58,16 +58,27 @@ jobs:
           - name: mingw-check-tidy
             os: ubuntu-20.04-4core-16gb
             env: {}
-          - name: x86_64-gnu-llvm-16
+          - name: x86_64-gnu-llvm-17
             env:
               ENABLE_GCC_CODEGEN: "1"
             os: ubuntu-20.04-16core-64gb
           - name: x86_64-gnu-tools
             os: ubuntu-20.04-16core-64gb
             env: {}
+    defaults:
+      run:
+        shell: "${{ contains(matrix.os, 'windows') && 'msys2 {0}' || 'bash' }}"
     timeout-minutes: 600
     runs-on: "${{ matrix.os }}"
     steps:
+      - if: "contains(matrix.os, 'windows')"
+        uses: msys2/setup-msys2@v2.22.0
+        with:
+          msystem: "${{ contains(matrix.name, 'i686') && 'mingw32' || 'mingw64' }}"
+          update: false
+          release: true
+          path-type: inherit
+          install: "make dos2unix diffutils\n"
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
       - name: checkout the source code
@@ -155,7 +166,7 @@ jobs:
         run: src/ci/scripts/create-doc-artifacts.sh
         if: success() && !env.SKIP_JOB
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.DOC_ARTIFACT_NAME }}"
           path: obj/artifacts/doc
@@ -222,6 +233,9 @@ jobs:
             os: ubuntu-20.04-8core-32gb
             env: {}
           - name: dist-loongarch64-linux
+            os: ubuntu-20.04-8core-32gb
+            env: {}
+          - name: dist-ohos
             os: ubuntu-20.04-8core-32gb
             env: {}
           - name: dist-powerpc-linux
@@ -301,11 +315,11 @@ jobs:
           - name: x86_64-gnu-distcheck
             os: ubuntu-20.04-8core-32gb
             env: {}
-          - name: x86_64-gnu-llvm-17
+          - name: x86_64-gnu-llvm-18
             env:
               RUST_BACKTRACE: 1
             os: ubuntu-20.04-8core-32gb
-          - name: x86_64-gnu-llvm-16
+          - name: x86_64-gnu-llvm-17
             env:
               RUST_BACKTRACE: 1
             os: ubuntu-20.04-8core-32gb
@@ -319,10 +333,10 @@ jobs:
           - name: dist-x86_64-apple
             env:
               SCRIPT: "./x.py dist bootstrap --include-default-paths --host=x86_64-apple-darwin --target=x86_64-apple-darwin"
-              RUST_CONFIGURE_ARGS: "--enable-full-tools --enable-sanitizers --enable-profiler --set rust.jemalloc --set rust.lto=thin"
+              RUST_CONFIGURE_ARGS: "--enable-full-tools --enable-sanitizers --enable-profiler --set rust.jemalloc --set rust.lto=thin --set rust.codegen-units=1"
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
               MACOSX_DEPLOYMENT_TARGET: 10.12
-              SELECT_XCODE: /Applications/Xcode_13.4.1.app
+              SELECT_XCODE: /Applications/Xcode_14.3.1.app
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
               NO_OVERFLOW_CHECKS: 1
@@ -335,7 +349,7 @@ jobs:
               RUST_CONFIGURE_ARGS: "--enable-sanitizers --enable-profiler --set rust.jemalloc"
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
               MACOSX_DEPLOYMENT_TARGET: 10.12
-              SELECT_XCODE: /Applications/Xcode_13.4.1.app
+              SELECT_XCODE: /Applications/Xcode_14.3.1.app
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
               NO_OVERFLOW_CHECKS: 1
@@ -347,6 +361,7 @@ jobs:
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
               MACOSX_DEPLOYMENT_TARGET: 10.12
               MACOSX_STD_DEPLOYMENT_TARGET: 10.12
+              SELECT_XCODE: /Applications/Xcode_14.3.1.app
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
               NO_OVERFLOW_CHECKS: 1
@@ -358,6 +373,7 @@ jobs:
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
               MACOSX_DEPLOYMENT_TARGET: 10.12
               MACOSX_STD_DEPLOYMENT_TARGET: 10.12
+              SELECT_XCODE: /Applications/Xcode_14.3.1.app
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
               NO_OVERFLOW_CHECKS: 1
@@ -367,7 +383,7 @@ jobs:
               SCRIPT: "./x.py dist bootstrap --include-default-paths --host=aarch64-apple-darwin --target=aarch64-apple-darwin"
               RUST_CONFIGURE_ARGS: "--enable-full-tools --enable-sanitizers --enable-profiler --set rust.jemalloc --set llvm.ninja=false --set rust.lto=thin"
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
-              SELECT_XCODE: /Applications/Xcode_13.4.1.app
+              SELECT_XCODE: /Applications/Xcode_14.3.1.app
               USE_XCODE_CLANG: 1
               MACOSX_DEPLOYMENT_TARGET: 11.0
               MACOSX_STD_DEPLOYMENT_TARGET: 11.0
@@ -381,7 +397,7 @@ jobs:
               SCRIPT: "./x.py --stage 2 test --host=aarch64-apple-darwin --target=aarch64-apple-darwin"
               RUST_CONFIGURE_ARGS: "--enable-sanitizers --enable-profiler --set rust.jemalloc"
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
-              SELECT_XCODE: /Applications/Xcode_13.4.1.app
+              SELECT_XCODE: /Applications/Xcode_14.3.1.app
               USE_XCODE_CLANG: 1
               MACOSX_DEPLOYMENT_TARGET: 11.0
               MACOSX_STD_DEPLOYMENT_TARGET: 11.0
@@ -422,7 +438,7 @@ jobs:
             os: windows-2019-8core-32gb
           - name: dist-x86_64-msvc
             env:
-              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-msvc --host=x86_64-pc-windows-msvc --target=x86_64-pc-windows-msvc --enable-full-tools --enable-profiler"
+              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-msvc --host=x86_64-pc-windows-msvc --target=x86_64-pc-windows-msvc --enable-full-tools --enable-profiler --set rust.codegen-units=1"
               SCRIPT: python x.py build --set rust.debug=true opt-dist && PGO_HOST=x86_64-pc-windows-msvc ./build/x86_64-pc-windows-msvc/stage0-tools-bin/opt-dist windows-ci -- python x.py dist bootstrap --include-default-paths
               DIST_REQUIRE_ALL_TOOLS: 1
             os: windows-2019-8core-32gb
@@ -459,9 +475,20 @@ jobs:
               RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-msvc --enable-extended --enable-profiler"
               SCRIPT: python x.py dist bootstrap --include-default-paths
             os: windows-2019-8core-32gb
+    defaults:
+      run:
+        shell: "${{ contains(matrix.os, 'windows') && 'msys2 {0}' || 'bash' }}"
     timeout-minutes: 600
     runs-on: "${{ matrix.os }}"
     steps:
+      - if: "contains(matrix.os, 'windows')"
+        uses: msys2/setup-msys2@v2.22.0
+        with:
+          msystem: "${{ contains(matrix.name, 'i686') && 'mingw32' || 'mingw64' }}"
+          update: false
+          release: true
+          path-type: inherit
+          install: "make dos2unix diffutils\n"
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
       - name: checkout the source code
@@ -549,7 +576,7 @@ jobs:
         run: src/ci/scripts/create-doc-artifacts.sh
         if: success() && !env.SKIP_JOB
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.DOC_ARTIFACT_NAME }}"
           path: obj/artifacts/doc
@@ -587,9 +614,20 @@ jobs:
             env:
               CODEGEN_BACKENDS: "llvm,cranelift"
             os: ubuntu-20.04-16core-64gb
+    defaults:
+      run:
+        shell: "${{ contains(matrix.os, 'windows') && 'msys2 {0}' || 'bash' }}"
     timeout-minutes: 600
     runs-on: "${{ matrix.os }}"
     steps:
+      - if: "contains(matrix.os, 'windows')"
+        uses: msys2/setup-msys2@v2.22.0
+        with:
+          msystem: "${{ contains(matrix.name, 'i686') && 'mingw32' || 'mingw64' }}"
+          update: false
+          release: true
+          path-type: inherit
+          install: "make dos2unix diffutils\n"
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
       - name: checkout the source code
@@ -677,7 +715,7 @@ jobs:
         run: src/ci/scripts/create-doc-artifacts.sh
         if: success() && !env.SKIP_JOB
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.DOC_ARTIFACT_NAME }}"
           path: obj/artifacts/doc

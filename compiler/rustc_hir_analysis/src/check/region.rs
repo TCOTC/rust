@@ -6,17 +6,16 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/borrow_check.html
 
-use rustc_ast::walk_list;
+use rustc_ast::visit::walk_list;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{Arm, Block, Expr, Local, Pat, PatKind, Stmt};
+use rustc_hir::{Arm, Block, Expr, LetStmt, Pat, PatKind, Stmt};
 use rustc_index::Idx;
 use rustc_middle::middle::region::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::source_map;
-use rustc_span::Span;
 
 use super::errs::{maybe_expr_static_mut, maybe_stmt_static_mut};
 
@@ -72,11 +71,7 @@ struct RegionResolutionVisitor<'tcx> {
 }
 
 /// Records the lifetime of a local variable as `cx.var_parent`
-fn record_var_lifetime(
-    visitor: &mut RegionResolutionVisitor<'_>,
-    var_id: hir::ItemLocalId,
-    _sp: Span,
-) {
+fn record_var_lifetime(visitor: &mut RegionResolutionVisitor<'_>, var_id: hir::ItemLocalId) {
     match visitor.cx.var_parent {
         None => {
             // this can happen in extern fn declarations like
@@ -128,7 +123,7 @@ fn resolve_block<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, blk: &'tcx h
 
         for (i, statement) in blk.stmts.iter().enumerate() {
             match statement.kind {
-                hir::StmtKind::Local(hir::Local { els: Some(els), .. }) => {
+                hir::StmtKind::Let(LetStmt { els: Some(els), .. }) => {
                     // Let-else has a special lexical structure for variables.
                     // First we take a checkpoint of the current scope context here.
                     let mut prev_cx = visitor.cx;
@@ -151,7 +146,7 @@ fn resolve_block<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, blk: &'tcx h
                     // From now on, we continue normally.
                     visitor.cx = prev_cx;
                 }
-                hir::StmtKind::Local(..) => {
+                hir::StmtKind::Let(..) => {
                     // Each declaration introduces a subscope for bindings
                     // introduced by the declaration; this subscope covers a
                     // suffix of the block. Each subscope in a block has the
@@ -210,7 +205,7 @@ fn resolve_pat<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, pat: &'tcx hir
 
     // If this is a binding then record the lifetime of that binding.
     if let PatKind::Binding(..) = pat.kind {
-        record_var_lifetime(visitor, pat.hir_id.local_id, pat.span);
+        record_var_lifetime(visitor, pat.hir_id.local_id);
     }
 
     debug!("resolve_pat - pre-increment {} pat = {:?}", visitor.expr_and_pat_count, pat);
@@ -659,7 +654,7 @@ fn resolve_local<'tcx>(
         // & expression, and its lifetime would be extended to the end of the block (due
         // to a different rule, not the below code).
         match pat.kind {
-            PatKind::Binding(hir::BindingAnnotation(hir::ByRef::Yes, _), ..) => true,
+            PatKind::Binding(hir::BindingAnnotation(hir::ByRef::Yes(_), _), ..) => true,
 
             PatKind::Struct(_, field_pats, _) => field_pats.iter().any(|fp| is_binding_pat(fp.pat)),
 
@@ -673,7 +668,7 @@ fn resolve_local<'tcx>(
             | PatKind::TupleStruct(_, subpats, _)
             | PatKind::Tuple(subpats, _) => subpats.iter().any(|p| is_binding_pat(p)),
 
-            PatKind::Box(subpat) => is_binding_pat(subpat),
+            PatKind::Box(subpat) | PatKind::Deref(subpat) => is_binding_pat(subpat),
 
             PatKind::Ref(_, _)
             | PatKind::Binding(hir::BindingAnnotation(hir::ByRef::No, _), ..)
@@ -765,7 +760,7 @@ impl<'tcx> RegionResolutionVisitor<'tcx> {
 
     fn enter_node_scope_with_dtor(&mut self, id: hir::ItemLocalId) {
         // If node was previously marked as a terminating scope during the
-        // recursive visit of its parent node in the AST, then we need to
+        // recursive visit of its parent node in the HIR, then we need to
         // account for the destruction scope representing the scope of
         // the destructors that run immediately after it completes.
         if self.terminating_scopes.contains(&id) {
@@ -860,7 +855,7 @@ impl<'tcx> Visitor<'tcx> for RegionResolutionVisitor<'tcx> {
     fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
         resolve_expr(self, ex);
     }
-    fn visit_local(&mut self, l: &'tcx Local<'tcx>) {
+    fn visit_local(&mut self, l: &'tcx LetStmt<'tcx>) {
         resolve_local(self, Some(l.pat), l.init)
     }
 }

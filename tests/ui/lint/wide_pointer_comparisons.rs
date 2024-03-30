@@ -1,4 +1,4 @@
-// check-pass
+//@ check-pass
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -37,6 +37,18 @@ fn main() {
     //~^ WARN ambiguous wide pointer comparison
     let _ = a.ne(&b);
     //~^ WARN ambiguous wide pointer comparison
+    let _ = a.cmp(&b);
+    //~^ WARN ambiguous wide pointer comparison
+    let _ = a.partial_cmp(&b);
+    //~^ WARN ambiguous wide pointer comparison
+    let _ = a.le(&b);
+    //~^ WARN ambiguous wide pointer comparison
+    let _ = a.lt(&b);
+    //~^ WARN ambiguous wide pointer comparison
+    let _ = a.ge(&b);
+    //~^ WARN ambiguous wide pointer comparison
+    let _ = a.gt(&b);
+    //~^ WARN ambiguous wide pointer comparison
 
     {
         // &*const ?Sized
@@ -67,6 +79,18 @@ fn main() {
         let _ = a.eq(b);
         //~^ WARN ambiguous wide pointer comparison
         let _ = a.ne(b);
+        //~^ WARN ambiguous wide pointer comparison
+        let _ = a.cmp(&b);
+        //~^ WARN ambiguous wide pointer comparison
+        let _ = a.partial_cmp(&b);
+        //~^ WARN ambiguous wide pointer comparison
+        let _ = a.le(&b);
+        //~^ WARN ambiguous wide pointer comparison
+        let _ = a.lt(&b);
+        //~^ WARN ambiguous wide pointer comparison
+        let _ = a.ge(&b);
+        //~^ WARN ambiguous wide pointer comparison
+        let _ = a.gt(&b);
         //~^ WARN ambiguous wide pointer comparison
     }
 
@@ -110,10 +134,12 @@ fn main() {
     {
         macro_rules! cmp {
             ($a:tt, $b:tt) => { $a == $b }
-            //~^ WARN ambiguous wide pointer comparison
         }
 
+        // FIXME: This lint uses some custom span combination logic.
+        // Rewrite it to adapt to the new metavariable span rules.
         cmp!(a, b);
+        //~^ WARN ambiguous wide pointer comparison
     }
 
     {

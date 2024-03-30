@@ -1,5 +1,5 @@
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
-// unit-test: GVN
+//@ unit-test: GVN
 
 #[inline(never)]
 fn read(_: usize) { }
@@ -7,7 +7,7 @@ fn read(_: usize) { }
 // EMIT_MIR pointer_expose_address.main.GVN.diff
 fn main() {
     // CHECK-LABEL: fn main(
-    // CHECK: [[ptr:_.*]] = const _;
+    // CHECK: [[ptr:_.*]] = const main::FOO;
     // CHECK: [[ref:_.*]] = &raw const (*[[ptr]]);
     // CHECK: [[x:_.*]] = move [[ref]] as usize (PointerExposeAddress);
     // CHECK: = read([[x]])

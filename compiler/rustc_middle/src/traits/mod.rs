@@ -12,11 +12,11 @@ pub mod util;
 use crate::infer::canonical::Canonical;
 use crate::mir::ConstraintCategory;
 use crate::ty::abstract_const::NotConstEvaluatable;
-use crate::ty::GenericArgsRef;
 use crate::ty::{self, AdtKind, Ty};
+use crate::ty::{GenericArgsRef, TyCtxt};
 
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Applicability, Diagnostic};
+use rustc_errors::{Applicability, Diag, EmissionGuarantee};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_span::def_id::{LocalDefId, CRATE_DEF_ID};
@@ -569,10 +569,10 @@ pub struct MatchExpressionArmCause<'tcx> {
     pub prior_arm_ty: Ty<'tcx>,
     pub prior_arm_span: Span,
     pub scrut_span: Span,
-    pub scrut_hir_id: hir::HirId,
     pub source: hir::MatchSource,
-    pub prior_arms: Vec<Span>,
-    pub opt_suggest_box_span: Option<Span>,
+    pub prior_non_diverging_arms: Vec<Span>,
+    // Is the expectation of this match expression an RPIT?
+    pub tail_defines_return_position_impl_trait: Option<LocalDefId>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -583,7 +583,8 @@ pub struct IfExpressionCause<'tcx> {
     pub then_ty: Ty<'tcx>,
     pub else_ty: Ty<'tcx>,
     pub outer_span: Option<Span>,
-    pub opt_suggest_box_span: Option<Span>,
+    // Is the expectation of this match expression an RPIT?
+    pub tail_defines_return_position_impl_trait: Option<LocalDefId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
@@ -619,6 +620,7 @@ pub enum SelectionError<'tcx> {
     OpaqueTypeAutoTraitLeakageUnknown(DefId),
 }
 
+// FIXME(@lcnr): The `Binder` here should be unnecessary. Just use `TraitRef` instead.
 #[derive(Clone, Debug, TypeVisitable)]
 pub struct SignatureMismatchData<'tcx> {
     pub found_trait_ref: ty::PolyTraitRef<'tcx>,
@@ -721,7 +723,7 @@ impl<'tcx, N> ImplSource<'tcx, N> {
 }
 
 /// Identifies a particular impl in the source, along with a set of
-/// substitutions from the impl's type/lifetime parameters. The
+/// generic parameters from the impl's type/lifetime parameters. The
 /// `nested` vector corresponds to the nested obligations attached to
 /// the impl's type parameters.
 ///
@@ -909,7 +911,7 @@ pub enum ObjectSafetyViolationSolution {
 }
 
 impl ObjectSafetyViolationSolution {
-    pub fn add_to(self, err: &mut Diagnostic) {
+    pub fn add_to<G: EmissionGuarantee>(self, err: &mut Diag<'_, G>) {
         match self {
             ObjectSafetyViolationSolution::None => {}
             ObjectSafetyViolationSolution::AddSelfOrMakeSized {
@@ -1002,10 +1004,14 @@ pub enum CodegenObligationError {
 /// opaques are replaced with inference vars eagerly in the old solver (e.g.
 /// in projection, and in the signature during function type-checking).
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
-pub enum DefiningAnchor {
-    /// Define opaques which are in-scope of the `LocalDefId`. Also, eagerly
-    /// replace opaque types in `replace_opaque_types_with_inference_vars`.
-    Bind(LocalDefId),
+pub enum DefiningAnchor<'tcx> {
+    /// Define opaques which are in-scope of the current item being analyzed.
+    /// Also, eagerly replace these opaque types in `replace_opaque_types_with_inference_vars`.
+    ///
+    /// If the list is empty, do not allow any opaques to be defined. This is used to catch type mismatch
+    /// errors when handling opaque types, and also should be used when we would
+    /// otherwise reveal opaques (such as [`Reveal::All`] reveal mode).
+    Bind(&'tcx ty::List<LocalDefId>),
     /// In contexts where we don't currently know what opaques are allowed to be
     /// defined, such as (old solver) canonical queries, we will simply allow
     /// opaques to be defined, but "bubble" them up in the canonical response or
@@ -1014,8 +1020,10 @@ pub enum DefiningAnchor {
     /// We do not eagerly replace opaque types in `replace_opaque_types_with_inference_vars`,
     /// which may affect what predicates pass and fail in the old trait solver.
     Bubble,
-    /// Do not allow any opaques to be defined. This is used to catch type mismatch
-    /// errors when handling opaque types, and also should be used when we would
-    /// otherwise reveal opaques (such as [`Reveal::All`] reveal mode).
-    Error,
+}
+
+impl<'tcx> DefiningAnchor<'tcx> {
+    pub fn bind(tcx: TyCtxt<'tcx>, item: LocalDefId) -> Self {
+        Self::Bind(tcx.opaque_types_defined_by(item))
+    }
 }

@@ -21,8 +21,8 @@ use rustc_span::symbol::{sym, Symbol};
 use rustc_target::abi::Size;
 
 use super::{
-    util::ensure_monomorphic_enough, CheckInAllocMsg, ImmTy, InterpCx, Machine, OpTy, PlaceTy,
-    Pointer,
+    memory::MemoryKind, util::ensure_monomorphic_enough, CheckInAllocMsg, ImmTy, InterpCx,
+    MPlaceTy, Machine, OpTy, Pointer,
 };
 
 use crate::fluent_generated as fluent;
@@ -79,7 +79,7 @@ pub(crate) fn eval_nullary_intrinsic<'tcx>(
             | ty::Str
             | ty::Array(_, _)
             | ty::Slice(_)
-            | ty::RawPtr(_)
+            | ty::RawPtr(_, _)
             | ty::Ref(_, _, _)
             | ty::FnDef(_, _)
             | ty::FnPtr(_)
@@ -104,7 +104,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx, M::Provenance>],
-        dest: &PlaceTy<'tcx, M::Provenance>,
+        dest: &MPlaceTy<'tcx, M::Provenance>,
         ret: Option<mir::BasicBlock>,
     ) -> InterpResult<'tcx, bool> {
         let instance_args = instance.args;
@@ -120,7 +120,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let val = self.tcx.span_as_caller_location(span);
                 let val =
                     self.const_val_to_op(val, self.tcx.caller_location_ty(), Some(dest.layout))?;
-                self.copy_op(&val, dest, /* allow_transmute */ false)?;
+                self.copy_op(&val, dest)?;
             }
 
             sym::min_align_of_val | sym::size_of_val => {
@@ -153,11 +153,10 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     sym::type_name => Ty::new_static_str(self.tcx.tcx),
                     _ => bug!(),
                 };
-                let val = self.ctfe_query(|tcx| {
-                    tcx.const_eval_global_id(self.param_env, gid, Some(tcx.span))
-                })?;
+                let val =
+                    self.ctfe_query(|tcx| tcx.const_eval_global_id(self.param_env, gid, tcx.span))?;
                 let val = self.const_val_to_op(val, ty, Some(dest.layout))?;
-                self.copy_op(&val, dest, /*allow_transmute*/ false)?;
+                self.copy_op(&val, dest)?;
             }
 
             sym::ctpop
@@ -377,12 +376,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let index = u64::from(self.read_scalar(&args[1])?.to_u32()?);
                 let elem = &args[2];
                 let (input, input_len) = self.operand_to_simd(&args[0])?;
-                let (dest, dest_len) = self.place_to_simd(dest)?;
+                let (dest, dest_len) = self.mplace_to_simd(dest)?;
                 assert_eq!(input_len, dest_len, "Return vector length must match input length");
-                assert!(
-                    index < dest_len,
-                    "Index `{index}` must be in bounds of vector with length {dest_len}"
-                );
+                // Bounds are not checked by typeck so we have to do it ourselves.
+                if index >= input_len {
+                    throw_ub_format!(
+                        "`simd_insert` index {index} is out-of-bounds of vector with length {input_len}"
+                    );
+                }
 
                 for i in 0..dest_len {
                     let place = self.project_index(&dest, i)?;
@@ -391,29 +392,30 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     } else {
                         self.project_index(&input, i)?.into()
                     };
-                    self.copy_op(&value, &place, /*allow_transmute*/ false)?;
+                    self.copy_op(&value, &place)?;
                 }
             }
             sym::simd_extract => {
                 let index = u64::from(self.read_scalar(&args[1])?.to_u32()?);
                 let (input, input_len) = self.operand_to_simd(&args[0])?;
-                assert!(
-                    index < input_len,
-                    "index `{index}` must be in bounds of vector with length {input_len}"
-                );
-                self.copy_op(
-                    &self.project_index(&input, index)?,
-                    dest,
-                    /*allow_transmute*/ false,
-                )?;
+                // Bounds are not checked by typeck so we have to do it ourselves.
+                if index >= input_len {
+                    throw_ub_format!(
+                        "`simd_extract` index {index} is out-of-bounds of vector with length {input_len}"
+                    );
+                }
+                self.copy_op(&self.project_index(&input, index)?, dest)?;
             }
             sym::likely | sym::unlikely | sym::black_box => {
                 // These just return their argument
-                self.copy_op(&args[0], dest, /*allow_transmute*/ false)?;
+                self.copy_op(&args[0], dest)?;
             }
             sym::raw_eq => {
                 let result = self.raw_eq_intrinsic(&args[0], &args[1])?;
                 self.write_scalar(result, dest)?;
+            }
+            sym::typed_swap => {
+                self.typed_swap_intrinsic(&args[0], &args[1])?;
             }
 
             sym::vtable_size => {
@@ -430,7 +432,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             _ => return Ok(false),
         }
 
-        trace!("{:?}", self.dump_place(dest));
+        trace!("{:?}", self.dump_place(&dest.clone().into()));
         self.go_to_block(ret);
         Ok(true)
     }
@@ -488,7 +490,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         &mut self,
         a: &ImmTy<'tcx, M::Provenance>,
         b: &ImmTy<'tcx, M::Provenance>,
-        dest: &PlaceTy<'tcx, M::Provenance>,
+        dest: &MPlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
         assert_eq!(a.layout.ty, b.layout.ty);
         assert!(matches!(a.layout.ty.kind(), ty::Int(..) | ty::Uint(..)));
@@ -506,7 +508,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             )
         }
         // `Rem` says this is all right, so we can let `Div` do its job.
-        self.binop_ignore_overflow(BinOp::Div, a, b, dest)
+        self.binop_ignore_overflow(BinOp::Div, a, b, &dest.clone().into())
     }
 
     pub fn saturating_arith(
@@ -606,6 +608,24 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         self.check_ptr_align(dst, align)?;
 
         self.mem_copy(src, dst, size, nonoverlapping)
+    }
+
+    /// Does a *typed* swap of `*left` and `*right`.
+    fn typed_swap_intrinsic(
+        &mut self,
+        left: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        right: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+    ) -> InterpResult<'tcx> {
+        let left = self.deref_pointer(left)?;
+        let right = self.deref_pointer(right)?;
+        debug_assert_eq!(left.layout, right.layout);
+        let kind = MemoryKind::Stack;
+        let temp = self.allocate(left.layout, kind)?;
+        self.copy_op(&left, &temp)?;
+        self.copy_op(&right, &left)?;
+        self.copy_op(&temp, &right)?;
+        self.deallocate_ptr(temp.ptr(), None, kind)?;
+        Ok(())
     }
 
     pub(crate) fn write_bytes_intrinsic(

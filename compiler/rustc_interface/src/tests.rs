@@ -4,23 +4,24 @@ use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::{emitter::HumanReadableErrorType, registry, ColorConfig};
 use rustc_session::config::{
     build_configuration, build_session_options, rustc_optgroups, BranchProtection, CFGuard, Cfg,
-    CollapseMacroDebuginfo, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry,
-    ExternLocation, Externs, FunctionReturn, InliningThreshold, Input, InstrumentCoverage,
-    InstrumentXRay, LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli, NextSolverConfig,
-    OomStrategy, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes, Polonius,
-    ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion, WasiExecModel,
+    CollapseMacroDebuginfo, CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType,
+    ExternEntry, ExternLocation, Externs, FunctionReturn, InliningThreshold, Input,
+    InstrumentCoverage, InstrumentXRay, LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli,
+    NextSolverConfig, OomStrategy, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet,
+    Passes, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
+    WasiExecModel,
 };
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
-use rustc_session::{build_session, getopts, CompilerIO, EarlyDiagCtxt, Session};
+use rustc_session::{build_session, filesearch, getopts, CompilerIO, EarlyDiagCtxt, Session};
 use rustc_span::edition::{Edition, DEFAULT_EDITION};
 use rustc_span::symbol::sym;
 use rustc_span::{FileName, SourceFileHashAlgorithm};
 use rustc_target::spec::{CodeModel, LinkerFlavorCli, MergeFunctions, PanicStrategy, RelocModel};
 use rustc_target::spec::{RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel};
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,6 +38,11 @@ fn mk_session(matches: getopts::Matches) -> (Session, Cfg) {
         output_file: None,
         temps_dir,
     };
+
+    let sysroot = filesearch::materialize_sysroot(sessopts.maybe_sysroot.clone());
+
+    let target = rustc_session::config::build_target_config(&early_dcx, &sessopts, &sysroot);
+
     let sess = build_session(
         early_dcx,
         sessopts,
@@ -46,7 +52,8 @@ fn mk_session(matches: getopts::Matches) -> (Session, Cfg) {
         vec![],
         Default::default(),
         None,
-        None,
+        target,
+        sysroot,
         "",
         None,
         Arc::default(),
@@ -308,30 +315,39 @@ fn test_search_paths_tracking_hash_different_order() {
         json_rendered: HumanReadableErrorType::Default(ColorConfig::Never),
     };
 
+    let push = |opts: &mut Options, search_path| {
+        opts.search_paths.push(SearchPath::from_cli_opt(
+            "not-a-sysroot".as_ref(),
+            &opts.target_triple,
+            &early_dcx,
+            search_path,
+        ));
+    };
+
     // Reference
-    v1.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "native=abc"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "crate=def"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "dependency=ghi"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "framework=jkl"));
-    v1.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "all=mno"));
+    push(&mut v1, "native=abc");
+    push(&mut v1, "crate=def");
+    push(&mut v1, "dependency=ghi");
+    push(&mut v1, "framework=jkl");
+    push(&mut v1, "all=mno");
 
-    v2.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "native=abc"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "dependency=ghi"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "crate=def"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "framework=jkl"));
-    v2.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "all=mno"));
+    push(&mut v2, "native=abc");
+    push(&mut v2, "dependency=ghi");
+    push(&mut v2, "crate=def");
+    push(&mut v2, "framework=jkl");
+    push(&mut v2, "all=mno");
 
-    v3.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "crate=def"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "framework=jkl"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "native=abc"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "dependency=ghi"));
-    v3.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "all=mno"));
+    push(&mut v3, "crate=def");
+    push(&mut v3, "framework=jkl");
+    push(&mut v3, "native=abc");
+    push(&mut v3, "dependency=ghi");
+    push(&mut v3, "all=mno");
 
-    v4.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "all=mno"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "native=abc"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "crate=def"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "dependency=ghi"));
-    v4.search_paths.push(SearchPath::from_cli_opt(&early_dcx, "framework=jkl"));
+    push(&mut v4, "all=mno");
+    push(&mut v4, "native=abc");
+    push(&mut v4, "crate=def");
+    push(&mut v4, "dependency=ghi");
+    push(&mut v4, "framework=jkl");
 
     assert_same_hash(&v1, &v2);
     assert_same_hash(&v1, &v3);
@@ -590,7 +606,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(force_frame_pointers, Some(false));
     tracked!(force_unwind_tables, Some(true));
     tracked!(inline_threshold, Some(0xf007ba11));
-    tracked!(instrument_coverage, InstrumentCoverage::All);
+    tracked!(instrument_coverage, InstrumentCoverage::Yes);
     tracked!(link_dead_code, Some(true));
     tracked!(linker_plugin_lto, LinkerPluginLto::LinkerPluginAuto);
     tracked!(llvm_args, vec![String::from("1"), String::from("2")]);
@@ -685,7 +701,7 @@ fn test_unstable_options_tracking_hash() {
     untracked!(nll_facts, true);
     untracked!(no_analysis, true);
     untracked!(no_leak_check, true);
-    untracked!(no_parallel_llvm, true);
+    untracked!(no_parallel_backend, true);
     untracked!(parse_only, true);
     // `pre_link_arg` is omitted because it just forwards to `pre_link_args`.
     untracked!(pre_link_args, vec![String::from("abc"), String::from("def")]);
@@ -743,6 +759,7 @@ fn test_unstable_options_tracking_hash() {
     );
     tracked!(codegen_backend, Some("abc".to_string()));
     tracked!(collapse_macro_debuginfo, CollapseMacroDebuginfo::Yes);
+    tracked!(coverage_options, CoverageOptions { branch: true });
     tracked!(crate_attr, vec!["abc".to_string()]);
     tracked!(cross_crate_inline_threshold, InliningThreshold::Always);
     tracked!(debug_info_for_profiling, true);
@@ -811,6 +828,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(sanitizer_cfi_canonical_jump_tables, None);
     tracked!(sanitizer_cfi_generalize_pointers, Some(true));
     tracked!(sanitizer_cfi_normalize_integers, Some(true));
+    tracked!(sanitizer_dataflow_abilist, vec![String::from("/rustc/abc")]);
     tracked!(sanitizer_memory_track_origins, 2);
     tracked!(sanitizer_recover, SanitizerSet::ADDRESS);
     tracked!(saturating_float_casts, Some(true));
@@ -827,7 +845,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(tls_model, Some(TlsModel::GeneralDynamic));
     tracked!(translate_remapped_path_to_local_path, false);
     tracked!(trap_unreachable, Some(false));
-    tracked!(treat_err_as_bug, NonZeroUsize::new(1));
+    tracked!(treat_err_as_bug, NonZero::new(1));
     tracked!(tune_cpu, Some(String::from("abc")));
     tracked!(uninit_const_chunk_threshold, 123);
     tracked!(unleash_the_miri_inside_of_you, true);

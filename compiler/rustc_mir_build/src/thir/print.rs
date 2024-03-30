@@ -635,9 +635,8 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                 self.print_pat(subpattern, depth_lvl + 3);
                 print_indented!(self, "}", depth_lvl + 1);
             }
-            PatKind::Binding { mutability, name, mode, var, ty, subpattern, is_primary } => {
+            PatKind::Binding { name, mode, var, ty, subpattern, is_primary } => {
                 print_indented!(self, "Binding {", depth_lvl + 1);
-                print_indented!(self, format!("mutability: {:?}", mutability), depth_lvl + 2);
                 print_indented!(self, format!("name: {:?}", name), depth_lvl + 2);
                 print_indented!(self, format!("mode: {:?}", mode), depth_lvl + 2);
                 print_indented!(self, format!("var: {:?}", var), depth_lvl + 2);
@@ -684,6 +683,12 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
             }
             PatKind::Deref { subpattern } => {
                 print_indented!(self, "Deref { ", depth_lvl + 1);
+                print_indented!(self, "subpattern:", depth_lvl + 2);
+                self.print_pat(subpattern, depth_lvl + 2);
+                print_indented!(self, "}", depth_lvl + 1);
+            }
+            PatKind::DerefPattern { subpattern } => {
+                print_indented!(self, "DerefPattern { ", depth_lvl + 1);
                 print_indented!(self, "subpattern:", depth_lvl + 2);
                 self.print_pat(subpattern, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl + 1);
@@ -887,6 +892,12 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
             InlineAsmOperand::SymStatic { def_id } => {
                 print_indented!(self, "InlineAsmOperand::SymStatic {", depth_lvl);
                 print_indented!(self, format!("def_id: {:?}", def_id), depth_lvl + 1);
+                print_indented!(self, "}", depth_lvl + 1);
+            }
+            InlineAsmOperand::Label { block } => {
+                print_indented!(self, "InlineAsmOperand::Block {", depth_lvl);
+                print_indented!(self, "block:", depth_lvl + 1);
+                self.print_block(*block, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl + 1);
             }
         }

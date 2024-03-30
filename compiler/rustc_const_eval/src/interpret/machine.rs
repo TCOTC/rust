@@ -196,7 +196,7 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         instance: ty::Instance<'tcx>,
         abi: CallAbi,
         args: &[FnArg<'tcx, Self::Provenance>],
-        destination: &PlaceTy<'tcx, Self::Provenance>,
+        destination: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>>;
@@ -208,7 +208,7 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         fn_val: Self::ExtraFnVal,
         abi: CallAbi,
         args: &[FnArg<'tcx, Self::Provenance>],
-        destination: &PlaceTy<'tcx, Self::Provenance>,
+        destination: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx>;
@@ -219,7 +219,7 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx, Self::Provenance>],
-        destination: &PlaceTy<'tcx, Self::Provenance>,
+        destination: &MPlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx>;
@@ -258,24 +258,6 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
     ) -> F2 {
         // By default we always return the preferred NaN.
         F2::NAN
-    }
-
-    /// Called before writing the specified `local` of the `frame`.
-    /// Since writing a ZST is not actually accessing memory or locals, this is never invoked
-    /// for ZST reads.
-    ///
-    /// Due to borrow checker trouble, we indicate the `frame` as an index rather than an `&mut
-    /// Frame`.
-    #[inline(always)]
-    fn before_access_local_mut<'a>(
-        _ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
-        _frame: usize,
-        _local: mir::Local,
-    ) -> InterpResult<'tcx>
-    where
-        'tcx: 'mir,
-    {
-        Ok(())
     }
 
     /// Called before a basic block terminator is executed.
@@ -374,20 +356,30 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         kind: Option<MemoryKind<Self::MemoryKind>>,
     ) -> InterpResult<'tcx, Cow<'b, Allocation<Self::Provenance, Self::AllocExtra, Self::Bytes>>>;
 
+    /// Evaluate the inline assembly.
+    ///
+    /// This should take care of jumping to the next block (one of `targets`) when asm goto
+    /// is triggered, `targets[0]` when the assembly falls through, or diverge in case of
+    /// `InlineAsmOptions::NORETURN` being set.
     fn eval_inline_asm(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
         _template: &'tcx [InlineAsmTemplatePiece],
         _operands: &[mir::InlineAsmOperand<'tcx>],
         _options: InlineAsmOptions,
+        _targets: &[mir::BasicBlock],
     ) -> InterpResult<'tcx> {
         throw_unsup_format!("inline assembly is not supported")
     }
 
     /// Hook for performing extra checks on a memory read access.
     ///
+    /// This will *not* be called during validation!
+    ///
     /// Takes read-only access to the allocation so we can keep all the memory read
     /// operations take `&self`. Use a `RefCell` in `AllocExtra` if you
     /// need to mutate.
+    ///
+    /// This is not invoked for ZST accesses, as no read actually happens.
     #[inline(always)]
     fn before_memory_read(
         _tcx: TyCtxtAt<'tcx>,
@@ -399,7 +391,22 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         Ok(())
     }
 
+    /// Hook for performing extra checks on any memory read access,
+    /// that involves an allocation, even ZST reads.
+    ///
+    /// This will *not* be called during validation!
+    ///
+    /// Used to prevent statics from self-initializing by reading from their own memory
+    /// as it is being initialized.
+    fn before_alloc_read(
+        _ecx: &InterpCx<'mir, 'tcx, Self>,
+        _alloc_id: AllocId,
+    ) -> InterpResult<'tcx> {
+        Ok(())
+    }
+
     /// Hook for performing extra checks on a memory write access.
+    /// This is not invoked for ZST accesses, as no write actually happens.
     #[inline(always)]
     fn before_memory_write(
         _tcx: TyCtxtAt<'tcx>,
@@ -418,7 +425,8 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         _machine: &mut Self,
         _alloc_extra: &mut Self::AllocExtra,
         _prov: (AllocId, Self::ProvenanceExtra),
-        _range: AllocRange,
+        _size: Size,
+        _align: Align,
     ) -> InterpResult<'tcx> {
         Ok(())
     }
@@ -451,11 +459,11 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
     /// argument/return value was actually copied or passed in-place..
     fn protect_in_place_function_argument(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        place: &PlaceTy<'tcx, Self::Provenance>,
+        mplace: &MPlaceTy<'tcx, Self::Provenance>,
     ) -> InterpResult<'tcx> {
         // Without an aliasing model, all we can do is put `Uninit` into the place.
         // Conveniently this also ensures that the place actually points to suitable memory.
-        ecx.write_uninit(place)
+        ecx.write_uninit(mplace)
     }
 
     /// Called immediately before a new stack frame gets pushed.
@@ -505,7 +513,6 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
     #[inline(always)]
     fn after_local_allocated(
         _ecx: &mut InterpCx<'mir, 'tcx, Self>,
-        _frame: usize,
         _local: mir::Local,
         _mplace: &MPlaceTy<'tcx, Self::Provenance>,
     ) -> InterpResult<'tcx> {
@@ -518,7 +525,7 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
     fn eval_mir_constant<F>(
         ecx: &InterpCx<'mir, 'tcx, Self>,
         val: mir::Const<'tcx>,
-        span: Option<Span>,
+        span: Span,
         layout: Option<TyAndLayout<'tcx>>,
         eval: F,
     ) -> InterpResult<'tcx, OpTy<'tcx, Self::Provenance>>
@@ -526,7 +533,7 @@ pub trait Machine<'mir, 'tcx: 'mir>: Sized {
         F: Fn(
             &InterpCx<'mir, 'tcx, Self>,
             mir::Const<'tcx>,
-            Option<Span>,
+            Span,
             Option<TyAndLayout<'tcx>>,
         ) -> InterpResult<'tcx, OpTy<'tcx, Self::Provenance>>,
     {
@@ -569,7 +576,7 @@ pub macro compile_time_machine(<$mir: lifetime, $tcx: lifetime>) {
         fn_val: !,
         _abi: CallAbi,
         _args: &[FnArg<$tcx>],
-        _destination: &PlaceTy<$tcx, Self::Provenance>,
+        _destination: &MPlaceTy<$tcx, Self::Provenance>,
         _target: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction,
     ) -> InterpResult<$tcx> {

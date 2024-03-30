@@ -1,9 +1,8 @@
-// revisions: llvm mir-opt3
-// compile-flags: -C opt-level=3 -Z merge-functions=disabled --edition=2021
-// only-x86_64
-// ignore-debug: the debug assertions get in the way
-// [mir-opt3]compile-flags: -Zmir-opt-level=3
-// [mir-opt3]build-pass
+//@ revisions: llvm mir-opt3
+//@ compile-flags: -C opt-level=3 -Z merge-functions=disabled --edition=2021
+//@ only-x86_64
+//@ [mir-opt3]compile-flags: -Zmir-opt-level=3
+//@ [mir-opt3]build-pass
 
 // mir-opt3 is a regression test for https://github.com/rust-lang/rust/issues/98016
 
@@ -52,8 +51,8 @@ pub fn wider_reduce_iter(x: Simd<u8, N>) -> u16 {
 #[no_mangle]
 // CHECK-LABEL: @wider_reduce_into_iter
 pub fn wider_reduce_into_iter(x: Simd<u8, N>) -> u16 {
-    // FIXME: It would be nice if this was exactly the same as the above tests,
-    // but at the time of writing this comment, that didn't happen on LLVM main.
-    // CHECK: call i16 @llvm.vector.reduce.add
+    // CHECK: zext <16 x i8>
+    // CHECK-SAME: to <16 x i16>
+    // CHECK: call i16 @llvm.vector.reduce.add.v16i16(<16 x i16>
     x.to_array().into_iter().map(u16::from).sum()
 }

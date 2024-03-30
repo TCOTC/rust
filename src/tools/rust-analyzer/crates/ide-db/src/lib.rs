@@ -15,6 +15,7 @@ pub mod helpers;
 pub mod items_locator;
 pub mod label;
 pub mod path_transform;
+pub mod prime_caches;
 pub mod rename;
 pub mod rust_doc;
 pub mod search;
@@ -43,13 +44,14 @@ pub mod syntax_helpers {
     pub use parser::LexedStr;
 }
 
-pub use hir::Change;
+pub use hir::ChangeWithProcMacros;
 
 use std::{fmt, mem::ManuallyDrop};
 
 use base_db::{
     salsa::{self, Durability},
     AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, SourceDatabase, Upcast,
+    DEFAULT_FILE_TEXT_LRU_CAP,
 };
 use hir::db::{DefDatabase, ExpandDatabase, HirDatabase};
 use triomphe::Arc;
@@ -156,6 +158,7 @@ impl RootDatabase {
 
     pub fn update_base_query_lru_capacities(&mut self, lru_capacity: Option<usize>) {
         let lru_capacity = lru_capacity.unwrap_or(base_db::DEFAULT_PARSE_LRU_CAP);
+        base_db::FileTextQuery.in_db_mut(self).set_lru_capacity(DEFAULT_FILE_TEXT_LRU_CAP);
         base_db::ParseQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
         // macro expansions are usually rather small, so we can afford to keep more of them alive
         hir::db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(4 * lru_capacity);
@@ -165,6 +168,7 @@ impl RootDatabase {
     pub fn update_lru_capacities(&mut self, lru_capacities: &FxHashMap<Box<str>, usize>) {
         use hir::db as hir_db;
 
+        base_db::FileTextQuery.in_db_mut(self).set_lru_capacity(DEFAULT_FILE_TEXT_LRU_CAP);
         base_db::ParseQuery.in_db_mut(self).set_lru_capacity(
             lru_capacities
                 .get(stringify!(ParseQuery))
@@ -198,7 +202,7 @@ impl RootDatabase {
             // base_db::ProcMacrosQuery
 
             // SourceDatabaseExt
-            // base_db::FileTextQuery
+            base_db::FileTextQuery
             // base_db::FileSourceRootQuery
             // base_db::SourceRootQuery
             base_db::SourceRootCratesQuery
@@ -215,7 +219,6 @@ impl RootDatabase {
 
             // DefDatabase
             hir_db::FileItemTreeQuery
-            hir_db::CrateDefMapQueryQuery
             hir_db::BlockDefMapQuery
             hir_db::StructDataWithDiagnosticsQuery
             hir_db::UnionDataWithDiagnosticsQuery
@@ -247,7 +250,6 @@ impl RootDatabase {
             hir_db::CrateSupportsNoStdQuery
 
             // HirDatabase
-            hir_db::InferQueryQuery
             hir_db::MirBodyQuery
             hir_db::BorrowckQuery
             hir_db::TyQuery
@@ -280,13 +282,12 @@ impl RootDatabase {
             // hir_db::InternCoroutineQuery
             hir_db::AssociatedTyDataQuery
             hir_db::TraitDatumQuery
-            hir_db::StructDatumQuery
+            hir_db::AdtDatumQuery
             hir_db::ImplDatumQuery
             hir_db::FnDefDatumQuery
             hir_db::FnDefVarianceQuery
             hir_db::AdtVarianceQuery
             hir_db::AssociatedTyValueQuery
-            hir_db::TraitSolveQueryQuery
             hir_db::ProgramClausesForChalkEnvQuery
 
             // SymbolsDatabase
@@ -350,6 +351,7 @@ pub enum SymbolKind {
     LifetimeParam,
     Local,
     Macro,
+    ProcMacro,
     Module,
     SelfParam,
     SelfType,
@@ -368,9 +370,8 @@ pub enum SymbolKind {
 impl From<hir::MacroKind> for SymbolKind {
     fn from(it: hir::MacroKind) -> Self {
         match it {
-            hir::MacroKind::Declarative | hir::MacroKind::BuiltIn | hir::MacroKind::ProcMacro => {
-                SymbolKind::Macro
-            }
+            hir::MacroKind::Declarative | hir::MacroKind::BuiltIn => SymbolKind::Macro,
+            hir::MacroKind::ProcMacro => SymbolKind::ProcMacro,
             hir::MacroKind::Derive => SymbolKind::Derive,
             hir::MacroKind::Attr => SymbolKind::Attribute,
         }
@@ -383,6 +384,7 @@ impl From<hir::ModuleDefId> for SymbolKind {
             hir::ModuleDefId::ConstId(..) => SymbolKind::Const,
             hir::ModuleDefId::EnumVariantId(..) => SymbolKind::Variant,
             hir::ModuleDefId::FunctionId(..) => SymbolKind::Function,
+            hir::ModuleDefId::MacroId(hir::MacroId::ProcMacroId(..)) => SymbolKind::ProcMacro,
             hir::ModuleDefId::MacroId(..) => SymbolKind::Macro,
             hir::ModuleDefId::ModuleId(..) => SymbolKind::Module,
             hir::ModuleDefId::StaticId(..) => SymbolKind::Static,
@@ -410,10 +412,4 @@ impl SnippetCap {
             None
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    mod line_index;
-    mod sourcegen_lints;
 }

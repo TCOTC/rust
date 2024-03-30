@@ -4,67 +4,101 @@ use crate::cmp::Ordering;
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
 use crate::intrinsics;
-#[cfg(bootstrap)]
-use crate::marker::StructuralEq;
-use crate::marker::StructuralPartialEq;
-use crate::ops::{BitOr, BitOrAssign, Div, Neg, Rem};
+use crate::marker::{Freeze, StructuralPartialEq};
+use crate::ops::{BitOr, BitOrAssign, Div, DivAssign, Neg, Rem, RemAssign};
+use crate::panic::{RefUnwindSafe, UnwindSafe};
 use crate::ptr;
 use crate::str::FromStr;
+use crate::ub_checks;
 
 use super::from_str_radix;
 use super::{IntErrorKind, ParseIntError};
 
-mod private {
-    #[unstable(
-        feature = "nonzero_internals",
-        reason = "implementation detail which may disappear or be replaced at any time",
-        issue = "none"
-    )]
-    #[const_trait]
-    pub trait Sealed {}
-}
-
 /// A marker trait for primitive types which can be zero.
 ///
-/// This is an implementation detail for [`NonZero<T>`](NonZero) which may disappear or be replaced at any time.
+/// This is an implementation detail for <code>[NonZero]\<T></code> which may disappear or be replaced at any time.
+///
+/// # Safety
+///
+/// Types implementing this trait must be primitives that are valid when zeroed.
+///
+/// The associated `Self::NonZeroInner` type must have the same size+align as `Self`,
+/// but with a niche and bit validity making it so the following `transmutes` are sound:
+///
+/// - `Self::NonZeroInner` to `Option<Self::NonZeroInner>`
+/// - `Option<Self::NonZeroInner>` to `Self`
+///
+/// (And, consequently, `Self::NonZeroInner` to `Self`.)
 #[unstable(
     feature = "nonzero_internals",
     reason = "implementation detail which may disappear or be replaced at any time",
     issue = "none"
 )]
 #[const_trait]
-pub trait ZeroablePrimitive: Sized + Copy + private::Sealed {}
+pub unsafe trait ZeroablePrimitive: Sized + Copy + private::Sealed {
+    #[doc(hidden)]
+    type NonZeroInner: Sized + Copy;
+}
 
 macro_rules! impl_zeroable_primitive {
-    ($primitive:ty) => {
-        #[unstable(
-            feature = "nonzero_internals",
-            reason = "implementation detail which may disappear or be replaced at any time",
-            issue = "none"
-        )]
-        impl const private::Sealed for $primitive {}
+    ($($NonZeroInner:ident ( $primitive:ty )),+ $(,)?) => {
+        mod private {
+            #[unstable(
+                feature = "nonzero_internals",
+                reason = "implementation detail which may disappear or be replaced at any time",
+                issue = "none"
+            )]
+            #[const_trait]
+            pub trait Sealed {}
 
-        #[unstable(
-            feature = "nonzero_internals",
-            reason = "implementation detail which may disappear or be replaced at any time",
-            issue = "none"
-        )]
-        impl const ZeroablePrimitive for $primitive {}
+            $(
+                #[derive(Debug, Clone, Copy, PartialEq)]
+                #[repr(transparent)]
+                #[rustc_layout_scalar_valid_range_start(1)]
+                #[rustc_nonnull_optimization_guaranteed]
+                #[unstable(
+                    feature = "nonzero_internals",
+                    reason = "implementation detail which may disappear or be replaced at any time",
+                    issue = "none"
+                )]
+                pub struct $NonZeroInner($primitive);
+            )+
+        }
+
+        $(
+            #[unstable(
+                feature = "nonzero_internals",
+                reason = "implementation detail which may disappear or be replaced at any time",
+                issue = "none"
+            )]
+            impl const private::Sealed for $primitive {}
+
+            #[unstable(
+                feature = "nonzero_internals",
+                reason = "implementation detail which may disappear or be replaced at any time",
+                issue = "none"
+            )]
+            unsafe impl const ZeroablePrimitive for $primitive {
+                type NonZeroInner = private::$NonZeroInner;
+            }
+        )+
     };
 }
 
-impl_zeroable_primitive!(u8);
-impl_zeroable_primitive!(u16);
-impl_zeroable_primitive!(u32);
-impl_zeroable_primitive!(u64);
-impl_zeroable_primitive!(u128);
-impl_zeroable_primitive!(usize);
-impl_zeroable_primitive!(i8);
-impl_zeroable_primitive!(i16);
-impl_zeroable_primitive!(i32);
-impl_zeroable_primitive!(i64);
-impl_zeroable_primitive!(i128);
-impl_zeroable_primitive!(isize);
+impl_zeroable_primitive!(
+    NonZeroU8Inner(u8),
+    NonZeroU16Inner(u16),
+    NonZeroU32Inner(u32),
+    NonZeroU64Inner(u64),
+    NonZeroU128Inner(u128),
+    NonZeroUsizeInner(usize),
+    NonZeroI8Inner(i8),
+    NonZeroI16Inner(i16),
+    NonZeroI32Inner(i32),
+    NonZeroI64Inner(i64),
+    NonZeroI128Inner(i128),
+    NonZeroIsizeInner(isize),
+);
 
 /// A value that is known not to equal zero.
 ///
@@ -79,10 +113,239 @@ impl_zeroable_primitive!(isize);
 /// ```
 #[unstable(feature = "generic_nonzero", issue = "120257")]
 #[repr(transparent)]
-#[rustc_layout_scalar_valid_range_start(1)]
 #[rustc_nonnull_optimization_guaranteed]
 #[rustc_diagnostic_item = "NonZero"]
-pub struct NonZero<T: ZeroablePrimitive>(T);
+pub struct NonZero<T: ZeroablePrimitive>(T::NonZeroInner);
+
+macro_rules! impl_nonzero_fmt {
+    ($Trait:ident) => {
+        #[stable(feature = "nonzero", since = "1.28.0")]
+        impl<T> fmt::$Trait for NonZero<T>
+        where
+            T: ZeroablePrimitive + fmt::$Trait,
+        {
+            #[inline]
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.get().fmt(f)
+            }
+        }
+    };
+}
+
+impl_nonzero_fmt!(Debug);
+impl_nonzero_fmt!(Display);
+impl_nonzero_fmt!(Binary);
+impl_nonzero_fmt!(Octal);
+impl_nonzero_fmt!(LowerHex);
+impl_nonzero_fmt!(UpperHex);
+
+macro_rules! impl_nonzero_auto_trait {
+    (unsafe $Trait:ident) => {
+        #[stable(feature = "nonzero", since = "1.28.0")]
+        unsafe impl<T> $Trait for NonZero<T> where T: ZeroablePrimitive + $Trait {}
+    };
+    ($Trait:ident) => {
+        #[stable(feature = "nonzero", since = "1.28.0")]
+        impl<T> $Trait for NonZero<T> where T: ZeroablePrimitive + $Trait {}
+    };
+}
+
+// Implement auto-traits manually based on `T` to avoid docs exposing
+// the `ZeroablePrimitive::NonZeroInner` implementation detail.
+impl_nonzero_auto_trait!(unsafe Freeze);
+impl_nonzero_auto_trait!(RefUnwindSafe);
+impl_nonzero_auto_trait!(unsafe Send);
+impl_nonzero_auto_trait!(unsafe Sync);
+impl_nonzero_auto_trait!(Unpin);
+impl_nonzero_auto_trait!(UnwindSafe);
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> Clone for NonZero<T>
+where
+    T: ZeroablePrimitive,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> Copy for NonZero<T> where T: ZeroablePrimitive {}
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> PartialEq for NonZero<T>
+where
+    T: ZeroablePrimitive + PartialEq,
+{
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+
+    #[inline]
+    fn ne(&self, other: &Self) -> bool {
+        self.get() != other.get()
+    }
+}
+
+#[unstable(feature = "structural_match", issue = "31434")]
+impl<T> StructuralPartialEq for NonZero<T> where T: ZeroablePrimitive + StructuralPartialEq {}
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> Eq for NonZero<T> where T: ZeroablePrimitive + Eq {}
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> PartialOrd for NonZero<T>
+where
+    T: ZeroablePrimitive + PartialOrd,
+{
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.get().partial_cmp(&other.get())
+    }
+
+    #[inline]
+    fn lt(&self, other: &Self) -> bool {
+        self.get() < other.get()
+    }
+
+    #[inline]
+    fn le(&self, other: &Self) -> bool {
+        self.get() <= other.get()
+    }
+
+    #[inline]
+    fn gt(&self, other: &Self) -> bool {
+        self.get() > other.get()
+    }
+
+    #[inline]
+    fn ge(&self, other: &Self) -> bool {
+        self.get() >= other.get()
+    }
+}
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> Ord for NonZero<T>
+where
+    T: ZeroablePrimitive + Ord,
+{
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.get().cmp(&other.get())
+    }
+
+    #[inline]
+    fn max(self, other: Self) -> Self {
+        // SAFETY: The maximum of two non-zero values is still non-zero.
+        unsafe { Self::new_unchecked(self.get().max(other.get())) }
+    }
+
+    #[inline]
+    fn min(self, other: Self) -> Self {
+        // SAFETY: The minimum of two non-zero values is still non-zero.
+        unsafe { Self::new_unchecked(self.get().min(other.get())) }
+    }
+
+    #[inline]
+    fn clamp(self, min: Self, max: Self) -> Self {
+        // SAFETY: A non-zero value clamped between two non-zero values is still non-zero.
+        unsafe { Self::new_unchecked(self.get().clamp(min.get(), max.get())) }
+    }
+}
+
+#[stable(feature = "nonzero", since = "1.28.0")]
+impl<T> Hash for NonZero<T>
+where
+    T: ZeroablePrimitive + Hash,
+{
+    #[inline]
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.get().hash(state)
+    }
+}
+
+#[stable(feature = "from_nonzero", since = "1.31.0")]
+impl<T> From<NonZero<T>> for T
+where
+    T: ZeroablePrimitive,
+{
+    #[inline]
+    fn from(nonzero: NonZero<T>) -> Self {
+        // Call `get` method to keep range information.
+        nonzero.get()
+    }
+}
+
+#[stable(feature = "nonzero_bitor", since = "1.45.0")]
+impl<T> BitOr for NonZero<T>
+where
+    T: ZeroablePrimitive + BitOr<Output = T>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self::Output {
+        // SAFETY: Bitwise OR of two non-zero values is still non-zero.
+        unsafe { Self::new_unchecked(self.get() | rhs.get()) }
+    }
+}
+
+#[stable(feature = "nonzero_bitor", since = "1.45.0")]
+impl<T> BitOr<T> for NonZero<T>
+where
+    T: ZeroablePrimitive + BitOr<Output = T>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: T) -> Self::Output {
+        // SAFETY: Bitwise OR of a non-zero value with anything is still non-zero.
+        unsafe { Self::new_unchecked(self.get() | rhs) }
+    }
+}
+
+#[stable(feature = "nonzero_bitor", since = "1.45.0")]
+impl<T> BitOr<NonZero<T>> for T
+where
+    T: ZeroablePrimitive + BitOr<Output = T>,
+{
+    type Output = NonZero<T>;
+
+    #[inline]
+    fn bitor(self, rhs: NonZero<T>) -> Self::Output {
+        // SAFETY: Bitwise OR of anything with a non-zero value is still non-zero.
+        unsafe { NonZero::new_unchecked(self | rhs.get()) }
+    }
+}
+
+#[stable(feature = "nonzero_bitor", since = "1.45.0")]
+impl<T> BitOrAssign for NonZero<T>
+where
+    T: ZeroablePrimitive,
+    Self: BitOr<Output = Self>,
+{
+    #[inline]
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
+
+#[stable(feature = "nonzero_bitor", since = "1.45.0")]
+impl<T> BitOrAssign<T> for NonZero<T>
+where
+    T: ZeroablePrimitive,
+    Self: BitOr<T, Output = Self>,
+{
+    #[inline]
+    fn bitor_assign(&mut self, rhs: T) {
+        *self = *self | rhs;
+    }
+}
 
 impl<T> NonZero<T>
 where
@@ -91,13 +354,12 @@ where
     /// Creates a non-zero if the given value is not zero.
     #[stable(feature = "nonzero", since = "1.28.0")]
     #[rustc_const_stable(feature = "const_nonzero_int_methods", since = "1.47.0")]
-    #[rustc_allow_const_fn_unstable(const_refs_to_cell)]
     #[must_use]
     #[inline]
     pub const fn new(n: T) -> Option<Self> {
         // SAFETY: Memory layout optimization guarantees that `Option<NonZero<T>>` has
         //         the same layout and size as `T`, with `0` representing `None`.
-        unsafe { ptr::read(ptr::addr_of!(n).cast()) }
+        unsafe { intrinsics::transmute_unchecked(n) }
     }
 
     /// Creates a non-zero without checking whether the value is non-zero.
@@ -116,9 +378,10 @@ where
             None => {
                 // SAFETY: The caller guarantees that `n` is non-zero, so this is unreachable.
                 unsafe {
-                    intrinsics::assert_unsafe_precondition!(
-                      "NonZero::new_unchecked requires the argument to be non-zero",
-                      () => false,
+                    ub_checks::assert_unsafe_precondition!(
+                        check_language_ub,
+                        "NonZero::new_unchecked requires the argument to be non-zero",
+                        () => false,
                     );
                     intrinsics::unreachable()
                 }
@@ -134,7 +397,7 @@ where
     pub fn from_mut(n: &mut T) -> Option<&mut Self> {
         // SAFETY: Memory layout optimization guarantees that `Option<NonZero<T>>` has
         //         the same layout and size as `T`, with `0` representing `None`.
-        let opt_n = unsafe { &mut *(n as *mut T as *mut Option<Self>) };
+        let opt_n = unsafe { &mut *(ptr::from_mut(n).cast::<Option<Self>>()) };
 
         opt_n.as_mut()
     }
@@ -155,28 +418,35 @@ where
             None => {
                 // SAFETY: The caller guarantees that `n` references a value that is non-zero, so this is unreachable.
                 unsafe {
-                    intrinsics::assert_unsafe_precondition!(
-                      "NonZero::from_mut_unchecked requires the argument to dereference as non-zero",
-                      () => false,
+                    ub_checks::assert_unsafe_precondition!(
+                        check_library_ub,
+                        "NonZero::from_mut_unchecked requires the argument to dereference as non-zero",
+                        () => false,
                     );
                     intrinsics::unreachable()
                 }
             }
         }
     }
-}
 
-macro_rules! impl_nonzero_fmt {
-    ( #[$stability: meta] ( $( $Trait: ident ),+ ) for $Ty: ident ) => {
-        $(
-            #[$stability]
-            impl fmt::$Trait for $Ty {
-                #[inline]
-                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    self.get().fmt(f)
-                }
-            }
-        )+
+    /// Returns the contained value as a primitive type.
+    #[stable(feature = "nonzero", since = "1.28.0")]
+    #[rustc_const_stable(feature = "const_nonzero_get", since = "1.34.0")]
+    #[inline]
+    pub const fn get(self) -> T {
+        // FIXME: This can be changed to simply `self.0` once LLVM supports `!range` metadata
+        // for function arguments: https://github.com/llvm/llvm-project/issues/76628
+        //
+        // Rustc can set range metadata only if it loads `self` from
+        // memory somewhere. If the value of `self` was from by-value argument
+        // of some not-inlined function, LLVM don't have range metadata
+        // to understand that the value cannot be zero.
+        //
+        // For now, using the transmute `assume`s the range at runtime.
+        //
+        // SAFETY: `ZeroablePrimitive` guarantees that the size and bit validity
+        // of `.0` is such that this transmute is sound.
+        unsafe { intrinsics::transmute_unchecked(self) }
     }
 }
 
@@ -225,26 +495,6 @@ macro_rules! nonzero_integer {
         pub type $Ty = NonZero<$Int>;
 
         impl $Ty {
-            /// Returns the value as a primitive type.
-            #[$stability]
-            #[inline]
-            #[rustc_const_stable(feature = "const_nonzero_get", since = "1.34.0")]
-            pub const fn get(self) -> $Int {
-                // FIXME: Remove this after LLVM supports `!range` metadata for function
-                // arguments https://github.com/llvm/llvm-project/issues/76628
-                //
-                // Rustc can set range metadata only if it loads `self` from
-                // memory somewhere. If the value of `self` was from by-value argument
-                // of some not-inlined function, LLVM don't have range metadata
-                // to understand that the value cannot be zero.
-
-                // SAFETY: It is an invariant of this type.
-                unsafe {
-                    intrinsics::assume(self.0 != 0);
-                }
-                self.0
-            }
-
             /// The size of this non-zero integer type in bits.
             ///
             #[doc = concat!("This value is equal to [`", stringify!($Int), "::BITS`].")]
@@ -313,18 +563,16 @@ macro_rules! nonzero_integer {
             /// Basic usage:
             ///
             /// ```
-            /// #![feature(non_zero_count_ones)]
+            /// #![feature(generic_nonzero, non_zero_count_ones)]
             /// # fn main() { test().unwrap(); }
             /// # fn test() -> Option<()> {
-            #[doc = concat!("# use std::num::{self, ", stringify!($Ty), "};")]
+            /// # use std::num::*;
+            /// #
+            #[doc = concat!("let a = NonZero::<", stringify!($Int), ">::new(0b100_0000)?;")]
+            #[doc = concat!("let b = NonZero::<", stringify!($Int), ">::new(0b100_0011)?;")]
             ///
-            /// let one = num::NonZeroU32::new(1)?;
-            /// let three = num::NonZeroU32::new(3)?;
-            #[doc = concat!("let a = ", stringify!($Ty), "::new(0b100_0000)?;")]
-            #[doc = concat!("let b = ", stringify!($Ty), "::new(0b100_0011)?;")]
-            ///
-            /// assert_eq!(a.count_ones(), one);
-            /// assert_eq!(b.count_ones(), three);
+            /// assert_eq!(a.count_ones(), NonZero::new(1)?);
+            /// assert_eq!(b.count_ones(), NonZero::new(3)?);
             /// # Some(())
             /// # }
             /// ```
@@ -336,11 +584,11 @@ macro_rules! nonzero_integer {
             #[must_use = "this returns the result of the operation, \
                         without modifying the original"]
             #[inline(always)]
-            pub const fn count_ones(self) -> NonZeroU32 {
+            pub const fn count_ones(self) -> NonZero<u32> {
                 // SAFETY:
                 // `self` is non-zero, which means it has at least one bit set, which means
                 // that the result of `count_ones` is non-zero.
-                unsafe { NonZeroU32::new_unchecked(self.get().count_ones()) }
+                unsafe { NonZero::new_unchecked(self.get().count_ones()) }
             }
 
             nonzero_integer_signedness_dependent_methods! {
@@ -552,175 +800,6 @@ macro_rules! nonzero_integer {
             }
         }
 
-        #[$stability]
-        impl Clone for $Ty {
-            #[inline]
-            fn clone(&self) -> Self {
-                // SAFETY: The contained value is non-zero.
-                unsafe { Self(self.0) }
-            }
-        }
-
-        #[$stability]
-        impl Copy for $Ty {}
-
-        #[$stability]
-        impl PartialEq for $Ty {
-            #[inline]
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0
-            }
-
-            #[inline]
-            fn ne(&self, other: &Self) -> bool {
-                self.0 != other.0
-            }
-        }
-
-        #[unstable(feature = "structural_match", issue = "31434")]
-        impl StructuralPartialEq for $Ty {}
-
-        #[$stability]
-        impl Eq for $Ty {}
-
-        #[unstable(feature = "structural_match", issue = "31434")]
-        #[cfg(bootstrap)]
-        impl StructuralEq for $Ty {}
-
-        #[$stability]
-        impl PartialOrd for $Ty {
-            #[inline]
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                self.0.partial_cmp(&other.0)
-            }
-
-            #[inline]
-            fn lt(&self, other: &Self) -> bool {
-                self.0 < other.0
-            }
-
-            #[inline]
-            fn le(&self, other: &Self) -> bool {
-                self.0 <= other.0
-            }
-
-            #[inline]
-            fn gt(&self, other: &Self) -> bool {
-                self.0 > other.0
-            }
-
-            #[inline]
-            fn ge(&self, other: &Self) -> bool {
-                self.0 >= other.0
-            }
-        }
-
-        #[$stability]
-        impl Ord for $Ty {
-            #[inline]
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.0.cmp(&other.0)
-            }
-
-            #[inline]
-            fn max(self, other: Self) -> Self {
-                // SAFETY: The maximum of two non-zero values is still non-zero.
-                unsafe { Self(self.0.max(other.0)) }
-            }
-
-            #[inline]
-            fn min(self, other: Self) -> Self {
-                // SAFETY: The minimum of two non-zero values is still non-zero.
-                unsafe { Self(self.0.min(other.0)) }
-            }
-
-            #[inline]
-            fn clamp(self, min: Self, max: Self) -> Self {
-                // SAFETY: A non-zero value clamped between two non-zero values is still non-zero.
-                unsafe { Self(self.0.clamp(min.0, max.0)) }
-            }
-        }
-
-        #[$stability]
-        impl Hash for $Ty {
-            #[inline]
-            fn hash<H>(&self, state: &mut H)
-            where
-                H: Hasher,
-            {
-                self.0.hash(state)
-            }
-        }
-
-        #[stable(feature = "from_nonzero", since = "1.31.0")]
-        impl From<$Ty> for $Int {
-            #[doc = concat!("Converts a `", stringify!($Ty), "` into an `", stringify!($Int), "`")]
-            #[inline]
-            fn from(nonzero: $Ty) -> Self {
-                // Call nonzero to keep information range information
-                // from get method.
-                nonzero.get()
-            }
-        }
-
-        #[stable(feature = "nonzero_bitor", since = "1.45.0")]
-        impl BitOr for $Ty {
-            type Output = Self;
-
-            #[inline]
-            fn bitor(self, rhs: Self) -> Self::Output {
-                // SAFETY: since `self` and `rhs` are both nonzero, the
-                // result of the bitwise-or will be nonzero.
-                unsafe { Self::new_unchecked(self.get() | rhs.get()) }
-            }
-        }
-
-        #[stable(feature = "nonzero_bitor", since = "1.45.0")]
-        impl BitOr<$Int> for $Ty {
-            type Output = Self;
-
-            #[inline]
-            fn bitor(self, rhs: $Int) -> Self::Output {
-                // SAFETY: since `self` is nonzero, the result of the
-                // bitwise-or will be nonzero regardless of the value of
-                // `rhs`.
-                unsafe { Self::new_unchecked(self.get() | rhs) }
-            }
-        }
-
-        #[stable(feature = "nonzero_bitor", since = "1.45.0")]
-        impl BitOr<$Ty> for $Int {
-            type Output = $Ty;
-
-            #[inline]
-            fn bitor(self, rhs: $Ty) -> Self::Output {
-                // SAFETY: since `rhs` is nonzero, the result of the
-                // bitwise-or will be nonzero regardless of the value of
-                // `self`.
-                unsafe { $Ty::new_unchecked(self | rhs.get()) }
-            }
-        }
-
-        #[stable(feature = "nonzero_bitor", since = "1.45.0")]
-        impl BitOrAssign for $Ty {
-            #[inline]
-            fn bitor_assign(&mut self, rhs: Self) {
-                *self = *self | rhs;
-            }
-        }
-
-        #[stable(feature = "nonzero_bitor", since = "1.45.0")]
-        impl BitOrAssign<$Int> for $Ty {
-            #[inline]
-            fn bitor_assign(&mut self, rhs: $Int) {
-                *self = *self | rhs;
-            }
-        }
-
-        impl_nonzero_fmt! {
-            #[$stability] (Debug, Display, Binary, Octal, LowerHex, UpperHex) for $Ty
-        }
-
         #[stable(feature = "nonzero_parse", since = "1.35.0")]
         impl FromStr for $Ty {
             type Err = ParseIntError;
@@ -773,6 +852,16 @@ macro_rules! nonzero_integer_signedness_dependent_impls {
             }
         }
 
+        #[stable(feature = "nonzero_div_assign", since = "CURRENT_RUSTC_VERSION")]
+        impl DivAssign<$Ty> for $Int {
+            /// This operation rounds towards zero,
+            /// truncating any fractional part of the exact result, and cannot panic.
+            #[inline]
+            fn div_assign(&mut self, other: $Ty) {
+                *self = *self / other;
+            }
+        }
+
         #[stable(feature = "nonzero_div", since = "1.51.0")]
         impl Rem<$Ty> for $Int {
             type Output = $Int;
@@ -783,6 +872,15 @@ macro_rules! nonzero_integer_signedness_dependent_impls {
                 // SAFETY: rem by zero is checked because `other` is a nonzero,
                 // and MIN/-1 is checked because `self` is an unsigned int.
                 unsafe { intrinsics::unchecked_rem(self, other.get()) }
+            }
+        }
+
+        #[stable(feature = "nonzero_div_assign", since = "CURRENT_RUSTC_VERSION")]
+        impl RemAssign<$Ty> for $Int {
+            /// This operation satisfies `n % d == n - (n / d) * d`, and cannot panic.
+            #[inline]
+            fn rem_assign(&mut self, other: $Ty) {
+                *self = *self % other;
             }
         }
     };

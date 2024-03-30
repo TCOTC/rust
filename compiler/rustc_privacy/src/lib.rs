@@ -5,14 +5,13 @@
 #![feature(associated_type_defaults)]
 #![feature(try_blocks)]
 #![feature(let_chains)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate tracing;
 
 mod errors;
 
+use rustc_ast::visit::{try_visit, VisitorResult};
 use rustc_ast::MacroDef;
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashSet;
@@ -21,7 +20,7 @@ use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId, CRATE_DEF_ID};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{AssocItemKind, ForeignItemKind, ItemId, PatKind};
+use rustc_hir::{AssocItemKind, ForeignItemKind, ItemId, ItemKind, PatKind};
 use rustc_middle::middle::privacy::{EffectiveVisibilities, EffectiveVisibility, Level};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::GenericArgs;
@@ -68,18 +67,14 @@ impl<'tcx> fmt::Display for LazyDefPathStr<'tcx> {
 /// First, it doesn't have overridable `fn visit_trait_ref`, so we have to catch trait `DefId`s
 /// manually. Second, it doesn't visit some type components like signatures of fn types, or traits
 /// in `impl Trait`, see individual comments in `DefIdVisitorSkeleton::visit_ty`.
-trait DefIdVisitor<'tcx> {
-    type BreakTy = ();
+pub trait DefIdVisitor<'tcx> {
+    type Result: VisitorResult = ();
     const SHALLOW: bool = false;
     const SKIP_ASSOC_TYS: bool = false;
 
     fn tcx(&self) -> TyCtxt<'tcx>;
-    fn visit_def_id(
-        &mut self,
-        def_id: DefId,
-        kind: &str,
-        descr: &dyn fmt::Display,
-    ) -> ControlFlow<Self::BreakTy>;
+    fn visit_def_id(&mut self, def_id: DefId, kind: &str, descr: &dyn fmt::Display)
+    -> Self::Result;
 
     /// Not overridden, but used to actually visit types and traits.
     fn skeleton(&mut self) -> DefIdVisitorSkeleton<'_, 'tcx, Self> {
@@ -89,33 +84,21 @@ trait DefIdVisitor<'tcx> {
             dummy: Default::default(),
         }
     }
-    fn visit(
-        &mut self,
-        ty_fragment: impl TypeVisitable<TyCtxt<'tcx>>,
-    ) -> ControlFlow<Self::BreakTy> {
+    fn visit(&mut self, ty_fragment: impl TypeVisitable<TyCtxt<'tcx>>) -> Self::Result {
         ty_fragment.visit_with(&mut self.skeleton())
     }
-    fn visit_trait(&mut self, trait_ref: TraitRef<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_trait(&mut self, trait_ref: TraitRef<'tcx>) -> Self::Result {
         self.skeleton().visit_trait(trait_ref)
     }
-    fn visit_projection_ty(&mut self, projection: ty::AliasTy<'tcx>) -> ControlFlow<Self::BreakTy> {
-        self.skeleton().visit_projection_ty(projection)
-    }
-    fn visit_predicates(
-        &mut self,
-        predicates: ty::GenericPredicates<'tcx>,
-    ) -> ControlFlow<Self::BreakTy> {
+    fn visit_predicates(&mut self, predicates: ty::GenericPredicates<'tcx>) -> Self::Result {
         self.skeleton().visit_clauses(predicates.predicates)
     }
-    fn visit_clauses(
-        &mut self,
-        clauses: &[(ty::Clause<'tcx>, Span)],
-    ) -> ControlFlow<Self::BreakTy> {
+    fn visit_clauses(&mut self, clauses: &[(ty::Clause<'tcx>, Span)]) -> Self::Result {
         self.skeleton().visit_clauses(clauses)
     }
 }
 
-struct DefIdVisitorSkeleton<'v, 'tcx, V: ?Sized> {
+pub struct DefIdVisitorSkeleton<'v, 'tcx, V: ?Sized> {
     def_id_visitor: &'v mut V,
     visited_opaque_tys: FxHashSet<DefId>,
     dummy: PhantomData<TyCtxt<'tcx>>,
@@ -125,36 +108,42 @@ impl<'tcx, V> DefIdVisitorSkeleton<'_, 'tcx, V>
 where
     V: DefIdVisitor<'tcx> + ?Sized,
 {
-    fn visit_trait(&mut self, trait_ref: TraitRef<'tcx>) -> ControlFlow<V::BreakTy> {
+    fn visit_trait(&mut self, trait_ref: TraitRef<'tcx>) -> V::Result {
         let TraitRef { def_id, args, .. } = trait_ref;
-        self.def_id_visitor.visit_def_id(def_id, "trait", &trait_ref.print_only_trait_path())?;
-        if V::SHALLOW { ControlFlow::Continue(()) } else { args.visit_with(self) }
+        try_visit!(self.def_id_visitor.visit_def_id(
+            def_id,
+            "trait",
+            &trait_ref.print_only_trait_path()
+        ));
+        if V::SHALLOW { V::Result::output() } else { args.visit_with(self) }
     }
 
-    fn visit_projection_ty(&mut self, projection: ty::AliasTy<'tcx>) -> ControlFlow<V::BreakTy> {
+    fn visit_projection_ty(&mut self, projection: ty::AliasTy<'tcx>) -> V::Result {
         let tcx = self.def_id_visitor.tcx();
         let (trait_ref, assoc_args) = projection.trait_ref_and_own_args(tcx);
-        self.visit_trait(trait_ref)?;
+        try_visit!(self.visit_trait(trait_ref));
         if V::SHALLOW {
-            ControlFlow::Continue(())
+            V::Result::output()
         } else {
-            assoc_args.iter().try_for_each(|subst| subst.visit_with(self))
+            V::Result::from_branch(
+                assoc_args.iter().try_for_each(|arg| arg.visit_with(self).branch()),
+            )
         }
     }
 
-    fn visit_clause(&mut self, clause: ty::Clause<'tcx>) -> ControlFlow<V::BreakTy> {
+    fn visit_clause(&mut self, clause: ty::Clause<'tcx>) -> V::Result {
         match clause.kind().skip_binder() {
             ty::ClauseKind::Trait(ty::TraitPredicate { trait_ref, polarity: _ }) => {
                 self.visit_trait(trait_ref)
             }
             ty::ClauseKind::Projection(ty::ProjectionPredicate { projection_ty, term }) => {
-                term.visit_with(self)?;
+                try_visit!(term.visit_with(self));
                 self.visit_projection_ty(projection_ty)
             }
             ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty, _region)) => ty.visit_with(self),
-            ty::ClauseKind::RegionOutlives(..) => ControlFlow::Continue(()),
+            ty::ClauseKind::RegionOutlives(..) => V::Result::output(),
             ty::ClauseKind::ConstArgHasType(ct, ty) => {
-                ct.visit_with(self)?;
+                try_visit!(ct.visit_with(self));
                 ty.visit_with(self)
             }
             ty::ClauseKind::ConstEvaluatable(ct) => ct.visit_with(self),
@@ -162,8 +151,11 @@ where
         }
     }
 
-    fn visit_clauses(&mut self, clauses: &[(ty::Clause<'tcx>, Span)]) -> ControlFlow<V::BreakTy> {
-        clauses.into_iter().try_for_each(|&(clause, _span)| self.visit_clause(clause))
+    fn visit_clauses(&mut self, clauses: &[(ty::Clause<'tcx>, Span)]) -> V::Result {
+        for &(clause, _) in clauses {
+            try_visit!(self.visit_clause(clause));
+        }
+        V::Result::output()
     }
 }
 
@@ -171,9 +163,13 @@ impl<'tcx, V> TypeVisitor<TyCtxt<'tcx>> for DefIdVisitorSkeleton<'_, 'tcx, V>
 where
     V: DefIdVisitor<'tcx> + ?Sized,
 {
-    type BreakTy = V::BreakTy;
+    type Result = V::Result;
 
-    fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<V::BreakTy> {
+    fn visit_predicate(&mut self, p: ty::Predicate<'tcx>) -> Self::Result {
+        self.visit_clause(p.as_clause().unwrap())
+    }
+
+    fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
         let tcx = self.def_id_visitor.tcx();
         // GenericArgs are not visited here because they are visited below
         // in `super_visit_with`.
@@ -184,16 +180,16 @@ where
             | ty::Closure(def_id, ..)
             | ty::CoroutineClosure(def_id, ..)
             | ty::Coroutine(def_id, ..) => {
-                self.def_id_visitor.visit_def_id(def_id, "type", &ty)?;
+                try_visit!(self.def_id_visitor.visit_def_id(def_id, "type", &ty));
                 if V::SHALLOW {
-                    return ControlFlow::Continue(());
+                    return V::Result::output();
                 }
                 // Default type visitor doesn't visit signatures of fn types.
                 // Something like `fn() -> Priv {my_func}` is considered a private type even if
                 // `my_func` is public, so we need to visit signatures.
                 if let ty::FnDef(..) = ty.kind() {
                     // FIXME: this should probably use `args` from `FnDef`
-                    tcx.fn_sig(def_id).instantiate_identity().visit_with(self)?;
+                    try_visit!(tcx.fn_sig(def_id).instantiate_identity().visit_with(self));
                 }
                 // Inherent static methods don't have self type in args.
                 // Something like `fn() {my_method}` type of the method
@@ -201,7 +197,9 @@ where
                 // so we need to visit the self type additionally.
                 if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
                     if let Some(impl_def_id) = assoc_item.impl_container(tcx) {
-                        tcx.type_of(impl_def_id).instantiate_identity().visit_with(self)?;
+                        try_visit!(
+                            tcx.type_of(impl_def_id).instantiate_identity().visit_with(self)
+                        );
                     }
                 }
             }
@@ -210,12 +208,12 @@ where
                     // Visitors searching for minimal visibility/reachability want to
                     // conservatively approximate associated types like `Type::Alias`
                     // as visible/reachable even if `Type` is private.
-                    // Ideally, associated types should be substituted in the same way as
+                    // Ideally, associated types should be instantiated in the same way as
                     // free type aliases, but this isn't done yet.
-                    return ControlFlow::Continue(());
+                    return V::Result::output();
                 }
 
-                self.def_id_visitor.visit_def_id(
+                try_visit!(self.def_id_visitor.visit_def_id(
                     data.def_id,
                     match kind {
                         ty::Inherent | ty::Projection => "associated type",
@@ -223,15 +221,17 @@ where
                         ty::Opaque => unreachable!(),
                     },
                     &LazyDefPathStr { def_id: data.def_id, tcx },
-                )?;
+                ));
 
                 // This will also visit args if necessary, so we don't need to recurse.
                 return if V::SHALLOW {
-                    ControlFlow::Continue(())
+                    V::Result::output()
                 } else if kind == ty::Projection {
                     self.visit_projection_ty(data)
                 } else {
-                    data.args.iter().try_for_each(|subst| subst.visit_with(self))
+                    V::Result::from_branch(
+                        data.args.iter().try_for_each(|arg| arg.visit_with(self).branch()),
+                    )
                 };
             }
             ty::Dynamic(predicates, ..) => {
@@ -246,7 +246,7 @@ where
                         }
                     };
                     let ty::ExistentialTraitRef { def_id, args: _ } = trait_ref;
-                    self.def_id_visitor.visit_def_id(def_id, "trait", &trait_ref)?;
+                    try_visit!(self.def_id_visitor.visit_def_id(def_id, "trait", &trait_ref));
                 }
             }
             ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }) => {
@@ -259,7 +259,7 @@ where
                     // through the trait list (default type visitor doesn't visit those traits).
                     // All traits in the list are considered the "primary" part of the type
                     // and are visited by shallow visitors.
-                    self.visit_clauses(tcx.explicit_item_bounds(def_id).skip_binder())?;
+                    try_visit!(self.visit_clauses(tcx.explicit_item_bounds(def_id).skip_binder()));
                 }
             }
             // These types don't have their own def-ids (but may have subcomponents
@@ -286,10 +286,10 @@ where
             }
         }
 
-        if V::SHALLOW { ControlFlow::Continue(()) } else { ty.super_visit_with(self) }
+        if V::SHALLOW { V::Result::output() } else { ty.super_visit_with(self) }
     }
 
-    fn visit_const(&mut self, c: Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_const(&mut self, c: Const<'tcx>) -> Self::Result {
         let tcx = self.def_id_visitor.tcx();
         tcx.expand_abstract_consts(c).super_visit_with(self)
     }
@@ -317,16 +317,10 @@ impl<'a, 'tcx, VL: VisibilityLike, const SHALLOW: bool> DefIdVisitor<'tcx>
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
-    fn visit_def_id(
-        &mut self,
-        def_id: DefId,
-        _kind: &str,
-        _descr: &dyn fmt::Display,
-    ) -> ControlFlow<Self::BreakTy> {
+    fn visit_def_id(&mut self, def_id: DefId, _kind: &str, _descr: &dyn fmt::Display) {
         if let Some(def_id) = def_id.as_local() {
             self.min = VL::new_min(self, def_id);
         }
-        ControlFlow::Continue(())
     }
 }
 
@@ -555,7 +549,7 @@ impl<'tcx> EmbargoVisitor<'tcx> {
         self.update(def_id, macro_ev, Level::Reachable);
         match def_kind {
             // No type privacy, so can be directly marked as reachable.
-            DefKind::Const | DefKind::Static(_) | DefKind::TraitAlias | DefKind::TyAlias => {
+            DefKind::Const | DefKind::Static { .. } | DefKind::TraitAlias | DefKind::TyAlias => {
                 if vis.is_accessible_from(module, self.tcx) {
                     self.update(def_id, macro_ev, Level::Reachable);
                 }
@@ -837,12 +831,7 @@ impl<'tcx> DefIdVisitor<'tcx> for ReachEverythingInTheInterfaceVisitor<'_, 'tcx>
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.ev.tcx
     }
-    fn visit_def_id(
-        &mut self,
-        def_id: DefId,
-        _kind: &str,
-        _descr: &dyn fmt::Display,
-    ) -> ControlFlow<Self::BreakTy> {
+    fn visit_def_id(&mut self, def_id: DefId, _kind: &str, _descr: &dyn fmt::Display) {
         if let Some(def_id) = def_id.as_local() {
             // All effective visibilities except `reachable_through_impl_trait` are limited to
             // nominal visibility. If any type or trait is leaked farther than that, it will
@@ -851,7 +840,6 @@ impl<'tcx> DefIdVisitor<'tcx> for ReachEverythingInTheInterfaceVisitor<'_, 'tcx>
                 .then(|| self.ev.tcx.local_visibility(def_id));
             self.ev.update_eff_vis(def_id, self.effective_vis, max_vis, self.level);
         }
-        ControlFlow::Continue(())
     }
 }
 
@@ -1076,6 +1064,14 @@ impl<'tcx> TypePrivacyVisitor<'tcx> {
     }
 }
 
+impl<'tcx> rustc_ty_utils::sig_types::SpannedTypeVisitor<'tcx> for TypePrivacyVisitor<'tcx> {
+    type Result = ControlFlow<()>;
+    fn visit(&mut self, span: Span, value: impl TypeVisitable<TyCtxt<'tcx>>) -> Self::Result {
+        self.span = span;
+        value.visit_with(&mut self.skeleton())
+    }
+}
+
 impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
     fn visit_nested_body(&mut self, body_id: hir::BodyId) {
         let old_maybe_typeck_results =
@@ -1086,18 +1082,15 @@ impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
 
     fn visit_ty(&mut self, hir_ty: &'tcx hir::Ty<'tcx>) {
         self.span = hir_ty.span;
-        if let Some(typeck_results) = self.maybe_typeck_results {
-            // Types in bodies.
-            if self.visit(typeck_results.node_type(hir_ty.hir_id)).is_break() {
-                return;
-            }
-        } else {
-            // Types in signatures.
-            // FIXME: This is very ineffective. Ideally each HIR type should be converted
-            // into a semantic type only once and the result should be cached somehow.
-            if self.visit(rustc_hir_analysis::hir_ty_to_ty(self.tcx, hir_ty)).is_break() {
-                return;
-            }
+        if self
+            .visit(
+                self.maybe_typeck_results
+                    .unwrap_or_else(|| span_bug!(hir_ty.span, "`hir::Ty` outside of a body"))
+                    .node_type(hir_ty.hir_id),
+            )
+            .is_break()
+        {
+            return;
         }
 
         intravisit::walk_ty(self, hir_ty);
@@ -1105,54 +1098,18 @@ impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
 
     fn visit_infer(&mut self, inf: &'tcx hir::InferArg) {
         self.span = inf.span;
-        if let Some(typeck_results) = self.maybe_typeck_results {
-            if let Some(ty) = typeck_results.node_type_opt(inf.hir_id) {
-                if self.visit(ty).is_break() {
-                    return;
-                }
-            } else {
-                // FIXME: check types of const infers here.
+        if let Some(ty) = self
+            .maybe_typeck_results
+            .unwrap_or_else(|| span_bug!(inf.span, "`hir::InferArg` outside of a body"))
+            .node_type_opt(inf.hir_id)
+        {
+            if self.visit(ty).is_break() {
+                return;
             }
         } else {
-            span_bug!(self.span, "`hir::InferArg` outside of a body");
+            // FIXME: check types of const infers here.
         }
         intravisit::walk_inf(self, inf);
-    }
-
-    fn visit_trait_ref(&mut self, trait_ref: &'tcx hir::TraitRef<'tcx>) {
-        self.span = trait_ref.path.span;
-        if self.maybe_typeck_results.is_some() {
-            // Privacy of traits in bodies is checked as a part of trait object types.
-        } else {
-            let bounds = rustc_hir_analysis::hir_trait_to_predicates(
-                self.tcx,
-                trait_ref,
-                // NOTE: This isn't really right, but the actual type doesn't matter here. It's
-                // just required by `ty::TraitRef`.
-                self.tcx.types.never,
-            );
-
-            for (clause, _) in bounds.clauses() {
-                match clause.kind().skip_binder() {
-                    ty::ClauseKind::Trait(trait_predicate) => {
-                        if self.visit_trait(trait_predicate.trait_ref).is_break() {
-                            return;
-                        }
-                    }
-                    ty::ClauseKind::Projection(proj_predicate) => {
-                        let term = self.visit(proj_predicate.term);
-                        if term.is_break()
-                            || self.visit_projection_ty(proj_predicate.projection_ty).is_break()
-                        {
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        intravisit::walk_trait_ref(self, trait_ref);
     }
 
     // Check types of expressions
@@ -1213,12 +1170,12 @@ impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
         let def = def.filter(|(kind, _)| {
             matches!(
                 kind,
-                DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy | DefKind::Static(_)
+                DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy | DefKind::Static { .. }
             )
         });
         if let Some((kind, def_id)) = def {
             let is_local_static =
-                if let DefKind::Static(_) = kind { def_id.is_local() } else { false };
+                if let DefKind::Static { .. } = kind { def_id.is_local() } else { false };
             if !self.item_is_accessible(def_id) && !is_local_static {
                 let name = match *qpath {
                     hir::QPath::LangItem(it, ..) => {
@@ -1252,7 +1209,7 @@ impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
         intravisit::walk_pat(self, pattern);
     }
 
-    fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx hir::LetStmt<'tcx>) {
         if let Some(init) = local.init {
             if self.check_expr_pat_type(init.hir_id, init.span) {
                 // Do not report duplicate errors for `let x = y`.
@@ -1265,6 +1222,7 @@ impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
 }
 
 impl<'tcx> DefIdVisitor<'tcx> for TypePrivacyVisitor<'tcx> {
+    type Result = ControlFlow<()>;
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -1273,7 +1231,7 @@ impl<'tcx> DefIdVisitor<'tcx> for TypePrivacyVisitor<'tcx> {
         def_id: DefId,
         kind: &str,
         descr: &dyn fmt::Display,
-    ) -> ControlFlow<Self::BreakTy> {
+    ) -> Self::Result {
         if self.check_def_id(def_id, kind, descr) {
             ControlFlow::Break(())
         } else {
@@ -1439,6 +1397,7 @@ impl SearchInterfaceForPrivateItemsVisitor<'_> {
 }
 
 impl<'tcx> DefIdVisitor<'tcx> for SearchInterfaceForPrivateItemsVisitor<'tcx> {
+    type Result = ControlFlow<()>;
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -1447,7 +1406,7 @@ impl<'tcx> DefIdVisitor<'tcx> for SearchInterfaceForPrivateItemsVisitor<'tcx> {
         def_id: DefId,
         kind: &str,
         descr: &dyn fmt::Display,
-    ) -> ControlFlow<Self::BreakTy> {
+    ) -> Self::Result {
         if self.check_def_id(def_id, kind, descr) {
             ControlFlow::Break(())
         } else {
@@ -1537,7 +1496,7 @@ impl<'tcx> PrivateItemsInPublicInterfacesChecker<'tcx, '_> {
         let def_kind = tcx.def_kind(def_id);
 
         match def_kind {
-            DefKind::Const | DefKind::Static(_) | DefKind::Fn | DefKind::TyAlias => {
+            DefKind::Const | DefKind::Static { .. } | DefKind::Fn | DefKind::TyAlias => {
                 if let DefKind::TyAlias = def_kind {
                     self.check_unnameable(def_id, effective_vis);
                 }
@@ -1727,7 +1686,26 @@ fn check_mod_privacy(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
     // inferred types of expressions and patterns.
     let span = tcx.def_span(module_def_id);
     let mut visitor = TypePrivacyVisitor { tcx, module_def_id, maybe_typeck_results: None, span };
-    tcx.hir().visit_item_likes_in_module(module_def_id, &mut visitor);
+
+    let module = tcx.hir_module_items(module_def_id);
+    for def_id in module.definitions() {
+        rustc_ty_utils::sig_types::walk_types(tcx, def_id, &mut visitor);
+
+        if let Some(body_id) = tcx.hir().maybe_body_owned_by(def_id) {
+            visitor.visit_nested_body(body_id);
+        }
+    }
+
+    for id in module.free_items() {
+        if let ItemKind::Impl(i) = tcx.hir().item(id).kind {
+            if let Some(item) = i.of_trait {
+                let trait_ref = tcx.impl_trait_ref(id.owner_id.def_id).unwrap();
+                let trait_ref = trait_ref.instantiate_identity();
+                visitor.span = item.path.span;
+                visitor.visit_def_id(trait_ref.def_id, "trait", &trait_ref.print_only_trait_path());
+            }
+        }
+    }
 }
 
 fn effective_visibilities(tcx: TyCtxt<'_>, (): ()) -> &EffectiveVisibilities {

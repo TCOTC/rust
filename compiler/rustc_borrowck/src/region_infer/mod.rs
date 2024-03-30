@@ -5,7 +5,7 @@ use rustc_data_structures::binary_search_util;
 use rustc_data_structures::frozen::Frozen;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::graph::scc::Sccs;
-use rustc_errors::Diagnostic;
+use rustc_errors::Diag;
 use rustc_hir::def_id::CRATE_DEF_ID;
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_infer::infer::outlives::test_type_match;
@@ -95,9 +95,11 @@ pub struct RegionInferenceContext<'tcx> {
     /// visible from this index.
     scc_universes: IndexVec<ConstraintSccIndex, ty::UniverseIndex>,
 
-    /// Contains a "representative" from each SCC. This will be the
-    /// minimal RegionVid belonging to that universe. It is used as a
-    /// kind of hacky way to manage checking outlives relationships,
+    /// Contains the "representative" region of each SCC.
+    /// It is defined as the one with the minimal RegionVid, favoring
+    /// free regions, then placeholders, then existential regions.
+    ///
+    /// It is a hacky way to manage checking regions for equality,
     /// since we can 'canonicalize' each region to the representative
     /// of its SCC and be sure that -- if they have the same repr --
     /// they *must* be equal (though not having the same repr does not
@@ -481,8 +483,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         scc_universes
     }
 
-    /// For each SCC, we compute a unique `RegionVid` (in fact, the
-    /// minimal one that belongs to the SCC). See
+    /// For each SCC, we compute a unique `RegionVid`. See the
     /// `scc_representatives` field of `RegionInferenceContext` for
     /// more details.
     fn compute_scc_representatives(
@@ -490,13 +491,20 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         definitions: &IndexSlice<RegionVid, RegionDefinition<'tcx>>,
     ) -> IndexVec<ConstraintSccIndex, ty::RegionVid> {
         let num_sccs = constraints_scc.num_sccs();
-        let next_region_vid = definitions.next_index();
-        let mut scc_representatives = IndexVec::from_elem_n(next_region_vid, num_sccs);
+        let mut scc_representatives = IndexVec::from_elem_n(RegionVid::MAX, num_sccs);
 
-        for region_vid in definitions.indices() {
-            let scc = constraints_scc.scc(region_vid);
-            let prev_min = scc_representatives[scc];
-            scc_representatives[scc] = region_vid.min(prev_min);
+        // Iterate over all RegionVids *in-order* and pick the least RegionVid as the
+        // representative of its SCC. This naturally prefers free regions over others.
+        for (vid, def) in definitions.iter_enumerated() {
+            let repr = &mut scc_representatives[constraints_scc.scc(vid)];
+            if *repr == ty::RegionVid::MAX {
+                *repr = vid;
+            } else if matches!(def.origin, NllRegionVariableOrigin::Placeholder(_))
+                && matches!(definitions[*repr].origin, NllRegionVariableOrigin::Existential { .. })
+            {
+                // Pick placeholders over existentials even if they have a greater RegionVid.
+                *repr = vid;
+            }
         }
 
         scc_representatives
@@ -592,7 +600,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     }
 
     /// Adds annotations for `#[rustc_regions]`; see `UniversalRegions::annotate`.
-    pub(crate) fn annotate(&self, tcx: TyCtxt<'tcx>, err: &mut Diagnostic) {
+    pub(crate) fn annotate(&self, tcx: TyCtxt<'tcx>, err: &mut Diag<'_, ()>) {
         self.universal_regions.annotate(tcx, err)
     }
 
@@ -662,7 +670,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         polonius_output: Option<Rc<PoloniusOutput>>,
     ) -> (Option<ClosureRegionRequirements<'tcx>>, RegionErrors<'tcx>) {
         let mir_def_id = body.source.def_id();
-        self.propagate_constraints(body);
+        self.propagate_constraints();
 
         let mut errors_buffer = RegionErrors::new(infcx.tcx);
 
@@ -716,8 +724,8 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// for each region variable until all the constraints are
     /// satisfied. Note that some values may grow **too** large to be
     /// feasible, but we check this later.
-    #[instrument(skip(self, _body), level = "debug")]
-    fn propagate_constraints(&mut self, _body: &Body<'tcx>) {
+    #[instrument(skip(self), level = "debug")]
+    fn propagate_constraints(&mut self) {
         debug!("constraints={:#?}", {
             let mut constraints: Vec<_> = self.outlives_constraints().collect();
             constraints.sort_by_key(|c| (c.sup, c.sub));
@@ -2065,7 +2073,6 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 from_closure: constraint.from_closure,
                 cause: ObligationCause::new(constraint.span, CRATE_DEF_ID, cause_code.clone()),
                 variance_info: constraint.variance_info,
-                outlives_constraint: *constraint,
             })
             .collect();
         debug!("categorized_path={:#?}", categorized_path);
@@ -2294,5 +2301,4 @@ pub struct BlameConstraint<'tcx> {
     pub from_closure: bool,
     pub cause: ObligationCause<'tcx>,
     pub variance_info: ty::VarianceDiagInfo<'tcx>,
-    pub outlives_constraint: OutlivesConstraint<'tcx>,
 }

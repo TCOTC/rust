@@ -64,9 +64,12 @@ diagnostics![
     MissingUnsafe,
     MovedOutOfRef,
     NeedMut,
+    NonExhaustiveLet,
     NoSuchField,
     PrivateAssocItem,
     PrivateField,
+    RemoveTrailingReturn,
+    RemoveUnnecessaryElse,
     ReplaceFilterMapNextWithFindMap,
     TraitImplIncorrectSafety,
     TraitImplMissingAssocItems,
@@ -84,6 +87,7 @@ diagnostics![
     UnresolvedMacroCall,
     UnresolvedMethodCall,
     UnresolvedModule,
+    UnresolvedIdent,
     UnresolvedProcMacro,
     UnusedMut,
     UnusedVariable,
@@ -200,7 +204,7 @@ pub struct NoSuchField {
 
 #[derive(Debug)]
 pub struct PrivateAssocItem {
-    pub expr_or_pat: InFile<AstPtr<Either<ast::Expr, Either<ast::Pat, ast::SelfParam>>>>,
+    pub expr_or_pat: InFile<AstPtr<Either<ast::Expr, ast::Pat>>>,
     pub item: AssocItem,
 }
 
@@ -236,7 +240,12 @@ pub struct UnresolvedMethodCall {
 
 #[derive(Debug)]
 pub struct UnresolvedAssocItem {
-    pub expr_or_pat: InFile<AstPtr<Either<ast::Expr, Either<ast::Pat, ast::SelfParam>>>>,
+    pub expr_or_pat: InFile<AstPtr<Either<ast::Expr, ast::Pat>>>,
+}
+
+#[derive(Debug)]
+pub struct UnresolvedIdent {
+    pub expr: InFile<AstPtr<ast::Expr>>,
 }
 
 #[derive(Debug)]
@@ -275,6 +284,12 @@ pub struct MismatchedArgCount {
 #[derive(Debug)]
 pub struct MissingMatchArms {
     pub scrutinee_expr: InFile<AstPtr<ast::Expr>>,
+    pub uncovered_patterns: String,
+}
+
+#[derive(Debug)]
+pub struct NonExhaustiveLet {
+    pub pat: InFile<AstPtr<ast::Pat>>,
     pub uncovered_patterns: String,
 }
 
@@ -340,6 +355,16 @@ pub struct TraitImplRedundantAssocItems {
     pub trait_: Trait,
     pub impl_: AstPtr<ast::Impl>,
     pub assoc_item: (Name, AssocItem),
+}
+
+#[derive(Debug)]
+pub struct RemoveTrailingReturn {
+    pub return_expr: InFile<AstPtr<ast::ReturnExpr>>,
+}
+
+#[derive(Debug)]
+pub struct RemoveUnnecessaryElse {
+    pub if_expr: InFile<AstPtr<ast::IfExpr>>,
 }
 
 impl AnyDiagnostic {
@@ -444,6 +469,45 @@ impl AnyDiagnostic {
                     Err(SyntheticSyntax) => (),
                 }
             }
+            BodyValidationDiagnostic::NonExhaustiveLet { pat, uncovered_patterns } => {
+                match source_map.pat_syntax(pat) {
+                    Ok(source_ptr) => {
+                        if let Some(ast_pat) = source_ptr.value.cast::<ast::Pat>() {
+                            return Some(
+                                NonExhaustiveLet {
+                                    pat: InFile::new(source_ptr.file_id, ast_pat),
+                                    uncovered_patterns,
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                    Err(SyntheticSyntax) => {}
+                }
+            }
+            BodyValidationDiagnostic::RemoveTrailingReturn { return_expr } => {
+                if let Ok(source_ptr) = source_map.expr_syntax(return_expr) {
+                    // Filters out desugared return expressions (e.g. desugared try operators).
+                    if let Some(ptr) = source_ptr.value.cast::<ast::ReturnExpr>() {
+                        return Some(
+                            RemoveTrailingReturn {
+                                return_expr: InFile::new(source_ptr.file_id, ptr),
+                            }
+                            .into(),
+                        );
+                    }
+                }
+            }
+            BodyValidationDiagnostic::RemoveUnnecessaryElse { if_expr } => {
+                if let Ok(source_ptr) = source_map.expr_syntax(if_expr) {
+                    if let Some(ptr) = source_ptr.value.cast::<ast::IfExpr>() {
+                        return Some(
+                            RemoveUnnecessaryElse { if_expr: InFile::new(source_ptr.file_id, ptr) }
+                                .into(),
+                        );
+                    }
+                }
+            }
         }
         None
     }
@@ -454,8 +518,12 @@ impl AnyDiagnostic {
         d: &InferenceDiagnostic,
         source_map: &hir_def::body::BodySourceMap,
     ) -> Option<AnyDiagnostic> {
-        let expr_syntax = |expr| source_map.expr_syntax(expr).expect("unexpected synthetic");
-        let pat_syntax = |pat| source_map.pat_syntax(pat).expect("unexpected synthetic");
+        let expr_syntax = |expr| {
+            source_map.expr_syntax(expr).inspect_err(|_| tracing::error!("synthetic syntax")).ok()
+        };
+        let pat_syntax = |pat| {
+            source_map.pat_syntax(pat).inspect_err(|_| tracing::error!("synthetic syntax")).ok()
+        };
         Some(match d {
             &InferenceDiagnostic::NoSuchField { field: expr, private } => {
                 let expr_or_pat = match expr {
@@ -469,23 +537,23 @@ impl AnyDiagnostic {
                 NoSuchField { field: expr_or_pat, private }.into()
             }
             &InferenceDiagnostic::MismatchedArgCount { call_expr, expected, found } => {
-                MismatchedArgCount { call_expr: expr_syntax(call_expr), expected, found }.into()
+                MismatchedArgCount { call_expr: expr_syntax(call_expr)?, expected, found }.into()
             }
             &InferenceDiagnostic::PrivateField { expr, field } => {
-                let expr = expr_syntax(expr);
+                let expr = expr_syntax(expr)?;
                 let field = field.into();
                 PrivateField { expr, field }.into()
             }
             &InferenceDiagnostic::PrivateAssocItem { id, item } => {
                 let expr_or_pat = match id {
-                    ExprOrPatId::ExprId(expr) => expr_syntax(expr).map(AstPtr::wrap_left),
-                    ExprOrPatId::PatId(pat) => pat_syntax(pat).map(AstPtr::wrap_right),
+                    ExprOrPatId::ExprId(expr) => expr_syntax(expr)?.map(AstPtr::wrap_left),
+                    ExprOrPatId::PatId(pat) => pat_syntax(pat)?.map(AstPtr::wrap_right),
                 };
                 let item = item.into();
                 PrivateAssocItem { expr_or_pat, item }.into()
             }
             InferenceDiagnostic::ExpectedFunction { call_expr, found } => {
-                let call_expr = expr_syntax(*call_expr);
+                let call_expr = expr_syntax(*call_expr)?;
                 ExpectedFunction { call: call_expr, found: Type::new(db, def, found.clone()) }
                     .into()
             }
@@ -495,7 +563,7 @@ impl AnyDiagnostic {
                 name,
                 method_with_same_name_exists,
             } => {
-                let expr = expr_syntax(*expr);
+                let expr = expr_syntax(*expr)?;
                 UnresolvedField {
                     expr,
                     name: name.clone(),
@@ -511,7 +579,7 @@ impl AnyDiagnostic {
                 field_with_same_name,
                 assoc_func_with_same_name,
             } => {
-                let expr = expr_syntax(*expr);
+                let expr = expr_syntax(*expr)?;
                 UnresolvedMethodCall {
                     expr,
                     name: name.clone(),
@@ -525,30 +593,31 @@ impl AnyDiagnostic {
             }
             &InferenceDiagnostic::UnresolvedAssocItem { id } => {
                 let expr_or_pat = match id {
-                    ExprOrPatId::ExprId(expr) => expr_syntax(expr).map(AstPtr::wrap_left),
-                    ExprOrPatId::PatId(pat) => pat_syntax(pat).map(AstPtr::wrap_right),
+                    ExprOrPatId::ExprId(expr) => expr_syntax(expr)?.map(AstPtr::wrap_left),
+                    ExprOrPatId::PatId(pat) => pat_syntax(pat)?.map(AstPtr::wrap_right),
                 };
                 UnresolvedAssocItem { expr_or_pat }.into()
             }
+            &InferenceDiagnostic::UnresolvedIdent { expr } => {
+                let expr = expr_syntax(expr)?;
+                UnresolvedIdent { expr }.into()
+            }
             &InferenceDiagnostic::BreakOutsideOfLoop { expr, is_break, bad_value_break } => {
-                let expr = expr_syntax(expr);
+                let expr = expr_syntax(expr)?;
                 BreakOutsideOfLoop { expr, is_break, bad_value_break }.into()
             }
             InferenceDiagnostic::TypedHole { expr, expected } => {
-                let expr = expr_syntax(*expr);
+                let expr = expr_syntax(*expr)?;
                 TypedHole { expr, expected: Type::new(db, def, expected.clone()) }.into()
             }
             &InferenceDiagnostic::MismatchedTupleStructPatArgCount { pat, expected, found } => {
                 let expr_or_pat = match pat {
-                    ExprOrPatId::ExprId(expr) => expr_syntax(expr).map(AstPtr::wrap_left),
+                    ExprOrPatId::ExprId(expr) => expr_syntax(expr)?.map(AstPtr::wrap_left),
                     ExprOrPatId::PatId(pat) => {
-                        let InFile { file_id, value } =
-                            source_map.pat_syntax(pat).expect("unexpected synthetic");
+                        let InFile { file_id, value } = pat_syntax(pat)?;
 
                         // cast from Either<Pat, SelfParam> -> Either<_, Pat>
-                        let Some(ptr) = AstPtr::try_from_raw(value.syntax_node_ptr()) else {
-                            return None;
-                        };
+                        let ptr = AstPtr::try_from_raw(value.syntax_node_ptr())?;
                         InFile { file_id, value: ptr }
                     }
                 };

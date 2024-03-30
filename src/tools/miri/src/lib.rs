@@ -1,6 +1,8 @@
 #![feature(rustc_private)]
 #![feature(cell_update)]
+#![feature(const_option)]
 #![feature(float_gamma)]
+#![feature(generic_nonzero)]
 #![feature(map_try_insert)]
 #![feature(never_type)]
 #![feature(try_blocks)]
@@ -10,7 +12,7 @@
 #![feature(nonzero_ops)]
 #![feature(let_chains)]
 #![feature(lint_reasons)]
-#![cfg_attr(not(bootstrap), feature(trait_upcasting))]
+#![feature(trait_upcasting)]
 // Configure clippy and other lints
 #![allow(
     clippy::collapsible_else_if,
@@ -33,8 +35,10 @@
     clippy::bool_to_int_with_if,
     clippy::box_default,
     clippy::needless_question_mark,
+    rustc::diagnostic_outside_of_impl,
     // We are not implementing queries here so it's fine
-    rustc::potential_query_instability
+    rustc::potential_query_instability,
+    rustc::untranslatable_diagnostic,
 )]
 #![warn(
     rust_2018_idioms,
@@ -46,8 +50,12 @@
 // Needed for rustdoc from bootstrap (with `-Znormalize-docs`).
 #![recursion_limit = "256"]
 
-extern crate either; // the one from rustc
+// Some "regular" crates we want to share with rustc
+extern crate either;
+#[macro_use]
+extern crate tracing;
 
+// The rustc crates we need
 extern crate rustc_apfloat;
 extern crate rustc_ast;
 extern crate rustc_const_eval;
@@ -60,19 +68,18 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
-
-// Necessary to pull in object code as the rest of the rustc crates are shipped only as rmeta
-// files.
+// Linking `rustc_driver` pulls in the required  object code as the rest of the rustc crates are
+// shipped only as rmeta files.
 #[allow(unused_extern_crates)]
 extern crate rustc_driver;
 
+mod alloc_addresses;
 mod borrow_tracker;
 mod clock;
 mod concurrency;
 mod diagnostics;
 mod eval;
 mod helpers;
-mod intptrcast;
 mod machine;
 mod mono_hash_map;
 mod operator;
@@ -95,6 +102,7 @@ pub use crate::shims::panic::{CatchUnwindData, EvalContextExt as _};
 pub use crate::shims::time::EvalContextExt as _;
 pub use crate::shims::tls::TlsData;
 
+pub use crate::alloc_addresses::{EvalContextExt as _, ProvenanceMode};
 pub use crate::borrow_tracker::stacked_borrows::{
     EvalContextExt as _, Item, Permission, Stack, Stacks,
 };
@@ -115,8 +123,7 @@ pub use crate::diagnostics::{
 pub use crate::eval::{
     create_ecx, eval_entry, AlignmentCheck, BacktraceStyle, IsolatedOp, MiriConfig, RejectOpWith,
 };
-pub use crate::helpers::EvalContextExt as _;
-pub use crate::intptrcast::{EvalContextExt as _, ProvenanceMode};
+pub use crate::helpers::{AccessKind, EvalContextExt as _};
 pub use crate::machine::{
     AllocExtra, FrameExtra, MiriInterpCx, MiriInterpCxExt, MiriMachine, MiriMemoryKind,
     PrimitiveLayouts, Provenance, ProvenanceExtra,
@@ -138,4 +145,7 @@ pub const MIRI_DEFAULT_ARGS: &[&str] = &[
     "-Zmir-keep-place-mention",
     "-Zmir-opt-level=0",
     "-Zmir-enable-passes=-CheckAlignment",
+    // Deduplicating diagnostics means we miss events when tracking what happens during an
+    // execution. Let's not do that.
+    "-Zdeduplicate-diagnostics=no",
 ];

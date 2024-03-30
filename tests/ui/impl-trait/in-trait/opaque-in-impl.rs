@@ -1,6 +1,4 @@
-// check-pass
-
-#![allow(incomplete_features)]
+//@ check-pass
 
 use std::fmt::Debug;
 

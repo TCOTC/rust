@@ -9,7 +9,7 @@ use rustc_span::Span;
 use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_clone(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -94,7 +94,7 @@ pub fn expand_deriving_clone(
 
 fn cs_clone_simple(
     name: &str,
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
     is_union: bool,
@@ -110,7 +110,9 @@ fn cs_clone_simple(
                 && !seen_type_names.insert(name)
             {
                 // Already produced an assertion for this type.
-            } else {
+                // Anonymous structs or unions must be eliminated as they cannot be
+                // type parameters.
+            } else if !field.ty.kind.is_anon_adt() {
                 // let _: AssertParamIsClone<FieldTy>;
                 super::assert_ty_bounds(
                     cx,
@@ -155,14 +157,14 @@ fn cs_clone_simple(
 
 fn cs_clone(
     name: &str,
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
 ) -> BlockOrExpr {
     let ctor_path;
     let all_fields;
     let fn_path = cx.std_path(&[sym::clone, sym::Clone, sym::clone]);
-    let subcall = |cx: &mut ExtCtxt<'_>, field: &FieldInfo| {
+    let subcall = |cx: &ExtCtxt<'_>, field: &FieldInfo| {
         let args = thin_vec![field.self_expr.clone()];
         cx.expr_call_global(field.span, fn_path.clone(), args)
     };

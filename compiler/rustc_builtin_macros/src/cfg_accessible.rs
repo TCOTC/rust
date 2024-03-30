@@ -10,7 +10,7 @@ use rustc_span::Span;
 
 pub(crate) struct Expander;
 
-fn validate_input<'a>(ecx: &mut ExtCtxt<'_>, mi: &'a ast::MetaItem) -> Option<&'a ast::Path> {
+fn validate_input<'a>(ecx: &ExtCtxt<'_>, mi: &'a ast::MetaItem) -> Option<&'a ast::Path> {
     use errors::CfgAccessibleInvalid::*;
     match mi.meta_item_list() {
         None => {}
@@ -46,7 +46,7 @@ impl MultiItemModifier for Expander {
     ) -> ExpandResult<Vec<Annotatable>, Annotatable> {
         let template = AttributeTemplate { list: Some("path"), ..Default::default() };
         validate_attr::check_builtin_meta_item(
-            &ecx.sess.parse_sess,
+            &ecx.sess.psess,
             meta_item,
             ast::AttrStyle::Outer,
             sym::cfg_accessible,

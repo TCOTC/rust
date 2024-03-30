@@ -1,5 +1,3 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 use crate::borrow_set::{BorrowData, BorrowSet, TwoPhaseActivation};
 use crate::places_conflict;
 use crate::AccessDepth;
@@ -29,7 +27,6 @@ pub(super) fn each_borrow_involving_path<'tcx, F, I, S>(
     s: &mut S,
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-    _location: Location,
     access_place: (AccessDepth, Place<'tcx>),
     borrow_set: &BorrowSet<'tcx>,
     is_candidate: I,

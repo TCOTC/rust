@@ -38,6 +38,9 @@ metadata_crate_dep_multiple =
     cannot satisfy dependencies so `{$crate_name}` only shows up once
     .help = having upstream crates all available in one format will likely make this go away
 
+metadata_crate_dep_not_static =
+    `{$crate_name}` was unavailable as a static crate, preventing fully static linking
+
 metadata_crate_location_unknown_type =
     extern location for {$crate_name} is of an unknown type: {$path}
 
@@ -45,7 +48,7 @@ metadata_crate_not_panic_runtime =
     the crate `{$crate_name}` is not a panic runtime
 
 metadata_dl_error =
-    {$err}
+    {$path}{$err}
 
 metadata_empty_link_name =
     link name must not be empty
@@ -281,6 +284,8 @@ metadata_unsupported_abi =
 metadata_unsupported_abi_i686 =
     ABI not supported by `#[link(kind = "raw-dylib")]` on i686
 
+metadata_wasm_c_abi =
+    older versions of the `wasm-bindgen` crate will be incompatible with future versions of Rust; please update to `wasm-bindgen` v0.2.88
 metadata_wasm_import_form =
     wasm import module must be of the form `wasm_import_module = "string"`
 

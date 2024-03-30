@@ -14,6 +14,43 @@ use rustc_span::Span;
 pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
     use rustc_hir::*;
 
+    // For an RPITIT, synthesize generics which are equal to the opaque's generics
+    // and parent fn's generics compressed into one list.
+    if let Some(ty::ImplTraitInTraitData::Trait { fn_def_id, opaque_def_id }) =
+        tcx.opt_rpitit_info(def_id.to_def_id())
+    {
+        let trait_def_id = tcx.parent(fn_def_id);
+        let opaque_ty_generics = tcx.generics_of(opaque_def_id);
+        let opaque_ty_parent_count = opaque_ty_generics.parent_count;
+        let mut params = opaque_ty_generics.params.clone();
+
+        let parent_generics = tcx.generics_of(trait_def_id);
+        let parent_count = parent_generics.parent_count + parent_generics.params.len();
+
+        let mut trait_fn_params = tcx.generics_of(fn_def_id).params.clone();
+
+        for param in &mut params {
+            param.index = param.index + parent_count as u32 + trait_fn_params.len() as u32
+                - opaque_ty_parent_count as u32;
+        }
+
+        trait_fn_params.extend(params);
+        params = trait_fn_params;
+
+        let param_def_id_to_index =
+            params.iter().map(|param| (param.def_id, param.index)).collect();
+
+        return ty::Generics {
+            parent: Some(trait_def_id),
+            parent_count,
+            params,
+            param_def_id_to_index,
+            has_self: opaque_ty_generics.has_self,
+            has_late_bound_regions: opaque_ty_generics.has_late_bound_regions,
+            host_effect_index: parent_generics.host_effect_index,
+        };
+    }
+
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
 
     let node = tcx.hir_node(hir_id);
@@ -51,7 +88,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                 // of a const parameter type, e.g. `struct Foo<const N: usize, const M: [u8; N]>` is not allowed.
                 None
             } else if tcx.features().generic_const_exprs {
-                let parent_node = tcx.hir().get_parent(hir_id);
+                let parent_node = tcx.parent_hir_node(hir_id);
                 if let Node::Variant(Variant { disr_expr: Some(constant), .. }) = parent_node
                     && constant.hir_id == hir_id
                 {
@@ -71,7 +108,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     // end up with that const looking like: `ty::ConstKind::Unevaluated(def_id, args: [N#0])`.
                     //
                     // This causes ICEs (#86580) when building the args for Foo in `fn foo() -> Foo { .. }` as
-                    // we substitute the defaults with the partially built args when we build the args. Subst'ing
+                    // we instantiate the defaults with the partially built args when we build the args. Instantiating
                     // the `N#0` on the unevaluated const indexes into the empty args we're in the process of building.
                     //
                     // We fix this by having this function return the parent's generics ourselves and truncating the
@@ -113,7 +150,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     Some(parent_def_id.to_def_id())
                 }
             } else {
-                let parent_node = tcx.hir().get_parent(hir_id);
+                let parent_node = tcx.parent_hir_node(hir_id);
                 match parent_node {
                     // HACK(eddyb) this provides the correct generics for repeat
                     // expressions' count (i.e. `N` in `[x; N]`), and explicit
@@ -181,8 +218,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         Deny,
     }
 
-    let no_generics = hir::Generics::empty();
-    let ast_generics = node.generics().unwrap_or(no_generics);
+    let hir_generics = node.generics().unwrap_or(hir::Generics::empty());
     let (opt_self, allow_defaults) = match node {
         Node::Item(item) => {
             match item.kind {
@@ -238,13 +274,13 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         generics.parent_count + generics.params.len()
     });
 
-    let mut params: Vec<_> = Vec::with_capacity(ast_generics.params.len() + has_self as usize);
+    let mut params: Vec<_> = Vec::with_capacity(hir_generics.params.len() + has_self as usize);
 
     if let Some(opt_self) = opt_self {
         params.push(opt_self);
     }
 
-    let early_lifetimes = super::early_bound_lifetimes_from_generics(tcx, ast_generics);
+    let early_lifetimes = super::early_bound_lifetimes_from_generics(tcx, hir_generics);
     params.extend(early_lifetimes.enumerate().map(|(i, param)| ty::GenericParamDef {
         name: param.name.ident().name,
         index: own_start + i as u32,
@@ -265,7 +301,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
     const TYPE_DEFAULT_NOT_ALLOWED: &'static str = "defaults for type parameters are only allowed in \
     `struct`, `enum`, `type`, or `trait` definitions";
 
-    params.extend(ast_generics.params.iter().filter_map(|param| match param.kind {
+    params.extend(hir_generics.params.iter().filter_map(|param| match param.kind {
         GenericParamKind::Lifetime { .. } => None,
         GenericParamKind::Type { default, synthetic, .. } => {
             if default.is_some() {
@@ -471,29 +507,9 @@ fn has_late_bound_regions<'tcx>(tcx: TyCtxt<'tcx>, node: Node<'tcx>) -> Option<S
         visitor.has_late_bound_regions
     }
 
-    match node {
-        Node::TraitItem(item) => match &item.kind {
-            hir::TraitItemKind::Fn(sig, _) => has_late_bound_regions(tcx, item.generics, sig.decl),
-            _ => None,
-        },
-        Node::ImplItem(item) => match &item.kind {
-            hir::ImplItemKind::Fn(sig, _) => has_late_bound_regions(tcx, item.generics, sig.decl),
-            _ => None,
-        },
-        Node::ForeignItem(item) => match item.kind {
-            hir::ForeignItemKind::Fn(fn_decl, _, generics) => {
-                has_late_bound_regions(tcx, generics, fn_decl)
-            }
-            _ => None,
-        },
-        Node::Item(item) => match &item.kind {
-            hir::ItemKind::Fn(sig, .., generics, _) => {
-                has_late_bound_regions(tcx, generics, sig.decl)
-            }
-            _ => None,
-        },
-        _ => None,
-    }
+    let decl = node.fn_decl()?;
+    let generics = node.generics()?;
+    has_late_bound_regions(tcx, generics, decl)
 }
 
 struct AnonConstInParamTyDetector {

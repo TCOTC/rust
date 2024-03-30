@@ -31,8 +31,9 @@ use proc_macro::bridge::client::ProcMacro;
 use std::error::Error;
 use std::ops::Fn;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
-use std::{cmp, iter};
+use std::{cmp, env, iter};
 
 /// The backend's way to give the crate store access to the metadata in a library.
 /// Note that it returns the raw metadata bytes stored in the library file, whether
@@ -388,6 +389,15 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         None
     }
 
+    // The `dependency` type is determined by the command line arguments(`--extern`) and
+    // `private_dep`. However, sometimes the directly dependent crate is not specified by
+    // `--extern`, in this case, `private-dep` is none during loading. This is equivalent to the
+    // scenario where the command parameter is set to `public-dependency`
+    fn is_private_dep(&self, name: &str, private_dep: Option<bool>) -> bool {
+        self.sess.opts.externs.get(name).map_or(private_dep.unwrap_or(false), |e| e.is_private_dep)
+            && private_dep.unwrap_or(true)
+    }
+
     fn register_crate(
         &mut self,
         host_lib: Option<Library>,
@@ -397,19 +407,13 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         name: Symbol,
         private_dep: Option<bool>,
     ) -> Result<CrateNum, CrateError> {
-        let _prof_timer = self.sess.prof.generic_activity("metadata_register_crate");
+        let _prof_timer =
+            self.sess.prof.generic_activity_with_arg("metadata_register_crate", name.as_str());
 
         let Library { source, metadata } = lib;
         let crate_root = metadata.get_root();
         let host_hash = host_lib.as_ref().map(|lib| lib.metadata.get_root().hash());
-
-        let private_dep = self
-            .sess
-            .opts
-            .externs
-            .get(name.as_str())
-            .map_or(private_dep.unwrap_or(false), |e| e.is_private_dep)
-            && private_dep.unwrap_or(true);
+        let private_dep = self.is_private_dep(name.as_str(), private_dep);
 
         // Claim this crate number and cache it
         let cnum = self.cstore.intern_stable_crate_id(&crate_root)?;
@@ -599,14 +603,17 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
 
         match result {
             (LoadResult::Previous(cnum), None) => {
+                // When `private_dep` is none, it indicates the directly dependent crate. If it is
+                // not specified by `--extern` on command line parameters, it may be
+                // `private-dependency` when `register_crate` is called for the first time. Then it must be updated to
+                // `public-dependency` here.
+                let private_dep = self.is_private_dep(name.as_str(), private_dep);
                 let data = self.cstore.get_crate_data_mut(cnum);
                 if data.is_proc_macro_crate() {
                     dep_kind = CrateDepKind::MacrosOnly;
                 }
                 data.set_dep_kind(cmp::max(data.dep_kind(), dep_kind));
-                if let Some(private_dep) = private_dep {
-                    data.update_and_private_dep(private_dep);
-                }
+                data.update_and_private_dep(private_dep);
                 Ok(cnum)
             }
             (LoadResult::Loaded(library), host_library) => {
@@ -692,20 +699,8 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         path: &Path,
         stable_crate_id: StableCrateId,
     ) -> Result<&'static [ProcMacro], CrateError> {
-        // Make sure the path contains a / or the linker will search for it.
-        let path = try_canonicalize(path).unwrap();
-        let lib = load_dylib(&path, 5).map_err(|err| CrateError::DlOpen(err))?;
-
         let sym_name = self.sess.generate_proc_macro_decls_symbol(stable_crate_id);
-        let sym = unsafe { lib.get::<*const &[ProcMacro]>(sym_name.as_bytes()) }
-            .map_err(|err| CrateError::DlSym(err.to_string()))?;
-
-        // Intentionally leak the dynamic library. We can't ever unload it
-        // since the library can make things that will live arbitrarily long.
-        let sym = unsafe { sym.into_raw() };
-        std::mem::forget(lib);
-
-        Ok(unsafe { **sym })
+        Ok(unsafe { *load_symbol_from_dylib::<*const &[ProcMacro]>(path, &sym_name)? })
     }
 
     fn inject_panic_runtime(&mut self, krate: &ast::Crate) {
@@ -926,7 +921,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         what: &str,
         needs_dep: &dyn Fn(&CrateMetadata) -> bool,
     ) {
-        // don't perform this validation if the session has errors, as one of
+        // Don't perform this validation if the session has errors, as one of
         // those errors may indicate a circular dependency which could cause
         // this to stack overflow.
         if self.dcx().has_errors().is_some() {
@@ -959,6 +954,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         }
     }
 
+    #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
     fn report_unused_deps(&mut self, krate: &ast::Crate) {
         // Make a point span rather than covering the whole file
         let span = krate.spans.inner_span.shrink_to_lo();
@@ -983,7 +979,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
                 continue;
             }
 
-            self.sess.parse_sess.buffer_lint(
+            self.sess.psess.buffer_lint(
                     lint::builtin::UNUSED_CRATE_DEPENDENCIES,
                     span,
                     ast::CRATE_NODE_ID,
@@ -996,6 +992,44 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         }
     }
 
+    fn report_future_incompatible_deps(&self, krate: &ast::Crate) {
+        let name = self.tcx.crate_name(LOCAL_CRATE);
+
+        if name.as_str() == "wasm_bindgen" {
+            let major = env::var("CARGO_PKG_VERSION_MAJOR")
+                .ok()
+                .and_then(|major| u64::from_str(&major).ok());
+            let minor = env::var("CARGO_PKG_VERSION_MINOR")
+                .ok()
+                .and_then(|minor| u64::from_str(&minor).ok());
+            let patch = env::var("CARGO_PKG_VERSION_PATCH")
+                .ok()
+                .and_then(|patch| u64::from_str(&patch).ok());
+
+            match (major, minor, patch) {
+                // v1 or bigger is valid.
+                (Some(1..), _, _) => return,
+                // v0.3 or bigger is valid.
+                (Some(0), Some(3..), _) => return,
+                // v0.2.88 or bigger is valid.
+                (Some(0), Some(2), Some(88..)) => return,
+                // Not using Cargo.
+                (None, None, None) => return,
+                _ => (),
+            }
+
+            // Make a point span rather than covering the whole file
+            let span = krate.spans.inner_span.shrink_to_lo();
+
+            self.sess.psess.buffer_lint(
+                lint::builtin::WASM_C_ABI,
+                span,
+                ast::CRATE_NODE_ID,
+                crate::fluent_generated::metadata_wasm_c_abi,
+            );
+        }
+    }
+
     pub fn postprocess(&mut self, krate: &ast::Crate) {
         self.inject_forced_externs();
         self.inject_profiler_runtime(krate);
@@ -1003,6 +1037,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         self.inject_panic_runtime(krate);
 
         self.report_unused_deps(krate);
+        self.report_future_incompatible_deps(krate);
 
         info!("{:?}", CrateDump(self.cstore));
     }
@@ -1070,16 +1105,6 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
     pub fn maybe_process_path_extern(&mut self, name: Symbol) -> Option<CrateNum> {
         self.maybe_resolve_crate(name, CrateDepKind::Explicit, None).ok()
     }
-
-    pub fn unload_unused_crates(&mut self) {
-        for opt_cdata in &mut self.cstore.metas {
-            if let Some(cdata) = opt_cdata
-                && !cdata.used()
-            {
-                *opt_cdata = None;
-            }
-        }
-    }
 }
 
 fn global_allocator_spans(krate: &ast::Crate) -> Vec<Span> {
@@ -1126,6 +1151,10 @@ fn alloc_error_handler_spans(krate: &ast::Crate) -> Vec<Span> {
     f.spans
 }
 
+fn format_dlopen_err(e: &(dyn std::error::Error + 'static)) -> String {
+    e.sources().map(|e| format!(": {e}")).collect()
+}
+
 // On Windows the compiler would sometimes intermittently fail to open the
 // proc-macro DLL with `Error::LoadLibraryExW`. It is suspected that something in the
 // system still holds a lock on the file, so we retry a few times before calling it
@@ -1150,7 +1179,13 @@ fn load_dylib(path: &Path, max_attempts: usize) -> Result<libloading::Library, S
             Err(err) => {
                 // Only try to recover from this specific error.
                 if !matches!(err, libloading::Error::LoadLibraryExW { .. }) {
-                    return Err(err.to_string());
+                    let err = format_dlopen_err(&err);
+                    // We include the path of the dylib in the error ourselves, so
+                    // if it's in the error, we strip it.
+                    if let Some(err) = err.strip_prefix(&format!(": {}", path.display())) {
+                        return Err(err.to_string());
+                    }
+                    return Err(err);
                 }
 
                 last_error = Some(err);
@@ -1164,9 +1199,43 @@ fn load_dylib(path: &Path, max_attempts: usize) -> Result<libloading::Library, S
 
     let last_error = last_error.unwrap();
     let message = if let Some(src) = last_error.source() {
-        format!("{last_error} ({src}) (retried {max_attempts} times)")
+        format!("{} ({src}) (retried {max_attempts} times)", format_dlopen_err(&last_error))
     } else {
-        format!("{last_error} (retried {max_attempts} times)")
+        format!("{} (retried {max_attempts} times)", format_dlopen_err(&last_error))
     };
     Err(message)
+}
+
+pub enum DylibError {
+    DlOpen(String, String),
+    DlSym(String, String),
+}
+
+impl From<DylibError> for CrateError {
+    fn from(err: DylibError) -> CrateError {
+        match err {
+            DylibError::DlOpen(path, err) => CrateError::DlOpen(path, err),
+            DylibError::DlSym(path, err) => CrateError::DlSym(path, err),
+        }
+    }
+}
+
+pub unsafe fn load_symbol_from_dylib<T: Copy>(
+    path: &Path,
+    sym_name: &str,
+) -> Result<T, DylibError> {
+    // Make sure the path contains a / or the linker will search for it.
+    let path = try_canonicalize(path).unwrap();
+    let lib =
+        load_dylib(&path, 5).map_err(|err| DylibError::DlOpen(path.display().to_string(), err))?;
+
+    let sym = unsafe { lib.get::<T>(sym_name.as_bytes()) }
+        .map_err(|err| DylibError::DlSym(path.display().to_string(), format_dlopen_err(&err)))?;
+
+    // Intentionally leak the dynamic library. We can't ever unload it
+    // since the library can make things that will live arbitrarily long.
+    let sym = unsafe { sym.into_raw() };
+    std::mem::forget(lib);
+
+    Ok(*sym)
 }

@@ -8,7 +8,7 @@ use rustc_span::Span;
 use thin_vec::thin_vec;
 
 pub fn expand_deriving_partial_ord(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
@@ -69,7 +69,7 @@ pub fn expand_deriving_partial_ord(
 }
 
 fn cs_partial_cmp(
-    cx: &mut ExtCtxt<'_>,
+    cx: &ExtCtxt<'_>,
     span: Span,
     substr: &Substructure<'_>,
     tag_then_data: bool,
@@ -132,7 +132,7 @@ fn cs_partial_cmp(
                 // Reference: https://github.com/rust-lang/rust/pull/103659#issuecomment-1328126354
 
                 if !tag_then_data
-                    && let ExprKind::Match(_, arms) = &mut expr1.kind
+                    && let ExprKind::Match(_, arms, _) = &mut expr1.kind
                     && let Some(last) = arms.last_mut()
                     && let PatKind::Wild = last.pat.kind
                 {

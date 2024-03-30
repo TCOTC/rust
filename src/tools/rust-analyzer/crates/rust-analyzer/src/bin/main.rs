@@ -3,17 +3,20 @@
 //! Based on cli flags, either spawns an LSP server, or runs a batch analysis
 
 #![warn(rust_2018_idioms, unused_lifetimes)]
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
 mod rustc_wrapper;
 
-use std::{env, fs, path::PathBuf, process, sync::Arc};
+use std::{env, fs, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::Context;
 use lsp_server::Connection;
 use rust_analyzer::{cli::flags, config::Config, from_json};
+use semver::Version;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use vfs::AbsPathBuf;
 
@@ -25,21 +28,15 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     if std::env::var("RA_RUSTC_WRAPPER").is_ok() {
-        let mut args = std::env::args_os();
-        let _me = args.next().unwrap();
-        let rustc = args.next().unwrap();
-        let code = match rustc_wrapper::run_rustc_skipping_cargo_checking(rustc, args.collect()) {
-            Ok(rustc_wrapper::ExitCode(code)) => code.unwrap_or(102),
-            Err(err) => {
-                eprintln!("{err}");
-                101
-            }
-        };
-        process::exit(code);
+        rustc_wrapper::main().map_err(Into::into)
+    } else {
+        actual_main()
     }
+}
 
+fn actual_main() -> anyhow::Result<ExitCode> {
     let flags = flags::RustAnalyzer::from_env_or_exit();
 
     #[cfg(debug_assertions)]
@@ -56,14 +53,14 @@ fn main() -> anyhow::Result<()> {
     let verbosity = flags.verbosity();
 
     match flags.subcommand {
-        flags::RustAnalyzerCmd::LspServer(cmd) => {
+        flags::RustAnalyzerCmd::LspServer(cmd) => 'lsp_server: {
             if cmd.print_config_schema {
                 println!("{:#}", Config::json_schema());
-                return Ok(());
+                break 'lsp_server;
             }
             if cmd.version {
                 println!("rust-analyzer {}", rust_analyzer::version());
-                return Ok(());
+                break 'lsp_server;
             }
 
             // rust-analyzer’s “main thread” is actually
@@ -88,7 +85,7 @@ fn main() -> anyhow::Result<()> {
         flags::RustAnalyzerCmd::RunTests(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::RustcTests(cmd) => cmd.run()?,
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn setup_logging(log_file_flag: Option<PathBuf>) -> anyhow::Result<()> {
@@ -132,7 +129,7 @@ fn setup_logging(log_file_flag: Option<PathBuf>) -> anyhow::Result<()> {
         writer,
         // Deliberately enable all `error` logs if the user has not set RA_LOG, as there is usually
         // useful information in there for debugging.
-        filter: env::var("RA_LOG").ok().unwrap_or_else(|| "error".to_string()),
+        filter: env::var("RA_LOG").ok().unwrap_or_else(|| "error".to_owned()),
         chalk_filter: env::var("CHALK_DEBUG").ok(),
         profile_filter: env::var("RA_PROFILE").ok(),
     }
@@ -197,10 +194,18 @@ fn run_server() -> anyhow::Result<()> {
         }
     };
 
-    let mut is_visual_studio_code = false;
+    let mut visual_studio_code_version = None;
     if let Some(client_info) = client_info {
-        tracing::info!("Client '{}' {}", client_info.name, client_info.version.unwrap_or_default());
-        is_visual_studio_code = client_info.name.starts_with("Visual Studio Code");
+        tracing::info!(
+            "Client '{}' {}",
+            client_info.name,
+            client_info.version.as_deref().unwrap_or_default()
+        );
+        visual_studio_code_version = client_info
+            .name
+            .starts_with("Visual Studio Code")
+            .then(|| client_info.version.as_deref().map(Version::parse).and_then(Result::ok))
+            .flatten();
     }
 
     let workspace_roots = workspace_folders
@@ -214,7 +219,8 @@ fn run_server() -> anyhow::Result<()> {
         })
         .filter(|workspaces| !workspaces.is_empty())
         .unwrap_or_else(|| vec![root_path.clone()]);
-    let mut config = Config::new(root_path, capabilities, workspace_roots, is_visual_studio_code);
+    let mut config =
+        Config::new(root_path, capabilities, workspace_roots, visual_studio_code_version);
     if let Some(json) = initialization_options {
         if let Err(e) = config.update(json) {
             use lsp_types::{
@@ -222,7 +228,7 @@ fn run_server() -> anyhow::Result<()> {
                 MessageType, ShowMessageParams,
             };
             let not = lsp_server::Notification::new(
-                ShowMessage::METHOD.to_string(),
+                ShowMessage::METHOD.to_owned(),
                 ShowMessageParams { typ: MessageType::WARNING, message: e.to_string() },
             );
             connection.sender.send(lsp_server::Message::Notification(not)).unwrap();

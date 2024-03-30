@@ -142,7 +142,7 @@ packed-remapped-single:
 packed-remapped-scope:
 	$(RUSTC) $(UNSTABLEOPTS) -C split-debuginfo=packed -C debuginfo=2 \
 		-Z split-dwarf-kind=single --remap-path-prefix $(TMPDIR)=/a \
-		-Z remap-path-scope=split-debuginfo-path foo.rs -g
+		-Z remap-path-scope=debuginfo foo.rs -g
 	objdump -Wi $(TMPDIR)/foo | grep DW_AT_GNU_dwo_name | (! grep $(TMPDIR)) || exit 1
 	ls $(TMPDIR)/*.o && exit 1 || exit 0
 	ls $(TMPDIR)/*.dwo && exit 1 || exit 0
@@ -234,28 +234,28 @@ unpacked-single:
 	ls $(TMPDIR)/*.dwp && exit 1 || exit 0
 	rm $(TMPDIR)/$(call BIN,foo)
 
-unpacked-lto: packed-lto-split packed-lto-single
+unpacked-lto: unpacked-lto-split unpacked-lto-single
 
 # - rmeta file added to rlib, no object files are generated and thus no debuginfo is generated
-# - `.o` never created
+# - `.o` present (bitcode)
 # - `.dwo` never created
 # - `.dwp` never created
 unpacked-lto-split:
 	$(RUSTC) baz.rs -g $(UNSTABLEOPTS) -Csplit-debuginfo=unpacked -Zsplit-dwarf-kind=split \
 		--crate-type=rlib -Clinker-plugin-lto
-	ls $(TMPDIR)/*.o && exit 1 || exit 0
+	rm $(TMPDIR)/*.o
 	ls $(TMPDIR)/*.dwo && exit 1 || exit 0
 	ls $(TMPDIR)/*.dwp && exit 1 || exit 0
 	rm $(TMPDIR)/libbaz.rlib
 
 # - rmeta file added to rlib, no object files are generated and thus no debuginfo is generated
-# - `.o` never created
+# - `.o` present (bitcode)
 # - `.dwo` never created
 # - `.dwp` never created
 unpacked-lto-single:
 	$(RUSTC) baz.rs -g $(UNSTABLEOPTS) -Csplit-debuginfo=unpacked -Zsplit-dwarf-kind=single \
 		--crate-type=rlib -Clinker-plugin-lto
-	ls $(TMPDIR)/*.o && exit 1 || exit 0
+	rm $(TMPDIR)/*.o
 	ls $(TMPDIR)/*.dwo && exit 1 || exit 0
 	ls $(TMPDIR)/*.dwp && exit 1 || exit 0
 	rm $(TMPDIR)/libbaz.rlib
@@ -298,7 +298,7 @@ unpacked-remapped-single:
 unpacked-remapped-scope:
 	$(RUSTC) $(UNSTABLEOPTS) -C split-debuginfo=unpacked -C debuginfo=2 \
 		-Z split-dwarf-kind=single --remap-path-prefix $(TMPDIR)=/a \
-		-Z remap-path-scope=split-debuginfo-path foo.rs -g
+		-Z remap-path-scope=debuginfo foo.rs -g
 	objdump -Wi $(TMPDIR)/foo | grep DW_AT_GNU_dwo_name | (! grep $(TMPDIR)) || exit 1
 	rm $(TMPDIR)/*.o
 	ls $(TMPDIR)/*.dwo && exit 1 || exit 0

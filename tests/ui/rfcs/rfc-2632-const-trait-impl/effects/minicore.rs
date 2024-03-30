@@ -1,4 +1,4 @@
-// check-pass
+//@ check-pass
 
 #![crate_type = "lib"]
 #![feature(no_core, lang_items, unboxed_closures, auto_traits, intrinsics, rustc_attrs, staged_api)]
@@ -509,21 +509,24 @@ trait StructuralPartialEq {}
 
 const fn drop<T: ~const Destruct>(_: T) {}
 
-extern "rust-intrinsic" {
-    #[rustc_const_stable(feature = "const_eval_select", since = "1.0.0")]
-    fn const_eval_select<ARG: Tuple, F, G, RET>(
-        arg: ARG,
-        called_in_const: F,
-        called_at_rt: G,
-    ) -> RET
-    where
-        F: const FnOnce<ARG, Output = RET>,
-        G: FnOnce<ARG, Output = RET>;
+#[rustc_const_stable(feature = "const_eval_select", since = "1.0.0")]
+#[rustc_intrinsic_must_be_overridden]
+#[rustc_intrinsic]
+const fn const_eval_select<ARG: Tuple, F, G, RET>(
+    arg: ARG,
+    called_in_const: F,
+    called_at_rt: G,
+) -> RET
+where
+    F: const FnOnce<ARG, Output = RET>,
+    G: FnOnce<ARG, Output = RET>,
+{
+    loop {}
 }
 
 fn test_const_eval_select() {
     const fn const_fn() {}
     fn rt_fn() {}
 
-    unsafe { const_eval_select((), const_fn, rt_fn); }
+    const_eval_select((), const_fn, rt_fn);
 }

@@ -21,13 +21,7 @@ pub mod fs;
 pub mod io;
 #[path = "../unsupported/net.rs"]
 pub mod net;
-#[path = "../unsupported/once.rs"]
-pub mod once;
 pub mod os;
-#[path = "../unix/os_str.rs"]
-pub mod os_str;
-#[path = "../unix/path.rs"]
-pub mod path;
 #[path = "../unsupported/pipe.rs"]
 pub mod pipe;
 #[path = "../unsupported/process.rs"]
@@ -37,8 +31,6 @@ pub mod thread_local_key;
 #[path = "../unsupported/time.rs"]
 pub mod time;
 
-#[path = "../unsupported/locks/mod.rs"]
-pub mod locks;
 #[path = "../unsupported/thread.rs"]
 pub mod thread;
 
@@ -48,10 +40,6 @@ pub mod thread_parking;
 mod abi;
 
 use crate::io as std_io;
-
-pub mod memchr {
-    pub use core::slice::memchr::{memchr, memrchr};
-}
 
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.

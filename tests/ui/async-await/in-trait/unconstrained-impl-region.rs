@@ -1,4 +1,4 @@
-// edition: 2021
+//@ edition: 2021
 
 pub(crate) trait Inbox<M> {
     async fn next(self) -> M;
@@ -14,6 +14,7 @@ impl<'a> Actor for () {
 //~^ ERROR the lifetime parameter `'a` is not constrained by the impl trait, self type, or predicates
     type Message = &'a ();
     async fn on_mount(self, _: impl Inbox<&'a ()>) {}
+    //~^ ERROR the trait bound `impl Inbox<&'a ()>: Inbox<&'a ()>` is not satisfied
 }
 
 fn main() {}

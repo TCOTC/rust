@@ -243,14 +243,14 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
 
 /// Traverses and collects all the lang items in all crates.
 fn get_lang_items(tcx: TyCtxt<'_>, (): ()) -> LanguageItems {
-    let resolver = tcx.resolver_for_lowering(()).borrow();
+    let resolver = tcx.resolver_for_lowering().borrow();
     let (resolver, krate) = &*resolver;
 
     // Initialize the collector.
     let mut collector = LanguageItemCollector::new(tcx, resolver);
 
     // Collect lang items in other crates.
-    for &cnum in tcx.crates(()).iter() {
+    for &cnum in tcx.used_crates(()).iter() {
         for &(def_id, lang_item) in tcx.defined_lang_items(cnum).iter() {
             collector.collect_item(lang_item, def_id, None);
         }

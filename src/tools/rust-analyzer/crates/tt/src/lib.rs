@@ -23,10 +23,10 @@ pub enum TokenTree<S> {
 }
 impl_from!(Leaf<S>, Subtree<S> for TokenTree);
 impl<S: Span> TokenTree<S> {
-    pub const fn empty(span: S) -> Self {
+    pub fn empty(span: S) -> Self {
         Self::Subtree(Subtree {
             delimiter: Delimiter::invisible_spanned(span),
-            token_trees: vec![],
+            token_trees: Box::new([]),
         })
     }
 
@@ -34,7 +34,7 @@ impl<S: Span> TokenTree<S> {
         match self {
             TokenTree::Leaf(_) => Subtree {
                 delimiter: Delimiter::invisible_delim_spanned(span),
-                token_trees: vec![self],
+                token_trees: Box::new([self]),
             },
             TokenTree::Subtree(s) => s,
         }
@@ -69,25 +69,35 @@ impl_from!(Literal<S>, Punct<S>, Ident<S> for Leaf);
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Subtree<S> {
     pub delimiter: Delimiter<S>,
-    pub token_trees: Vec<TokenTree<S>>,
+    pub token_trees: Box<[TokenTree<S>]>,
 }
 
 impl<S: Span> Subtree<S> {
-    pub const fn empty(span: DelimSpan<S>) -> Self {
-        Subtree { delimiter: Delimiter::invisible_delim_spanned(span), token_trees: vec![] }
+    pub fn empty(span: DelimSpan<S>) -> Self {
+        Subtree { delimiter: Delimiter::invisible_delim_spanned(span), token_trees: Box::new([]) }
     }
 
-    pub fn visit_ids(&mut self, f: &mut impl FnMut(S) -> S) {
-        self.delimiter.open = f(self.delimiter.open);
-        self.delimiter.close = f(self.delimiter.close);
-        self.token_trees.iter_mut().for_each(|tt| match tt {
-            crate::TokenTree::Leaf(leaf) => match leaf {
-                crate::Leaf::Literal(it) => it.span = f(it.span),
-                crate::Leaf::Punct(it) => it.span = f(it.span),
-                crate::Leaf::Ident(it) => it.span = f(it.span),
-            },
-            crate::TokenTree::Subtree(s) => s.visit_ids(f),
-        })
+    /// This is slow, and should be avoided, as it will always reallocate!
+    pub fn push(&mut self, subtree: TokenTree<S>) {
+        let mut mutable_trees = std::mem::take(&mut self.token_trees).into_vec();
+
+        // Reserve exactly space for one element, to avoid `into_boxed_slice` having to reallocate again.
+        mutable_trees.reserve_exact(1);
+        mutable_trees.push(subtree);
+
+        self.token_trees = mutable_trees.into_boxed_slice();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SubtreeBuilder<S> {
+    pub delimiter: Delimiter<S>,
+    pub token_trees: Vec<TokenTree<S>>,
+}
+
+impl<S> SubtreeBuilder<S> {
+    pub fn build(self) -> Subtree<S> {
+        Subtree { delimiter: self.delimiter, token_trees: self.token_trees.into_boxed_slice() }
     }
 }
 
@@ -142,6 +152,7 @@ pub struct Punct<S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Spacing {
     Alone,
+    /// Whether the following token is joint to the current one.
     Joint,
 }
 
@@ -166,17 +177,19 @@ fn print_debug_subtree<S: fmt::Debug>(
     let align = "  ".repeat(level);
 
     let Delimiter { kind, open, close } = &subtree.delimiter;
-    let aux = match kind {
-        DelimiterKind::Invisible => format!("$$ {:?} {:?}", open, close),
-        DelimiterKind::Parenthesis => format!("() {:?} {:?}", open, close),
-        DelimiterKind::Brace => format!("{{}} {:?} {:?}", open, close),
-        DelimiterKind::Bracket => format!("[] {:?} {:?}", open, close),
+    let delim = match kind {
+        DelimiterKind::Invisible => "$$",
+        DelimiterKind::Parenthesis => "()",
+        DelimiterKind::Brace => "{}",
+        DelimiterKind::Bracket => "[]",
     };
 
-    if subtree.token_trees.is_empty() {
-        write!(f, "{align}SUBTREE {aux}")?;
-    } else {
-        writeln!(f, "{align}SUBTREE {aux}")?;
+    write!(f, "{align}SUBTREE {delim} ",)?;
+    fmt::Debug::fmt(&open, f)?;
+    write!(f, " ")?;
+    fmt::Debug::fmt(&close, f)?;
+    if !subtree.token_trees.is_empty() {
+        writeln!(f)?;
         for (idx, child) in subtree.token_trees.iter().enumerate() {
             print_debug_token(f, child, level + 1)?;
             if idx != subtree.token_trees.len() - 1 {
@@ -197,16 +210,24 @@ fn print_debug_token<S: fmt::Debug>(
 
     match tkn {
         TokenTree::Leaf(leaf) => match leaf {
-            Leaf::Literal(lit) => write!(f, "{}LITERAL {} {:?}", align, lit.text, lit.span)?,
-            Leaf::Punct(punct) => write!(
-                f,
-                "{}PUNCH   {} [{}] {:?}",
-                align,
-                punct.char,
-                if punct.spacing == Spacing::Alone { "alone" } else { "joint" },
-                punct.span
-            )?,
-            Leaf::Ident(ident) => write!(f, "{}IDENT   {} {:?}", align, ident.text, ident.span)?,
+            Leaf::Literal(lit) => {
+                write!(f, "{}LITERAL {}", align, lit.text)?;
+                fmt::Debug::fmt(&lit.span, f)?;
+            }
+            Leaf::Punct(punct) => {
+                write!(
+                    f,
+                    "{}PUNCH   {} [{}] ",
+                    align,
+                    punct.char,
+                    if punct.spacing == Spacing::Alone { "alone" } else { "joint" },
+                )?;
+                fmt::Debug::fmt(&punct.span, f)?;
+            }
+            Leaf::Ident(ident) => {
+                write!(f, "{}IDENT   {} ", align, ident.text)?;
+                fmt::Debug::fmt(&ident.span, f)?;
+            }
         },
         TokenTree::Subtree(subtree) => {
             print_debug_subtree(f, subtree, level)?;
@@ -241,7 +262,7 @@ impl<S> fmt::Display for Subtree<S> {
         };
         f.write_str(l)?;
         let mut needs_space = false;
-        for tt in &self.token_trees {
+        for tt in self.token_trees.iter() {
             if needs_space {
                 f.write_str(" ")?;
             }
@@ -316,7 +337,7 @@ impl<S> Subtree<S> {
         let mut res = String::new();
         res.push_str(delim.0);
         let mut last = None;
-        for child in &self.token_trees {
+        for child in self.token_trees.iter() {
             let s = match child {
                 TokenTree::Leaf(it) => {
                     let s = match it {
@@ -326,11 +347,11 @@ impl<S> Subtree<S> {
                     };
                     match (it, last) {
                         (Leaf::Ident(_), Some(&TokenTree::Leaf(Leaf::Ident(_)))) => {
-                            " ".to_string() + &s
+                            " ".to_owned() + &s
                         }
                         (Leaf::Punct(_), Some(TokenTree::Leaf(Leaf::Punct(punct)))) => {
                             if punct.spacing == Spacing::Alone {
-                                " ".to_string() + &s
+                                " ".to_owned() + &s
                             } else {
                                 s
                             }

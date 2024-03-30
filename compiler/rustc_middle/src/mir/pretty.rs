@@ -4,14 +4,16 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::mir::interpret::ConstAllocation;
+
 use super::graphviz::write_mir_fn_graphviz;
-use rustc_ast::InlineAsmTemplatePiece;
+use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_middle::mir::interpret::{
     alloc_range, read_target_uint, AllocBytes, AllocId, Allocation, GlobalAlloc, Pointer,
     Provenance,
 };
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{self, *};
+use rustc_middle::mir::*;
 use rustc_target::abi::Size;
 
 const INDENT: &str = "    ";
@@ -124,7 +126,7 @@ fn dump_matched_mir_node<'tcx, F>(
             Some(promoted) => write!(file, "::{promoted:?}`")?,
         }
         writeln!(file, " {disambiguator} {pass_name}")?;
-        if let Some(ref layout) = body.coroutine_layout() {
+        if let Some(ref layout) = body.coroutine_layout_raw() {
             writeln!(file, "/* coroutine_layout = {layout:#?} */")?;
         }
         writeln!(file)?;
@@ -459,8 +461,30 @@ pub fn write_mir_intro<'tcx>(
     // Add an empty line before the first block is printed.
     writeln!(w)?;
 
+    if let Some(branch_info) = &body.coverage_branch_info {
+        write_coverage_branch_info(branch_info, w)?;
+    }
     if let Some(function_coverage_info) = &body.function_coverage_info {
         write_function_coverage_info(function_coverage_info, w)?;
+    }
+
+    Ok(())
+}
+
+fn write_coverage_branch_info(
+    branch_info: &coverage::BranchInfo,
+    w: &mut dyn io::Write,
+) -> io::Result<()> {
+    let coverage::BranchInfo { branch_spans, .. } = branch_info;
+
+    for coverage::BranchSpan { span, true_marker, false_marker } in branch_spans {
+        writeln!(
+            w,
+            "{INDENT}coverage branch {{ true: {true_marker:?}, false: {false_marker:?} }} => {span:?}",
+        )?;
+    }
+    if !branch_spans.is_empty() {
+        writeln!(w)?;
     }
 
     Ok(())
@@ -491,13 +515,17 @@ fn write_mir_sig(tcx: TyCtxt<'_>, body: &Body<'_>, w: &mut dyn io::Write) -> io:
     let kind = tcx.def_kind(def_id);
     let is_function = match kind {
         DefKind::Fn | DefKind::AssocFn | DefKind::Ctor(..) => true,
-        _ => tcx.is_closure_or_coroutine(def_id),
+        _ => tcx.is_closure_like(def_id),
     };
     match (kind, body.source.promoted) {
-        (_, Some(i)) => write!(w, "{i:?} in ")?,
+        (_, Some(_)) => write!(w, "const ")?, // promoteds are the closest to consts
         (DefKind::Const | DefKind::AssocConst, _) => write!(w, "const ")?,
-        (DefKind::Static(hir::Mutability::Not), _) => write!(w, "static ")?,
-        (DefKind::Static(hir::Mutability::Mut), _) => write!(w, "static mut ")?,
+        (DefKind::Static { mutability: hir::Mutability::Not, nested: false }, _) => {
+            write!(w, "static ")?
+        }
+        (DefKind::Static { mutability: hir::Mutability::Mut, nested: false }, _) => {
+            write!(w, "static mut ")?
+        }
         (_, _) if is_function => write!(w, "fn ")?,
         (DefKind::AnonConst | DefKind::InlineConst, _) => {} // things like anon const, not an item
         _ => bug!("Unexpected def kind {:?}", kind),
@@ -506,6 +534,9 @@ fn write_mir_sig(tcx: TyCtxt<'_>, body: &Body<'_>, w: &mut dyn io::Write) -> io:
     ty::print::with_forced_impl_filename_line! {
         // see notes on #41697 elsewhere
         write!(w, "{}", tcx.def_path_str(def_id))?
+    }
+    if let Some(p) = body.source.promoted {
+        write!(w, "::{p:?}")?;
     }
 
     if body.source.promoted.is_none() && is_function {
@@ -680,7 +711,7 @@ impl Debug for Statement<'_> {
             AscribeUserType(box (ref place, ref c_ty), ref variance) => {
                 write!(fmt, "AscribeUserType({place:?}, {variance:?}, {c_ty:?})")
             }
-            Coverage(box mir::Coverage { ref kind }) => write!(fmt, "Coverage::{kind:?}"),
+            Coverage(ref kind) => write!(fmt, "Coverage::{kind:?}"),
             Intrinsic(box ref intrinsic) => write!(fmt, "{intrinsic}"),
             ConstEvalCounter => write!(fmt, "ConstEvalCounter"),
             Nop => write!(fmt, "nop"),
@@ -828,6 +859,9 @@ impl<'tcx> TerminatorKind<'tcx> {
                         InlineAsmOperand::SymStatic { def_id } => {
                             write!(fmt, "sym_static {def_id:?}")?;
                         }
+                        InlineAsmOperand::Label { target_index } => {
+                            write!(fmt, "label {target_index}")?;
+                        }
                     }
                 }
                 write!(fmt, ", options({options:?}))")
@@ -866,16 +900,19 @@ impl<'tcx> TerminatorKind<'tcx> {
                 vec!["real".into(), "unwind".into()]
             }
             FalseUnwind { unwind: _, .. } => vec!["real".into()],
-            InlineAsm { destination: Some(_), unwind: UnwindAction::Cleanup(_), .. } => {
-                vec!["return".into(), "unwind".into()]
+            InlineAsm { options, ref targets, unwind, .. } => {
+                let mut vec = Vec::with_capacity(targets.len() + 1);
+                if !options.contains(InlineAsmOptions::NORETURN) {
+                    vec.push("return".into());
+                }
+                vec.resize(targets.len(), "label".into());
+
+                if let UnwindAction::Cleanup(_) = unwind {
+                    vec.push("unwind".into());
+                }
+
+                vec
             }
-            InlineAsm { destination: Some(_), unwind: _, .. } => {
-                vec!["return".into()]
-            }
-            InlineAsm { destination: None, unwind: UnwindAction::Cleanup(_), .. } => {
-                vec!["unwind".into()]
-            }
-            InlineAsm { destination: None, unwind: _, .. } => vec![],
         }
     }
 }
@@ -907,6 +944,7 @@ impl<'tcx> Debug for Rvalue<'tcx> {
                     NullOp::SizeOf => write!(fmt, "SizeOf({t})"),
                     NullOp::AlignOf => write!(fmt, "AlignOf({t})"),
                     NullOp::OffsetOf(fields) => write!(fmt, "OffsetOf({t}, {fields:?})"),
+                    NullOp::UbChecks => write!(fmt, "UbChecks()"),
                 }
             }
             ThreadLocalRef(did) => ty::tls::with(|tcx| {

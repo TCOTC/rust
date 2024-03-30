@@ -64,6 +64,7 @@ pub use crate::{
 // - `expr.ref` -> `&expr`
 // - `expr.refm` -> `&mut expr`
 // - `expr.let` -> `let $0 = expr;`
+// - `expr.lete` -> `let $1 = expr else { $0 };`
 // - `expr.letm` -> `let mut $0 = expr;`
 // - `expr.not` -> `!expr`
 // - `expr.dbg` -> `dbg!(expr)`
@@ -206,7 +207,7 @@ pub fn completions(
             CompletionAnalysis::String { original, expanded: Some(expanded) } => {
                 completions::extern_abi::complete_extern_abi(acc, ctx, expanded);
                 completions::format_string::format_string(acc, ctx, original, expanded);
-                completions::env_vars::complete_cargo_env_vars(acc, ctx, expanded);
+                completions::env_vars::complete_cargo_env_vars(acc, ctx, original, expanded);
             }
             CompletionAnalysis::UnexpandedAttrTT {
                 colon_prefix,

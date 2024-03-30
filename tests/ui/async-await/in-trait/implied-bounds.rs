@@ -1,7 +1,5 @@
-// check-pass
-// edition: 2021
-
-#![allow(incomplete_features)]
+//@ check-pass
+//@ edition: 2021
 
 trait TcpStack {
     type Connection<'a>: Sized where Self: 'a;

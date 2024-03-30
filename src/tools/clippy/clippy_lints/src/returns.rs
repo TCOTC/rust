@@ -1,11 +1,15 @@
-use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then, span_lint_hir_and_then};
+use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
 use clippy_utils::source::{snippet_opt, snippet_with_context};
 use clippy_utils::sugg::has_enclosing_paren;
 use clippy_utils::visitors::{for_each_expr_with_closures, Descend};
-use clippy_utils::{fn_def_id, is_from_proc_macro, is_inside_let_else, path_to_local_id, span_find_starting_semi};
+use clippy_utils::{
+    fn_def_id, is_from_proc_macro, is_inside_let_else, is_res_lang_ctor, path_res, path_to_local_id,
+    span_find_starting_semi,
+};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::FnKind;
+use rustc_hir::LangItem::ResultErr;
 use rustc_hir::{
     Block, Body, Expr, ExprKind, FnDecl, HirId, ItemKind, LangItem, MatchSource, Node, OwnerNode, PatKind, QPath, Stmt,
     StmtKind,
@@ -18,6 +22,7 @@ use rustc_session::declare_lint_pass;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{BytePos, Pos, Span};
 use std::borrow::Cow;
+use std::fmt::Display;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -146,14 +151,14 @@ impl<'tcx> RetReplacement<'tcx> {
     }
 }
 
-impl<'tcx> ToString for RetReplacement<'tcx> {
-    fn to_string(&self) -> String {
+impl<'tcx> Display for RetReplacement<'tcx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Empty => String::new(),
-            Self::Block => "{}".to_string(),
-            Self::Unit => "()".to_string(),
-            Self::IfSequence(inner, _) => format!("({inner})"),
-            Self::Expr(inner, _) => inner.to_string(),
+            Self::Empty => write!(f, ""),
+            Self::Block => write!(f, "{{}}"),
+            Self::Unit => write!(f, "()"),
+            Self::IfSequence(inner, _) => write!(f, "({inner})"),
+            Self::Expr(inner, _) => write!(f, "{inner}"),
         }
     }
 }
@@ -181,7 +186,15 @@ impl<'tcx> LateLintPass<'tcx> for Return {
         if !in_external_macro(cx.sess(), stmt.span)
             && let StmtKind::Semi(expr) = stmt.kind
             && let ExprKind::Ret(Some(ret)) = expr.kind
-            && let ExprKind::Match(.., MatchSource::TryDesugar(_)) = ret.kind
+            // return Err(...)? desugars to a match
+            // over a Err(...).branch()
+            // which breaks down to a branch call, with the callee being
+            // the constructor of the Err variant
+            && let ExprKind::Match(maybe_cons, _, MatchSource::TryDesugar(_)) = ret.kind
+            && let ExprKind::Call(_, [maybe_result_err]) = maybe_cons.kind
+            && let ExprKind::Call(maybe_constr, _) = maybe_result_err.kind
+            && is_res_lang_ctor(cx, path_res(cx, maybe_constr), ResultErr)
+
             // Ensure this is not the final stmt, otherwise removing it would cause a compile error
             && let OwnerNode::Item(item) = cx.tcx.hir_owner_node(cx.tcx.hir().get_parent_item(expr.hir_id))
             && let ItemKind::Fn(_, _, body) = item.kind
@@ -209,7 +222,7 @@ impl<'tcx> LateLintPass<'tcx> for Return {
         // we need both a let-binding stmt and an expr
         if let Some(retexpr) = block.expr
             && let Some(stmt) = block.stmts.iter().last()
-            && let StmtKind::Local(local) = &stmt.kind
+            && let StmtKind::Let(local) = &stmt.kind
             && local.ty.is_none()
             && cx.tcx.hir().attrs(local.hir_id).is_empty()
             && let Some(initexpr) = &local.init
@@ -367,7 +380,7 @@ fn check_final_expr<'tcx>(
                 return;
             }
 
-            emit_return_lint(cx, ret_span, semi_spans, &replacement);
+            emit_return_lint(cx, ret_span, semi_spans, &replacement, expr.hir_id);
         },
         ExprKind::If(_, then, else_clause_opt) => {
             check_block_return(cx, &then.kind, peeled_drop_expr.span, semi_spans.clone());
@@ -402,18 +415,31 @@ fn expr_contains_conjunctive_ifs<'tcx>(expr: &'tcx Expr<'tcx>) -> bool {
     contains_if(expr, false)
 }
 
-fn emit_return_lint(cx: &LateContext<'_>, ret_span: Span, semi_spans: Vec<Span>, replacement: &RetReplacement<'_>) {
+fn emit_return_lint(
+    cx: &LateContext<'_>,
+    ret_span: Span,
+    semi_spans: Vec<Span>,
+    replacement: &RetReplacement<'_>,
+    at: HirId,
+) {
     if ret_span.from_expansion() {
         return;
     }
 
-    span_lint_and_then(cx, NEEDLESS_RETURN, ret_span, "unneeded `return` statement", |diag| {
-        let suggestions = std::iter::once((ret_span, replacement.to_string()))
-            .chain(semi_spans.into_iter().map(|span| (span, String::new())))
-            .collect();
+    span_lint_hir_and_then(
+        cx,
+        NEEDLESS_RETURN,
+        at,
+        ret_span,
+        "unneeded `return` statement",
+        |diag| {
+            let suggestions = std::iter::once((ret_span, replacement.to_string()))
+                .chain(semi_spans.into_iter().map(|span| (span, String::new())))
+                .collect();
 
-        diag.multipart_suggestion_verbose(replacement.sugg_help(), suggestions, replacement.applicability());
-    });
+            diag.multipart_suggestion_verbose(replacement.sugg_help(), suggestions, replacement.applicability());
+        },
+    );
 }
 
 fn last_statement_borrows<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
@@ -439,8 +465,8 @@ fn last_statement_borrows<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) 
 // Go backwards while encountering whitespace and extend the given Span to that point.
 fn extend_span_to_previous_non_ws(cx: &LateContext<'_>, sp: Span) -> Span {
     if let Ok(prev_source) = cx.sess().source_map().span_to_prev_source(sp) {
-        let ws = [' ', '\t', '\n'];
-        if let Some(non_ws_pos) = prev_source.rfind(|c| !ws.contains(&c)) {
+        let ws = [b' ', b'\t', b'\n'];
+        if let Some(non_ws_pos) = prev_source.bytes().rposition(|c| !ws.contains(&c)) {
             let len = prev_source.len() - non_ws_pos - 1;
             return sp.with_lo(sp.lo() - BytePos::from_usize(len));
         }

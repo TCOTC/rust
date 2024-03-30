@@ -1,10 +1,10 @@
-use rustc_apfloat::ieee::{Double, Single};
+use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use rustc_apfloat::Float;
-use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
+use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_target::abi::Size;
 use std::fmt;
-use std::num::NonZeroU8;
+use std::num::NonZero;
 
 use crate::ty::TyCtxt;
 
@@ -114,11 +114,11 @@ impl std::fmt::Debug for ConstInt {
     }
 }
 
-impl IntoDiagnosticArg for ConstInt {
+impl IntoDiagArg for ConstInt {
     // FIXME this simply uses the Debug impl, but we could probably do better by converting both
     // to an inherent method that returns `Cow`.
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        DiagnosticArgValue::Str(format!("{self:?}").into())
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(format!("{self:?}").into())
     }
 }
 
@@ -132,7 +132,7 @@ pub struct ScalarInt {
     /// The first `size` bytes of `data` are the value.
     /// Do not try to read less or more bytes than that. The remaining bytes must be 0.
     data: u128,
-    size: NonZeroU8,
+    size: NonZero<u8>,
 }
 
 // Cannot derive these, as the derives take references to the fields, and we
@@ -161,14 +161,14 @@ impl<D: Decoder> Decodable<D> for ScalarInt {
         let mut data = [0u8; 16];
         let size = d.read_u8();
         data[..size as usize].copy_from_slice(d.read_raw_bytes(size as usize));
-        ScalarInt { data: u128::from_le_bytes(data), size: NonZeroU8::new(size).unwrap() }
+        ScalarInt { data: u128::from_le_bytes(data), size: NonZero::new(size).unwrap() }
     }
 }
 
 impl ScalarInt {
-    pub const TRUE: ScalarInt = ScalarInt { data: 1_u128, size: NonZeroU8::new(1).unwrap() };
+    pub const TRUE: ScalarInt = ScalarInt { data: 1_u128, size: NonZero::new(1).unwrap() };
 
-    pub const FALSE: ScalarInt = ScalarInt { data: 0_u128, size: NonZeroU8::new(1).unwrap() };
+    pub const FALSE: ScalarInt = ScalarInt { data: 0_u128, size: NonZero::new(1).unwrap() };
 
     #[inline]
     pub fn size(self) -> Size {
@@ -196,7 +196,7 @@ impl ScalarInt {
 
     #[inline]
     pub fn null(size: Size) -> Self {
-        Self { data: 0, size: NonZeroU8::new(size.bytes() as u8).unwrap() }
+        Self { data: 0, size: NonZero::new(size.bytes() as u8).unwrap() }
     }
 
     #[inline]
@@ -208,7 +208,7 @@ impl ScalarInt {
     pub fn try_from_uint(i: impl Into<u128>, size: Size) -> Option<Self> {
         let data = i.into();
         if size.truncate(data) == data {
-            Some(Self { data, size: NonZeroU8::new(size.bytes() as u8).unwrap() })
+            Some(Self { data, size: NonZero::new(size.bytes() as u8).unwrap() })
         } else {
             None
         }
@@ -220,7 +220,7 @@ impl ScalarInt {
         // `into` performed sign extension, we have to truncate
         let truncated = size.truncate(i as u128);
         if size.sign_extend(truncated) as i128 == i {
-            Some(Self { data: truncated, size: NonZeroU8::new(size.bytes() as u8).unwrap() })
+            Some(Self { data: truncated, size: NonZero::new(size.bytes() as u8).unwrap() })
         } else {
             None
         }
@@ -370,12 +370,22 @@ impl ScalarInt {
     }
 
     #[inline]
+    pub fn try_to_f16(self) -> Result<Half, Size> {
+        self.try_to_float()
+    }
+
+    #[inline]
     pub fn try_to_f32(self) -> Result<Single, Size> {
         self.try_to_float()
     }
 
     #[inline]
     pub fn try_to_f64(self) -> Result<Double, Size> {
+        self.try_to_float()
+    }
+
+    #[inline]
+    pub fn try_to_f128(self) -> Result<Quad, Size> {
         self.try_to_float()
     }
 }
@@ -388,7 +398,7 @@ macro_rules! from {
                 fn from(u: $ty) -> Self {
                     Self {
                         data: u128::from(u),
-                        size: NonZeroU8::new(std::mem::size_of::<$ty>() as u8).unwrap(),
+                        size: NonZero::new(std::mem::size_of::<$ty>() as u8).unwrap(),
                     }
                 }
             }
@@ -427,7 +437,7 @@ impl TryFrom<ScalarInt> for bool {
 impl From<char> for ScalarInt {
     #[inline]
     fn from(c: char) -> Self {
-        Self { data: c as u128, size: NonZeroU8::new(std::mem::size_of::<char>() as u8).unwrap() }
+        Self { data: c as u128, size: NonZero::new(std::mem::size_of::<char>() as u8).unwrap() }
     }
 }
 
@@ -450,11 +460,27 @@ impl TryFrom<ScalarInt> for char {
     }
 }
 
+impl From<Half> for ScalarInt {
+    #[inline]
+    fn from(f: Half) -> Self {
+        // We trust apfloat to give us properly truncated data.
+        Self { data: f.to_bits(), size: NonZero::new((Half::BITS / 8) as u8).unwrap() }
+    }
+}
+
+impl TryFrom<ScalarInt> for Half {
+    type Error = Size;
+    #[inline]
+    fn try_from(int: ScalarInt) -> Result<Self, Size> {
+        int.to_bits(Size::from_bytes(2)).map(Self::from_bits)
+    }
+}
+
 impl From<Single> for ScalarInt {
     #[inline]
     fn from(f: Single) -> Self {
         // We trust apfloat to give us properly truncated data.
-        Self { data: f.to_bits(), size: NonZeroU8::new((Single::BITS / 8) as u8).unwrap() }
+        Self { data: f.to_bits(), size: NonZero::new((Single::BITS / 8) as u8).unwrap() }
     }
 }
 
@@ -470,7 +496,7 @@ impl From<Double> for ScalarInt {
     #[inline]
     fn from(f: Double) -> Self {
         // We trust apfloat to give us properly truncated data.
-        Self { data: f.to_bits(), size: NonZeroU8::new((Double::BITS / 8) as u8).unwrap() }
+        Self { data: f.to_bits(), size: NonZero::new((Double::BITS / 8) as u8).unwrap() }
     }
 }
 
@@ -479,6 +505,22 @@ impl TryFrom<ScalarInt> for Double {
     #[inline]
     fn try_from(int: ScalarInt) -> Result<Self, Size> {
         int.to_bits(Size::from_bytes(8)).map(Self::from_bits)
+    }
+}
+
+impl From<Quad> for ScalarInt {
+    #[inline]
+    fn from(f: Quad) -> Self {
+        // We trust apfloat to give us properly truncated data.
+        Self { data: f.to_bits(), size: NonZero::new((Quad::BITS / 8) as u8).unwrap() }
+    }
+}
+
+impl TryFrom<ScalarInt> for Quad {
+    type Error = Size;
+    #[inline]
+    fn try_from(int: ScalarInt) -> Result<Self, Size> {
+        int.to_bits(Size::from_bytes(16)).map(Self::from_bits)
     }
 }
 

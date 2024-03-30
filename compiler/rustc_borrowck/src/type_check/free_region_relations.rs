@@ -10,7 +10,7 @@ use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::{self, RegionVid, Ty, TypeVisitableExt};
-use rustc_span::{ErrorGuaranteed, DUMMY_SP};
+use rustc_span::{ErrorGuaranteed, Span};
 use rustc_trait_selection::solve::deeply_normalize;
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::query::type_op::{self, TypeOp};
@@ -164,6 +164,13 @@ impl UniversalRegionRelations<'_> {
         self.outlives.contains(fr1, fr2)
     }
 
+    /// Returns `true` if fr1 is known to equal fr2.
+    ///
+    /// This will only ever be true for universally quantified regions.
+    pub(crate) fn equal(&self, fr1: RegionVid, fr2: RegionVid) -> bool {
+        self.outlives.contains(fr1, fr2) && self.outlives.contains(fr2, fr1)
+    }
+
     /// Returns a vector of free regions `x` such that `fr1: x` is
     /// known to hold.
     pub(crate) fn regions_outlived_by(&self, fr1: RegionVid) -> Vec<RegionVid> {
@@ -269,7 +276,7 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
             debug!("build: input_or_output={:?}", ty);
             // We add implied bounds from both the unnormalized and normalized ty.
             // See issue #87748
-            let constraints_unnorm = self.add_implied_bounds(ty);
+            let constraints_unnorm = self.add_implied_bounds(ty, span);
             if let Some(c) = constraints_unnorm {
                 constraints.push(c)
             }
@@ -299,7 +306,7 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
             // ```
             // Both &Self::Bar and &() are WF
             if ty != norm_ty {
-                let constraints_norm = self.add_implied_bounds(norm_ty);
+                let constraints_norm = self.add_implied_bounds(norm_ty, span);
                 if let Some(c) = constraints_norm {
                     constraints.push(c)
                 }
@@ -311,19 +318,19 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
         // Add implied bounds from impl header.
         if matches!(tcx.def_kind(defining_ty_def_id), DefKind::AssocFn | DefKind::AssocConst) {
             for &(ty, _) in tcx.assumed_wf_types(tcx.local_parent(defining_ty_def_id)) {
-                let Ok(TypeOpOutput { output: norm_ty, constraints: c, .. }) = self
+                let result: Result<_, ErrorGuaranteed> = self
                     .param_env
                     .and(type_op::normalize::Normalize::new(ty))
-                    .fully_perform(self.infcx, span)
-                else {
-                    tcx.dcx().span_delayed_bug(span, format!("failed to normalize {ty:?}"));
+                    .fully_perform(self.infcx, span);
+                let Ok(TypeOpOutput { output: norm_ty, constraints: c, .. }) = result else {
                     continue;
                 };
+
                 constraints.extend(c);
 
                 // We currently add implied bounds from the normalized ty only.
                 // This is more conservative and matches wfcheck behavior.
-                let c = self.add_implied_bounds(norm_ty);
+                let c = self.add_implied_bounds(norm_ty, span);
                 constraints.extend(c);
             }
         }
@@ -361,11 +368,15 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
     /// the same time, compute and add any implied bounds that come
     /// from this local.
     #[instrument(level = "debug", skip(self))]
-    fn add_implied_bounds(&mut self, ty: Ty<'tcx>) -> Option<&'tcx QueryRegionConstraints<'tcx>> {
+    fn add_implied_bounds(
+        &mut self,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> Option<&'tcx QueryRegionConstraints<'tcx>> {
         let TypeOpOutput { output: bounds, constraints, .. } = self
             .param_env
             .and(type_op::implied_outlives_bounds::ImpliedOutlivesBounds { ty })
-            .fully_perform(self.infcx, DUMMY_SP)
+            .fully_perform(self.infcx, span)
             .map_err(|_: ErrorGuaranteed| debug!("failed to compute implied bounds {:?}", ty))
             .ok()?;
         debug!(?bounds, ?constraints);

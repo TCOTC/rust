@@ -1,6 +1,6 @@
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::intern::Interned;
-use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
+use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_hir::def_id::DefId;
 use rustc_hir::LangItem;
 use rustc_span::Span;
@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use crate::ty::visit::TypeVisitableExt;
 use crate::ty::{
     self, AliasTy, Binder, DebruijnIndex, DebugWithInfcx, EarlyBinder, GenericArg, GenericArgs,
-    GenericArgsRef, ImplPolarity, Term, Ty, TyCtxt, TypeFlags, WithCachedTypeInfo,
+    GenericArgsRef, PredicatePolarity, Term, Ty, TyCtxt, TypeFlags, WithCachedTypeInfo,
 };
 
 pub type ClauseKind<'tcx> = IrClauseKind<TyCtxt<'tcx>>;
@@ -29,6 +29,16 @@ pub struct Predicate<'tcx>(
     pub(super) Interned<'tcx, WithCachedTypeInfo<ty::Binder<'tcx, PredicateKind<'tcx>>>>,
 );
 
+impl<'tcx> rustc_type_ir::visit::Flags for Predicate<'tcx> {
+    fn flags(&self) -> TypeFlags {
+        self.0.flags
+    }
+
+    fn outer_exclusive_binder(&self) -> ty::DebruijnIndex {
+        self.0.outer_exclusive_binder
+    }
+}
+
 impl<'tcx> Predicate<'tcx> {
     /// Gets the inner `ty::Binder<'tcx, PredicateKind<'tcx>>`.
     #[inline]
@@ -36,11 +46,13 @@ impl<'tcx> Predicate<'tcx> {
         self.0.internee
     }
 
+    // FIXME(compiler-errors): Think about removing this.
     #[inline(always)]
     pub fn flags(self) -> TypeFlags {
         self.0.flags
     }
 
+    // FIXME(compiler-errors): Think about removing this.
     #[inline(always)]
     pub fn outer_exclusive_binder(self) -> DebruijnIndex {
         self.0.outer_exclusive_binder
@@ -58,7 +70,7 @@ impl<'tcx> Predicate<'tcx> {
                     polarity,
                 })) => Some(PredicateKind::Clause(ClauseKind::Trait(TraitPredicate {
                     trait_ref,
-                    polarity: polarity.flip()?,
+                    polarity: polarity.flip(),
                 }))),
 
                 _ => None,
@@ -108,15 +120,15 @@ impl<'tcx> Predicate<'tcx> {
     }
 }
 
-impl rustc_errors::IntoDiagnosticArg for Predicate<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
-        rustc_errors::DiagnosticArgValue::Str(std::borrow::Cow::Owned(self.to_string()))
+impl rustc_errors::IntoDiagArg for Predicate<'_> {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        rustc_errors::DiagArgValue::Str(std::borrow::Cow::Owned(self.to_string()))
     }
 }
 
-impl rustc_errors::IntoDiagnosticArg for Clause<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
-        rustc_errors::DiagnosticArgValue::Str(std::borrow::Cow::Owned(self.to_string()))
+impl rustc_errors::IntoDiagArg for Clause<'_> {
+    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+        rustc_errors::DiagArgValue::Str(std::borrow::Cow::Owned(self.to_string()))
     }
 }
 
@@ -180,7 +192,7 @@ impl<'tcx> Clause<'tcx> {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Ord, Eq, Hash, TyEncodable, TyDecodable)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub enum ExistentialPredicate<'tcx> {
     /// E.g., `Iterator`.
@@ -323,8 +335,8 @@ impl<'tcx> ty::List<ty::PolyExistentialPredicate<'tcx>> {
 /// and `U` as parameter 1.
 ///
 /// Trait references also appear in object types like `Foo<U>`, but in
-/// that case the `Self` parameter is absent from the substitutions.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, TyEncodable, TyDecodable)]
+/// that case the `Self` parameter is absent from the generic parameters.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct TraitRef<'tcx> {
     pub def_id: DefId,
@@ -395,9 +407,9 @@ impl<'tcx> PolyTraitRef<'tcx> {
     }
 }
 
-impl<'tcx> IntoDiagnosticArg for TraitRef<'tcx> {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        self.to_string().into_diagnostic_arg()
+impl<'tcx> IntoDiagArg for TraitRef<'tcx> {
+    fn into_diag_arg(self) -> DiagArgValue {
+        self.to_string().into_diag_arg()
     }
 }
 
@@ -406,9 +418,9 @@ impl<'tcx> IntoDiagnosticArg for TraitRef<'tcx> {
 /// ```ignore (illustrative)
 /// exists T. T: Trait<'a, 'b, X, Y>
 /// ```
-/// The substitutions don't include the erased `Self`, only trait
+/// The generic parameters don't include the erased `Self`, only trait
 /// type and lifetime parameters (`[X, Y]` and `['a, 'b]` above).
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct ExistentialTraitRef<'tcx> {
     pub def_id: DefId,
@@ -441,9 +453,9 @@ impl<'tcx> ExistentialTraitRef<'tcx> {
     }
 }
 
-impl<'tcx> IntoDiagnosticArg for ExistentialTraitRef<'tcx> {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        self.to_string().into_diagnostic_arg()
+impl<'tcx> IntoDiagArg for ExistentialTraitRef<'tcx> {
+    fn into_diag_arg(self) -> DiagArgValue {
+        self.to_string().into_diag_arg()
     }
 }
 
@@ -464,7 +476,7 @@ impl<'tcx> PolyExistentialTraitRef<'tcx> {
 }
 
 /// A `ProjectionPredicate` for an `ExistentialTraitRef`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, TyEncodable, TyDecodable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct ExistentialProjection<'tcx> {
     pub def_id: DefId,
@@ -481,8 +493,8 @@ impl<'tcx> ExistentialProjection<'tcx> {
     /// reference.
     pub fn trait_ref(&self, tcx: TyCtxt<'tcx>) -> ty::ExistentialTraitRef<'tcx> {
         let def_id = tcx.parent(self.def_id);
-        let subst_count = tcx.generics_of(def_id).count() - 1;
-        let args = tcx.mk_args(&self.args[..subst_count]);
+        let args_count = tcx.generics_of(def_id).count() - 1;
+        let args = tcx.mk_args(&self.args[..args_count]);
         ty::ExistentialTraitRef { def_id, args }
     }
 
@@ -534,12 +546,12 @@ impl<'tcx> PolyExistentialProjection<'tcx> {
 }
 
 impl<'tcx> Clause<'tcx> {
-    /// Performs a substitution suitable for going from a
+    /// Performs a instantiation suitable for going from a
     /// poly-trait-ref to supertraits that must hold if that
     /// poly-trait-ref holds. This is slightly different from a normal
-    /// substitution in terms of what happens with bound regions. See
+    /// instantiation in terms of what happens with bound regions. See
     /// lengthy comment below for details.
-    pub fn subst_supertrait(
+    pub fn instantiate_supertrait(
         self,
         tcx: TyCtxt<'tcx>,
         trait_ref: &ty::PolyTraitRef<'tcx>,
@@ -556,7 +568,7 @@ impl<'tcx> Clause<'tcx> {
         // we can deduce that `for<'x> T: Bar<'x,'x>`. Basically, if we
         // knew that `Foo<'x>` (for any 'x) then we also know that
         // `Bar<'x,'x>` (for any 'x). This more-or-less falls out from
-        // normal substitution.
+        // normal instantiation.
         //
         // In terms of why this is sound, the idea is that whenever there
         // is an impl of `T:Foo<'a>`, it must show that `T:Bar<'a,'a>`
@@ -582,7 +594,7 @@ impl<'tcx> Clause<'tcx> {
         // - We start out with `for<'x> T: Foo1<'x>`. In this case, `'x`
         //   has a De Bruijn index of 1. We want to produce `for<'x,'b> T: Bar1<'x,'b>`,
         //   where both `'x` and `'b` would have a DB index of 1.
-        //   The substitution from the input trait-ref is therefore going to be
+        //   The instantiation from the input trait-ref is therefore going to be
         //   `'a => 'x` (where `'x` has a DB index of 1).
         // - The supertrait-ref is `for<'b> Bar1<'a,'b>`, where `'a` is an
         //   early-bound parameter and `'b` is a late-bound parameter with a
@@ -591,17 +603,17 @@ impl<'tcx> Clause<'tcx> {
         //   a DB index of 1, and thus we'll have `for<'x,'b> Bar1<'x,'b>`
         //   just as we wanted.
         //
-        // There is only one catch. If we just apply the substitution `'a
-        // => 'x` to `for<'b> Bar1<'a,'b>`, the substitution code will
-        // adjust the DB index because we substituting into a binder (it
+        // There is only one catch. If we just apply the instantiation `'a
+        // => 'x` to `for<'b> Bar1<'a,'b>`, the instantiation code will
+        // adjust the DB index because we instantiating into a binder (it
         // tries to be so smart...) resulting in `for<'x> for<'b>
         // Bar1<'x,'b>` (we have no syntax for this, so use your
         // imagination). Basically the 'x will have DB index of 2 and 'b
         // will have DB index of 1. Not quite what we want. So we apply
-        // the substitution to the *contents* of the trait reference,
+        // the instantiation to the *contents* of the trait reference,
         // rather than the trait reference itself (put another way, the
-        // substitution code expects equal binding levels in the values
-        // from the substitution and the value being substituted into, and
+        // instantiation code expects equal binding levels in the values
+        // from the instantiation and the value being instantiated into, and
         // this trick achieves that).
 
         // Working through the second example:
@@ -651,7 +663,7 @@ pub struct TraitPredicate<'tcx> {
     /// exist via a series of predicates.)
     ///
     /// If polarity is Reserved: that's a bug.
-    pub polarity: ImplPolarity,
+    pub polarity: PredicatePolarity,
 }
 
 pub type PolyTraitPredicate<'tcx> = ty::Binder<'tcx, TraitPredicate<'tcx>>;
@@ -681,7 +693,7 @@ impl<'tcx> PolyTraitPredicate<'tcx> {
     }
 
     #[inline]
-    pub fn polarity(self) -> ImplPolarity {
+    pub fn polarity(self) -> PredicatePolarity {
         self.skip_binder().polarity
     }
 }
@@ -895,7 +907,7 @@ impl<'tcx> ToPredicate<'tcx> for TraitRef<'tcx> {
 impl<'tcx> ToPredicate<'tcx, TraitPredicate<'tcx>> for TraitRef<'tcx> {
     #[inline(always)]
     fn to_predicate(self, _tcx: TyCtxt<'tcx>) -> TraitPredicate<'tcx> {
-        TraitPredicate { trait_ref: self, polarity: ImplPolarity::Positive }
+        TraitPredicate { trait_ref: self, polarity: PredicatePolarity::Positive }
     }
 }
 
@@ -928,7 +940,7 @@ impl<'tcx> ToPredicate<'tcx, PolyTraitPredicate<'tcx>> for Binder<'tcx, TraitRef
     fn to_predicate(self, _: TyCtxt<'tcx>) -> PolyTraitPredicate<'tcx> {
         self.map_bound(|trait_ref| TraitPredicate {
             trait_ref,
-            polarity: ty::ImplPolarity::Positive,
+            polarity: ty::PredicatePolarity::Positive,
         })
     }
 }

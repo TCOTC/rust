@@ -64,7 +64,7 @@ unsafe impl<T> Sync for Interned<T> {}
 
 impl fmt::Display for Interned<String> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &str = &*self;
+        let s: &str = self;
         f.write_str(s)
     }
 }
@@ -74,7 +74,7 @@ where
     Self: Deref<Target = U>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: &U = &*self;
+        let s: &U = self;
         f.write_fmt(format_args!("{s:?}"))
     }
 }
@@ -132,7 +132,7 @@ impl<T: Hash + Clone + Eq> TyIntern<T> {
         B: Eq + Hash + ToOwned<Owned = T> + ?Sized,
         T: Borrow<B>,
     {
-        if let Some(i) = self.set.get(&item) {
+        if let Some(i) = self.set.get(item) {
             return *i;
         }
         let item = item.to_owned();
@@ -194,17 +194,6 @@ impl Interner {
     pub fn intern_str(&self, s: &str) -> Interned<String> {
         self.strs.lock().unwrap().intern_borrow(s)
     }
-    pub fn intern_string(&self, s: String) -> Interned<String> {
-        self.strs.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_path(&self, s: PathBuf) -> Interned<PathBuf> {
-        self.paths.lock().unwrap().intern(s)
-    }
-
-    pub fn intern_list(&self, v: Vec<String>) -> Interned<Vec<String>> {
-        self.lists.lock().unwrap().intern(v)
-    }
 }
 
 pub static INTERNER: Lazy<Interner> = Lazy::new(Interner::default);
@@ -233,7 +222,7 @@ impl Cache {
         let type_id = TypeId::of::<S>();
         let stepcache = cache
             .entry(type_id)
-            .or_insert_with(|| Box::new(HashMap::<S, S::Output>::new()))
+            .or_insert_with(|| Box::<HashMap<S, S::Output>>::default())
             .downcast_mut::<HashMap<S, S::Output>>()
             .expect("invalid type mapped");
         assert!(!stepcache.contains_key(&step), "processing {step:?} a second time");
@@ -245,7 +234,7 @@ impl Cache {
         let type_id = TypeId::of::<S>();
         let stepcache = cache
             .entry(type_id)
-            .or_insert_with(|| Box::new(HashMap::<S, S::Output>::new()))
+            .or_insert_with(|| Box::<HashMap<S, S::Output>>::default())
             .downcast_mut::<HashMap<S, S::Output>>()
             .expect("invalid type mapped");
         stepcache.get(step).cloned()

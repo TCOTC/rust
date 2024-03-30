@@ -58,6 +58,7 @@ pub(super) const ATOM_EXPR_FIRST: TokenSet =
         T![match],
         T![move],
         T![return],
+        T![become],
         T![static],
         T![try],
         T![unsafe],
@@ -102,6 +103,7 @@ pub(super) fn atom_expr(
         T![try] => try_block_expr(p, None),
         T![match] => match_expr(p),
         T![return] => return_expr(p),
+        T![become] => become_expr(p),
         T![yield] => yield_expr(p),
         T![do] if p.nth_at_contextual_kw(1, T![yeet]) => yeet_expr(p),
         T![continue] => continue_expr(p),
@@ -145,7 +147,7 @@ pub(super) fn atom_expr(
         T![async] if la == T![move] && p.nth(2) == T!['{'] => {
             let m = p.start();
             p.bump(T![async]);
-            p.eat(T![move]);
+            p.bump(T![move]);
             stmt_list(p);
             m.complete(p, BLOCK_EXPR)
         }
@@ -388,8 +390,7 @@ fn if_expr(p: &mut Parser<'_>) -> CompletedMarker {
     p.bump(T![if]);
     expr_no_struct(p);
     block_expr(p);
-    if p.at(T![else]) {
-        p.bump(T![else]);
+    if p.eat(T![else]) {
         if p.at(T![if]) {
             if_expr(p);
         } else {
@@ -619,6 +620,18 @@ fn return_expr(p: &mut Parser<'_>) -> CompletedMarker {
         expr(p);
     }
     m.complete(p, RETURN_EXPR)
+}
+
+// test become_expr
+// fn foo() {
+//     become foo();
+// }
+fn become_expr(p: &mut Parser<'_>) -> CompletedMarker {
+    assert!(p.at(T![become]));
+    let m = p.start();
+    p.bump(T![become]);
+    expr(p);
+    m.complete(p, BECOME_EXPR)
 }
 
 // test yield_expr

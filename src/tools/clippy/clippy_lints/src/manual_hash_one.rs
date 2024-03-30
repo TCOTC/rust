@@ -4,7 +4,7 @@ use clippy_utils::source::snippet_opt;
 use clippy_utils::visitors::{is_local_used, local_used_once};
 use clippy_utils::{is_trait_method, path_to_local_id};
 use rustc_errors::Applicability;
-use rustc_hir::{BindingAnnotation, ExprKind, Local, Node, PatKind, StmtKind};
+use rustc_hir::{BindingAnnotation, ExprKind, LetStmt, Node, PatKind, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::sym;
@@ -60,7 +60,7 @@ impl ManualHashOne {
 impl_lint_pass!(ManualHashOne => [MANUAL_HASH_ONE]);
 
 impl LateLintPass<'_> for ManualHashOne {
-    fn check_local(&mut self, cx: &LateContext<'_>, local: &Local<'_>) {
+    fn check_local(&mut self, cx: &LateContext<'_>, local: &LetStmt<'_>) {
         // `let mut hasher = seg.build_hasher();`
         if let PatKind::Binding(BindingAnnotation::MUT, hasher, _, None) = local.pat.kind
             && let Some(init) = local.init
@@ -68,8 +68,8 @@ impl LateLintPass<'_> for ManualHashOne {
             && let ExprKind::MethodCall(seg, build_hasher, [], _) = init.kind
             && seg.ident.name == sym!(build_hasher)
 
-            && let Node::Stmt(local_stmt) = cx.tcx.hir().get_parent(local.hir_id)
-            && let Node::Block(block) = cx.tcx.hir().get_parent(local_stmt.hir_id)
+            && let Node::Stmt(local_stmt) = cx.tcx.parent_hir_node(local.hir_id)
+            && let Node::Block(block) = cx.tcx.parent_hir_node(local_stmt.hir_id)
 
             && let mut stmts = block.stmts.iter()
                 .skip_while(|stmt| stmt.hir_id != local_stmt.hir_id)
@@ -91,7 +91,7 @@ impl LateLintPass<'_> for ManualHashOne {
 
             // `hasher.finish()`, may be anywhere in a statement or the trailing expr of the block
             && let Some(path_expr) = local_used_once(cx, (maybe_finish_stmt, block.expr), hasher)
-            && let Node::Expr(finish_expr) = cx.tcx.hir().get_parent(path_expr.hir_id)
+            && let Node::Expr(finish_expr) = cx.tcx.parent_hir_node(path_expr.hir_id)
             && !finish_expr.span.from_expansion()
             && let ExprKind::MethodCall(seg, _, [], _) = finish_expr.kind
             && seg.ident.name == sym!(finish)

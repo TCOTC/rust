@@ -1,9 +1,7 @@
 use std::fmt::{self, Write};
-use std::num::NonZeroU64;
+use std::num::NonZero;
 
-use log::trace;
-
-use rustc_errors::{DiagnosticBuilder, DiagnosticMessage, Level};
+use rustc_errors::{Diag, DiagMessage, Level};
 use rustc_span::{SpanData, Symbol, DUMMY_SP};
 use rustc_target::abi::{Align, Size};
 
@@ -48,6 +46,7 @@ pub enum TerminationInfo {
         op1: RacingOp,
         op2: RacingOp,
         extra: Option<&'static str>,
+        retag_explain: bool,
     },
 }
 
@@ -97,15 +96,12 @@ impl fmt::Debug for TerminationInfo {
 }
 
 impl MachineStopType for TerminationInfo {
-    fn diagnostic_message(&self) -> DiagnosticMessage {
+    fn diagnostic_message(&self) -> DiagMessage {
         self.to_string().into()
     }
     fn add_args(
         self: Box<Self>,
-        _: &mut dyn FnMut(
-            std::borrow::Cow<'static, str>,
-            rustc_errors::DiagnosticArgValue,
-        ),
+        _: &mut dyn FnMut(std::borrow::Cow<'static, str>, rustc_errors::DiagArgValue),
     ) {
     }
 }
@@ -115,12 +111,13 @@ pub enum NonHaltingDiagnostic {
     /// (new_tag, new_perm, (alloc_id, base_offset, orig_tag))
     ///
     /// new_perm is `None` for base tags.
-    CreatedPointerTag(NonZeroU64, Option<String>, Option<(AllocId, AllocRange, ProvenanceExtra)>),
+    CreatedPointerTag(NonZero<u64>, Option<String>, Option<(AllocId, AllocRange, ProvenanceExtra)>),
     /// This `Item` was popped from the borrow stack. The string explains the reason.
     PoppedPointerTag(Item, String),
     CreatedCallId(CallId),
     CreatedAlloc(AllocId, Size, Align, MemoryKind<MiriMemoryKind>),
     FreedAlloc(AllocId),
+    AccessedAlloc(AllocId, AccessKind),
     RejectedIsolatedOp(String),
     ProgressReport {
         block_count: u64, // how many basic blocks have been run so far
@@ -267,11 +264,16 @@ pub fn report_error<'tcx, 'mir>(
                 vec![(Some(*span), format!("the `{link_name}` symbol is defined here"))],
             Int2PtrWithStrictProvenance =>
                 vec![(None, format!("use Strict Provenance APIs (https://doc.rust-lang.org/nightly/std/ptr/index.html#strict-provenance, https://crates.io/crates/sptr) instead"))],
-            DataRace { op1, extra, .. } => {
+            DataRace { op1, extra, retag_explain, .. } => {
                 let mut helps = vec![(Some(op1.span), format!("and (1) occurred earlier here"))];
                 if let Some(extra) = extra {
                     helps.push((None, format!("{extra}")));
                     helps.push((None, format!("see https://doc.rust-lang.org/nightly/std/sync/atomic/index.html#memory-model-for-atomic-accesses for more information about the Rust memory model")));
+                }
+                if *retag_explain {
+                    helps.push((None, "retags occur on all (re)borrows and as well as when references are copied or moved".to_owned()));
+                    helps.push((None, "retags permit optimizations that insert speculative reads or writes".to_owned()));
+                    helps.push((None, "therefore from the perspective of data races, a retag has the same implications as a read or write".to_owned()));
                 }
                 helps.push((None, format!("this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior")));
                 helps.push((None, format!("see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information")));
@@ -290,7 +292,10 @@ pub fn report_error<'tcx, 'mir>(
                 ) =>
             {
                 ecx.handle_ice(); // print interpreter backtrace
-                bug!("This validation error should be impossible in Miri: {}", ecx.format_error(e));
+                bug!(
+                    "This validation error should be impossible in Miri: {}",
+                    format_interp_error(ecx.tcx.dcx(), e)
+                );
             }
             UndefinedBehavior(_) => "Undefined Behavior",
             ResourceExhaustion(_) => "resource exhaustion",
@@ -304,7 +309,10 @@ pub fn report_error<'tcx, 'mir>(
             ) => "post-monomorphization error",
             _ => {
                 ecx.handle_ice(); // print interpreter backtrace
-                bug!("This error should be impossible in Miri: {}", ecx.format_error(e));
+                bug!(
+                    "This error should be impossible in Miri: {}",
+                    format_interp_error(ecx.tcx.dcx(), e)
+                );
             }
         };
         #[rustfmt::skip]
@@ -370,7 +378,7 @@ pub fn report_error<'tcx, 'mir>(
         _ => {}
     }
 
-    msg.insert(0, ecx.format_error(e));
+    msg.insert(0, format_interp_error(ecx.tcx.dcx(), e));
 
     report_msg(
         DiagLevel::Error,
@@ -458,7 +466,7 @@ pub fn report_msg<'tcx>(
         DiagLevel::Warning => Level::Warning,
         DiagLevel::Note => Level::Note,
     };
-    let mut err = DiagnosticBuilder::<()>::new(sess.dcx(), level, title);
+    let mut err = Diag::<()>::new(sess.dcx(), level, title);
     err.span(span);
 
     // Show main message.
@@ -476,7 +484,6 @@ pub fn report_msg<'tcx>(
 
     // Show note and help messages.
     let mut extra_span = false;
-    let notes_len = notes.len();
     for (span_data, note) in notes {
         if let Some(span_data) = span_data {
             err.span_note(span_data.span(), note);
@@ -485,7 +492,6 @@ pub fn report_msg<'tcx>(
             err.note(note);
         }
     }
-    let helps_len = helps.len();
     for (span_data, help) in helps {
         if let Some(span_data) = span_data {
             err.span_help(span_data.span(), help);
@@ -494,17 +500,25 @@ pub fn report_msg<'tcx>(
             err.help(help);
         }
     }
-    if notes_len + helps_len > 0 {
-        // Add visual separator before backtrace.
-        err.note(if extra_span { "BACKTRACE (of the first span):" } else { "BACKTRACE:" });
-    }
 
     // Add backtrace
+    let mut backtrace_title = String::from("BACKTRACE");
+    if extra_span {
+        write!(backtrace_title, " (of the first span)").unwrap();
+    }
+    let thread_name =
+        machine.threads.get_thread_display_name(machine.threads.get_active_thread_id());
+    if thread_name != "main" {
+        // Only print thread name if it is not `main`.
+        write!(backtrace_title, " on thread `{thread_name}`").unwrap();
+    };
+    write!(backtrace_title, ":").unwrap();
+    err.note(backtrace_title);
     for (idx, frame_info) in stacktrace.iter().enumerate() {
         let is_local = machine.is_local(frame_info);
         // No span for non-local frames and the first frame (which is the error site).
         if is_local && idx > 0 {
-            err.eager_subdiagnostic(err.dcx, frame_info.as_note(machine.tcx));
+            err.subdiagnostic(err.dcx, frame_info.as_note(machine.tcx));
         } else {
             let sm = sess.source_map();
             let span = sm.span_to_embeddable_string(frame_info.span);
@@ -519,8 +533,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
     pub fn emit_diagnostic(&self, e: NonHaltingDiagnostic) {
         use NonHaltingDiagnostic::*;
 
-        let stacktrace =
-            MiriInterpCx::generate_stacktrace_from_stack(self.threads.active_thread_stack());
+        let stacktrace = Frame::generate_stacktrace_from_stack(self.threads.active_thread_stack());
         let (stacktrace, _was_pruned) = prune_stacktrace(stacktrace, self);
 
         let (title, diag_level) = match &e {
@@ -531,6 +544,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             | PoppedPointerTag(..)
             | CreatedCallId(..)
             | CreatedAlloc(..)
+            | AccessedAlloc(..)
             | FreedAlloc(..)
             | ProgressReport { .. }
             | WeakMemoryOutdatedLoad => ("tracking was triggered".to_string(), DiagLevel::Note),
@@ -552,6 +566,8 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                     size = size.bytes(),
                     align = align.bytes(),
                 ),
+            AccessedAlloc(AllocId(id), access_kind) =>
+                format!("{access_kind} to allocation with id {id}"),
             FreedAlloc(AllocId(id)) => format!("freed allocation with id {id}"),
             RejectedIsolatedOp(ref op) =>
                 format!("{op} was made to return an error due to isolation"),

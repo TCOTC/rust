@@ -31,7 +31,7 @@
 //! }
 //! ```
 
-use hir::{self, HasAttrs};
+use hir::HasAttrs;
 use ide_db::{
     documentation::HasDocs, path_transform::PathTransform,
     syntax_helpers::insert_whitespace_into_node, traits::get_missing_assoc_items, SymbolKind,
@@ -96,7 +96,7 @@ fn complete_trait_impl_name(
             .parent()
         }
     }?;
-    let item = ctx.sema.original_syntax_node(&item)?;
+    let item = ctx.sema.original_syntax_node_rooted(&item)?;
     // item -> ASSOC_ITEM_LIST -> IMPL
     let impl_def = ast::Impl::cast(item.parent()?.parent()?)?;
     let replacement_range = {

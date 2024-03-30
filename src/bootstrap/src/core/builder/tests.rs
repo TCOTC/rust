@@ -1,6 +1,6 @@
 use super::*;
 use crate::core::build_steps::doc::DocumentationFormat;
-use crate::core::config::{Config, DryRun, TargetSelection};
+use crate::core::config::Config;
 use std::thread;
 
 fn configure(cmd: &str, host: &[&str], target: &[&str]) -> Config {
@@ -113,6 +113,19 @@ fn test_intersection() {
     let subset = library_set.intersection_removing_matches(&mut command_paths, Kind::Build);
     assert_eq!(subset, set(&["library/core", "library/alloc"]),);
     assert_eq!(command_paths, vec![Path::new("library/stdarch")]);
+}
+
+#[test]
+fn validate_path_remap() {
+    let build = Build::new(configure("test", &["A"], &["A"]));
+
+    PATH_REMAP
+        .iter()
+        .flat_map(|(_, paths)| paths.iter())
+        .map(|path| build.src.join(path))
+        .for_each(|path| {
+            assert!(path.exists(), "{} should exist.", path.display());
+        });
 }
 
 #[test]
@@ -525,6 +538,23 @@ mod dist {
     }
 
     #[test]
+    fn llvm_out_behaviour() {
+        let mut config = configure(&["A"], &["B"]);
+        config.llvm_from_ci = true;
+        let build = Build::new(config.clone());
+
+        let target = TargetSelection::from_user("A");
+        assert!(build.llvm_out(target).ends_with("ci-llvm"));
+        let target = TargetSelection::from_user("B");
+        assert!(build.llvm_out(target).ends_with("llvm"));
+
+        config.llvm_from_ci = false;
+        let build = Build::new(config.clone());
+        let target = TargetSelection::from_user("A");
+        assert!(build.llvm_out(target).ends_with("llvm"));
+    }
+
+    #[test]
     fn build_with_empty_host() {
         let config = configure(&[], &["C"]);
         let build = Build::new(config);
@@ -591,7 +621,7 @@ mod dist {
                 compiler: Compiler { host, stage: 0 },
                 target: host,
                 mode: Mode::Std,
-                crates: vec![INTERNER.intern_str("std")],
+                crates: vec!["std".to_owned()],
             },]
         );
     }

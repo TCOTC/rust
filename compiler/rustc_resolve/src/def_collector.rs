@@ -1,5 +1,5 @@
 use crate::{ImplTraitContext, Resolver};
-use rustc_ast::visit::{self, FnKind};
+use rustc_ast::visit::FnKind;
 use rustc_ast::*;
 use rustc_expand::expand::AstFragment;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind};
@@ -38,14 +38,16 @@ impl<'a, 'b, 'tcx> DefCollector<'a, 'b, 'tcx> {
             "create_def(node_id={:?}, def_kind={:?}, parent_def={:?})",
             node_id, def_kind, parent_def
         );
-        self.resolver.create_def(
-            parent_def,
-            node_id,
-            name,
-            def_kind,
-            self.expansion.to_expn_id(),
-            span.with_parent(None),
-        )
+        self.resolver
+            .create_def(
+                parent_def,
+                node_id,
+                name,
+                def_kind,
+                self.expansion.to_expn_id(),
+                span.with_parent(None),
+            )
+            .def_id()
     }
 
     fn with_parent<F: FnOnce(&mut Self)>(&mut self, parent_def: LocalDefId, f: F) {
@@ -80,6 +82,22 @@ impl<'a, 'b, 'tcx> DefCollector<'a, 'b, 'tcx> {
             let name = field.ident.map_or_else(|| sym::integer(index(self)), |ident| ident.name);
             let def = self.create_def(field.id, name, DefKind::Field, field.span);
             self.with_parent(def, |this| visit::walk_field_def(this, field));
+            self.visit_anon_adt(&field.ty);
+        }
+    }
+
+    fn visit_anon_adt(&mut self, ty: &'a Ty) {
+        let def_kind = match &ty.kind {
+            TyKind::AnonStruct(..) => DefKind::Struct,
+            TyKind::AnonUnion(..) => DefKind::Union,
+            _ => return,
+        };
+        match &ty.kind {
+            TyKind::AnonStruct(node_id, _) | TyKind::AnonUnion(node_id, _) => {
+                let def_id = self.create_def(*node_id, kw::Empty, def_kind, ty.span);
+                self.with_parent(def_id, |this| visit::walk_ty(this, ty));
+            }
+            _ => {}
         }
     }
 
@@ -109,7 +127,7 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
             ItemKind::Union(..) => DefKind::Union,
             ItemKind::ExternCrate(..) => DefKind::ExternCrate,
             ItemKind::TyAlias(..) => DefKind::TyAlias,
-            ItemKind::Static(s) => DefKind::Static(s.mutability),
+            ItemKind::Static(s) => DefKind::Static { mutability: s.mutability, nested: false },
             ItemKind::Const(..) => DefKind::Const,
             ItemKind::Fn(..) | ItemKind::Delegation(..) => DefKind::Fn,
             ItemKind::MacroDef(..) => {
@@ -196,7 +214,9 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
 
     fn visit_foreign_item(&mut self, fi: &'a ForeignItem) {
         let def_kind = match fi.kind {
-            ForeignItemKind::Static(_, mt, _) => DefKind::Static(mt),
+            ForeignItemKind::Static(_, mutability, _) => {
+                DefKind::Static { mutability, nested: false }
+            }
             ForeignItemKind::Fn(_) => DefKind::Fn,
             ForeignItemKind::TyAlias(_) => DefKind::ForeignTy,
             ForeignItemKind::MacCall(_) => return self.visit_macro_invoc(fi.id),
@@ -324,8 +344,10 @@ impl<'a, 'b, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'b, 'tcx> {
     }
 
     fn visit_ty(&mut self, ty: &'a Ty) {
-        match ty.kind {
+        match &ty.kind {
             TyKind::MacCall(..) => self.visit_macro_invoc(ty.id),
+            // Anonymous structs or unions are visited later after defined.
+            TyKind::AnonStruct(..) | TyKind::AnonUnion(..) => {}
             _ => visit::walk_ty(self, ty),
         }
     }

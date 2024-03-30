@@ -3,6 +3,8 @@
 #![cfg_attr(doc, doc(rust_logo))]
 #![feature(rustc_private)]
 // Note: please avoid adding other feature gates where possible
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![warn(rust_2018_idioms)]
 #![warn(unused_lifetimes)]
 #![warn(unreachable_pub)]
@@ -19,6 +21,7 @@ extern crate rustc_hir;
 extern crate rustc_incremental;
 extern crate rustc_index;
 extern crate rustc_metadata;
+extern crate rustc_monomorphize;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
@@ -145,7 +148,7 @@ impl CodegenCx {
         let unwind_context =
             UnwindContext::new(isa, matches!(backend_config.codegen_mode, CodegenMode::Aot));
         let debug_context = if debug_info && !tcx.sess.target.options.is_like_windows {
-            Some(DebugContext::new(tcx, isa))
+            Some(DebugContext::new(tcx, isa, cgu_name.as_str()))
         } else {
             None
         };
@@ -230,12 +233,13 @@ impl CodegenBackend for CraneliftCodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
-        _outputs: &OutputFilenames,
-    ) -> Result<(CodegenResults, FxIndexMap<WorkProductId, WorkProduct>), ErrorGuaranteed> {
-        Ok(ongoing_codegen
-            .downcast::<driver::aot::OngoingCodegen>()
-            .unwrap()
-            .join(sess, self.config.borrow().as_ref().unwrap()))
+        outputs: &OutputFilenames,
+    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+        ongoing_codegen.downcast::<driver::aot::OngoingCodegen>().unwrap().join(
+            sess,
+            outputs,
+            self.config.borrow().as_ref().unwrap(),
+        )
     }
 
     fn link(

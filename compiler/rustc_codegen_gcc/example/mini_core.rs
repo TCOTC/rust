@@ -1,6 +1,6 @@
 #![feature(
     no_core, lang_items, intrinsics, unboxed_closures, type_ascription, extern_types,
-    decl_macro, rustc_attrs, transparent_unions, auto_traits,
+    decl_macro, rustc_attrs, transparent_unions, auto_traits, freeze_impls,
     thread_local
 )]
 #![no_core]
@@ -418,6 +418,36 @@ pub fn panic(_msg: &'static str) -> ! {
     }
 }
 
+macro_rules! panic_const {
+    ($($lang:ident = $message:expr,)+) => {
+        #[cfg(not(bootstrap))]
+        pub mod panic_const {
+            use super::*;
+
+            $(
+                #[track_caller]
+                #[lang = stringify!($lang)]
+                pub fn $lang() -> ! {
+                    panic($message);
+                }
+            )+
+        }
+    }
+}
+
+panic_const! {
+    panic_const_add_overflow = "attempt to add with overflow",
+    panic_const_sub_overflow = "attempt to subtract with overflow",
+    panic_const_mul_overflow = "attempt to multiply with overflow",
+    panic_const_div_overflow = "attempt to divide with overflow",
+    panic_const_rem_overflow = "attempt to calculate the remainder with overflow",
+    panic_const_neg_overflow = "attempt to negate with overflow",
+    panic_const_shr_overflow = "attempt to shift right with overflow",
+    panic_const_shl_overflow = "attempt to shift left with overflow",
+    panic_const_div_by_zero = "attempt to divide by zero",
+    panic_const_rem_by_zero = "attempt to calculate the remainder with a divisor of zero",
+}
+
 #[lang = "panic_cannot_unwind"]
 fn panic_cannot_unwind() -> ! {
     unsafe {
@@ -472,6 +502,7 @@ pub trait Allocator {
 
 impl Allocator for () {}
 
+#[lang = "global_alloc_ty"]
 pub struct Global;
 
 impl Allocator for Global {}

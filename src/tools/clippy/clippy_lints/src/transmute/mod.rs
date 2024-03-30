@@ -514,7 +514,7 @@ declare_clippy_lint! {
     ///              ^^^^ ^^ `bool::then` only executes the closure if the condition is true!
     /// }
     /// ```
-    #[clippy::version = "1.76.0"]
+    #[clippy::version = "1.77.0"]
     pub EAGER_TRANSMUTE,
     correctness,
     "eager evaluation of `transmute`"
@@ -592,7 +592,7 @@ impl<'tcx> LateLintPass<'tcx> for Transmute {
                 | (eager_transmute::check(cx, e, arg, from_ty, to_ty));
 
             if !linted {
-                transmutes_expressible_as_ptr_casts::check(cx, e, from_ty, from_ty_adjusted, to_ty, arg);
+                transmutes_expressible_as_ptr_casts::check(cx, e, from_ty, from_ty_adjusted, to_ty, arg, const_context);
             }
         }
     }

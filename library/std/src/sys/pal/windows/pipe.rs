@@ -7,7 +7,7 @@ use crate::path::Path;
 use crate::ptr;
 use crate::slice;
 use crate::sync::atomic::AtomicUsize;
-use crate::sync::atomic::Ordering::SeqCst;
+use crate::sync::atomic::Ordering::Relaxed;
 use crate::sys::c;
 use crate::sys::fs::{File, OpenOptions};
 use crate::sys::handle::Handle;
@@ -214,11 +214,11 @@ pub fn spawn_pipe_relay(
 fn random_number() -> usize {
     static N: AtomicUsize = AtomicUsize::new(0);
     loop {
-        if N.load(SeqCst) != 0 {
-            return N.fetch_add(1, SeqCst);
+        if N.load(Relaxed) != 0 {
+            return N.fetch_add(1, Relaxed);
         }
 
-        N.store(hashmap_random_keys().0 as usize, SeqCst);
+        N.store(hashmap_random_keys().0 as usize, Relaxed);
     }
 }
 
@@ -273,7 +273,7 @@ impl AnonPipe {
             Err(e) => Err(e),
             Ok(n) => {
                 unsafe {
-                    buf.advance(n);
+                    buf.advance_unchecked(n);
                 }
                 Ok(())
             }
@@ -375,7 +375,7 @@ impl AnonPipe {
         let mut overlapped: c::OVERLAPPED = crate::mem::zeroed();
         // `hEvent` is unused by `ReadFileEx` and `WriteFileEx`.
         // Therefore the documentation suggests using it to smuggle a pointer to the callback.
-        overlapped.hEvent = &mut async_result as *mut _ as *mut _;
+        overlapped.hEvent = core::ptr::addr_of_mut!(async_result) as *mut _;
 
         // Asynchronous read of the pipe.
         // If successful, `callback` will be called once it completes.

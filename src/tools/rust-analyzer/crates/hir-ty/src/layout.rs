@@ -1,6 +1,6 @@
 //! Compute the binary representation of a type
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use base_db::salsa::Cycle;
 use chalk_ir::{AdtId, FloatTy, IntTy, TyKind, UintTy};
@@ -19,8 +19,12 @@ use stdx::never;
 use triomphe::Arc;
 
 use crate::{
-    consteval::try_const_usize, db::HirDatabase, infer::normalize, layout::adt::struct_variant_idx,
-    utils::ClosureSubst, Interner, ProjectionTy, Substitution, TraitEnvironment, Ty,
+    consteval::try_const_usize,
+    db::{HirDatabase, InternedClosure},
+    infer::normalize,
+    layout::adt::struct_variant_idx,
+    utils::ClosureSubst,
+    Interner, ProjectionTy, Substitution, TraitEnvironment, Ty,
 };
 
 pub use self::{
@@ -110,8 +114,8 @@ struct LayoutCx<'a> {
 impl<'a> LayoutCalculator for LayoutCx<'a> {
     type TargetDataLayoutRef = &'a TargetDataLayout;
 
-    fn delayed_bug(&self, txt: String) {
-        never!("{}", txt);
+    fn delayed_bug(&self, txt: impl Into<Cow<'static, str>>) {
+        never!("{}", txt.into());
     }
 
     fn current_data_layout(&self) -> &'a TargetDataLayout {
@@ -367,8 +371,8 @@ pub fn layout_of_ty_query(
         TyKind::Never => cx.layout_of_never_type(),
         TyKind::Dyn(_) | TyKind::Foreign(_) => {
             let mut unit = layout_of_unit(&cx, dl)?;
-            match unit.abi {
-                Abi::Aggregate { ref mut sized } => *sized = false,
+            match &mut unit.abi {
+                Abi::Aggregate { sized } => *sized = false,
                 _ => return Err(LayoutError::Unknown),
             }
             unit
@@ -391,7 +395,7 @@ pub fn layout_of_ty_query(
             }
         }
         TyKind::Closure(c, subst) => {
-            let (def, _) = db.lookup_intern_closure((*c).into());
+            let InternedClosure(def, _) = db.lookup_intern_closure((*c).into());
             let infer = db.infer(def);
             let (captures, _) = infer.closure_info(c);
             let fields = captures

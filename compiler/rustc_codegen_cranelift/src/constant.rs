@@ -6,17 +6,16 @@ use cranelift_module::*;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::interpret::{read_target_uint, AllocId, GlobalAlloc, Scalar};
-use rustc_middle::ty::ScalarInt;
+use rustc_middle::ty::{Binder, ExistentialTraitRef, ScalarInt};
 
 use crate::prelude::*;
 
 pub(crate) struct ConstantCx {
     todo: Vec<TodoItem>,
-    done: FxHashSet<DataId>,
     anon_allocs: FxHashMap<AllocId, DataId>,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 enum TodoItem {
     Alloc(AllocId),
     Static(DefId),
@@ -24,19 +23,24 @@ enum TodoItem {
 
 impl ConstantCx {
     pub(crate) fn new() -> Self {
-        ConstantCx { todo: vec![], done: FxHashSet::default(), anon_allocs: FxHashMap::default() }
+        ConstantCx { todo: vec![], anon_allocs: FxHashMap::default() }
     }
 
     pub(crate) fn finalize(mut self, tcx: TyCtxt<'_>, module: &mut dyn Module) {
         define_all_allocs(tcx, module, &mut self);
-        self.done.clear();
     }
 }
 
-pub(crate) fn codegen_static(tcx: TyCtxt<'_>, module: &mut dyn Module, def_id: DefId) {
+pub(crate) fn codegen_static(tcx: TyCtxt<'_>, module: &mut dyn Module, def_id: DefId) -> DataId {
     let mut constants_cx = ConstantCx::new();
     constants_cx.todo.push(TodoItem::Static(def_id));
     constants_cx.finalize(tcx, module);
+
+    data_id_for_static(
+        tcx, module, def_id, false,
+        // For a declaration the stated mutability doesn't matter.
+        false,
+    )
 }
 
 pub(crate) fn codegen_tls_ref<'tcx>(
@@ -53,7 +57,11 @@ pub(crate) fn codegen_tls_ref<'tcx>(
         let call = fx.bcx.ins().call(func_ref, &[]);
         fx.bcx.func.dfg.first_result(call)
     } else {
-        let data_id = data_id_for_static(fx.tcx, fx.module, def_id, false);
+        let data_id = data_id_for_static(
+            fx.tcx, fx.module, def_id, false,
+            // For a declaration the stated mutability doesn't matter.
+            false,
+        );
         let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
         if fx.clif_comments.enabled() {
             fx.add_comment(local_data_id, format!("tls {:?}", def_id));
@@ -70,8 +78,8 @@ pub(crate) fn eval_mir_constant<'tcx>(
     let cv = fx.monomorphize(constant.const_);
     // This cannot fail because we checked all required_consts in advance.
     let val = cv
-        .eval(fx.tcx, ty::ParamEnv::reveal_all(), Some(constant.span))
-        .expect("erroneous constant not captured by required_consts");
+        .eval(fx.tcx, ty::ParamEnv::reveal_all(), constant.span)
+        .expect("erroneous constant missed by mono item collection");
     (val, cv.ty())
 }
 
@@ -149,14 +157,12 @@ pub(crate) fn codegen_const_value<'tcx>(
                         fx.bcx.ins().func_addr(fx.pointer_type, local_func_id)
                     }
                     GlobalAlloc::VTable(ty, trait_ref) => {
-                        let alloc_id = fx.tcx.vtable_allocation((ty, trait_ref));
-                        let alloc = fx.tcx.global_alloc(alloc_id).unwrap_memory();
-                        // FIXME: factor this common code with the `Memory` arm into a function?
-                        let data_id = data_id_for_alloc_id(
+                        let data_id = data_id_for_vtable(
+                            fx.tcx,
                             &mut fx.constants_cx,
                             fx.module,
-                            alloc_id,
-                            alloc.inner().mutability,
+                            ty,
+                            trait_ref,
                         );
                         let local_data_id =
                             fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
@@ -164,7 +170,11 @@ pub(crate) fn codegen_const_value<'tcx>(
                     }
                     GlobalAlloc::Static(def_id) => {
                         assert!(fx.tcx.is_static(def_id));
-                        let data_id = data_id_for_static(fx.tcx, fx.module, def_id, false);
+                        let data_id = data_id_for_static(
+                            fx.tcx, fx.module, def_id, false,
+                            // For a declaration the stated mutability doesn't matter.
+                            false,
+                        );
                         let local_data_id =
                             fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
                         if fx.clif_comments.enabled() {
@@ -200,12 +210,8 @@ fn pointer_for_allocation<'tcx>(
     alloc_id: AllocId,
 ) -> crate::pointer::Pointer {
     let alloc = fx.tcx.global_alloc(alloc_id).unwrap_memory();
-    let data_id = data_id_for_alloc_id(
-        &mut fx.constants_cx,
-        &mut *fx.module,
-        alloc_id,
-        alloc.inner().mutability,
-    );
+    let data_id =
+        data_id_for_alloc_id(&mut fx.constants_cx, fx.module, alloc_id, alloc.inner().mutability);
 
     let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
     if fx.clif_comments.enabled() {
@@ -227,26 +233,35 @@ pub(crate) fn data_id_for_alloc_id(
         .or_insert_with(|| module.declare_anonymous_data(mutability.is_mut(), false).unwrap())
 }
 
+pub(crate) fn data_id_for_vtable<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cx: &mut ConstantCx,
+    module: &mut dyn Module,
+    ty: Ty<'tcx>,
+    trait_ref: Option<Binder<'tcx, ExistentialTraitRef<'tcx>>>,
+) -> DataId {
+    let alloc_id = tcx.vtable_allocation((ty, trait_ref));
+    data_id_for_alloc_id(cx, module, alloc_id, Mutability::Not)
+}
+
 fn data_id_for_static(
     tcx: TyCtxt<'_>,
     module: &mut dyn Module,
     def_id: DefId,
     definition: bool,
+    definition_writable: bool,
 ) -> DataId {
     let attrs = tcx.codegen_fn_attrs(def_id);
 
     let instance = Instance::mono(tcx, def_id).polymorphize(tcx);
     let symbol_name = tcx.symbol_name(instance).name;
-    let ty = instance.ty(tcx, ParamEnv::reveal_all());
-    let is_mutable = if tcx.is_mutable_static(def_id) {
-        true
-    } else {
-        !ty.is_freeze(tcx, ParamEnv::reveal_all())
-    };
-    let align = tcx.layout_of(ParamEnv::reveal_all().and(ty)).unwrap().align.pref.bytes();
 
     if let Some(import_linkage) = attrs.import_linkage {
         assert!(!definition);
+        assert!(!tcx.is_mutable_static(def_id));
+
+        let ty = instance.ty(tcx, ParamEnv::reveal_all());
+        let align = tcx.layout_of(ParamEnv::reveal_all().and(ty)).unwrap().align.pref.bytes();
 
         let linkage = if import_linkage == rustc_middle::mir::mono::Linkage::ExternalWeak
             || import_linkage == rustc_middle::mir::mono::Linkage::WeakAny
@@ -259,7 +274,7 @@ fn data_id_for_static(
         let data_id = match module.declare_data(
             symbol_name,
             linkage,
-            is_mutable,
+            false,
             attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL),
         ) {
             Ok(data_id) => data_id,
@@ -307,7 +322,7 @@ fn data_id_for_static(
     let data_id = match module.declare_data(
         symbol_name,
         linkage,
-        is_mutable,
+        definition_writable,
         attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL),
     ) {
         Ok(data_id) => data_id,
@@ -321,7 +336,12 @@ fn data_id_for_static(
 }
 
 fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut ConstantCx) {
+    let mut done = FxHashSet::default();
     while let Some(todo_item) = cx.todo.pop() {
+        if !done.insert(todo_item) {
+            continue;
+        }
+
         let (data_id, alloc, section_name) = match todo_item {
             TodoItem::Alloc(alloc_id) => {
                 let alloc = match tcx.global_alloc(alloc_id) {
@@ -341,14 +361,16 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
 
                 let alloc = tcx.eval_static_initializer(def_id).unwrap();
 
-                let data_id = data_id_for_static(tcx, module, def_id, true);
+                let data_id = data_id_for_static(
+                    tcx,
+                    module,
+                    def_id,
+                    true,
+                    alloc.inner().mutability == Mutability::Mut,
+                );
                 (data_id, alloc, section_name)
             }
         };
-
-        if cx.done.contains(&data_id) {
-            continue;
-        }
 
         let mut data = DataDescription::new();
         let alloc = alloc.inner();
@@ -400,8 +422,7 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                     data_id_for_alloc_id(cx, module, alloc_id, target_alloc.inner().mutability)
                 }
                 GlobalAlloc::VTable(ty, trait_ref) => {
-                    let alloc_id = tcx.vtable_allocation((ty, trait_ref));
-                    data_id_for_alloc_id(cx, module, alloc_id, Mutability::Not)
+                    data_id_for_vtable(tcx, cx, module, ty, trait_ref)
                 }
                 GlobalAlloc::Static(def_id) => {
                     if tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL)
@@ -415,7 +436,11 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                     // Don't push a `TodoItem::Static` here, as it will cause statics used by
                     // multiple crates to be duplicated between them. It isn't necessary anyway,
                     // as it will get pushed by `codegen_static` when necessary.
-                    data_id_for_static(tcx, module, def_id, false)
+                    data_id_for_static(
+                        tcx, module, def_id, false,
+                        // For a declaration the stated mutability doesn't matter.
+                        false,
+                    )
                 }
             };
 
@@ -424,7 +449,6 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
         }
 
         module.define_data(data_id, &data).unwrap();
-        cx.done.insert(data_id);
     }
 
     assert!(cx.todo.is_empty(), "{:?}", cx.todo);

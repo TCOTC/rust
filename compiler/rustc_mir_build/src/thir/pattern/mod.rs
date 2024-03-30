@@ -9,15 +9,14 @@ use crate::errors::*;
 use crate::thir::util::UserAnnotatedTyHelpers;
 
 use rustc_errors::codes::*;
-use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::pat_util::EnumerateAndAdjustIterator;
-use rustc_hir::RangeEnd;
+use rustc_hir::{self as hir, RangeEnd};
 use rustc_index::Idx;
 use rustc_middle::mir::interpret::{ErrorHandled, GlobalId, LitToConstError, LitToConstInput};
-use rustc_middle::mir::{self, BorrowKind, Const, Mutability};
+use rustc_middle::mir::{self, Const};
 use rustc_middle::thir::{
-    Ascription, BindingMode, FieldPat, LocalVarId, Pat, PatKind, PatRange, PatRangeBoundary,
+    Ascription, FieldPat, LocalVarId, Pat, PatKind, PatRange, PatRangeBoundary,
 };
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, TyCtxt, TypeVisitableExt};
@@ -175,7 +174,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
     ) -> Result<PatKind<'tcx>, ErrorGuaranteed> {
         if lo_expr.is_none() && hi_expr.is_none() {
             let msg = "found twice-open range pattern (`..`) outside of error recovery";
-            return Err(self.tcx.dcx().span_delayed_bug(span, msg));
+            self.tcx.dcx().span_bug(span, msg);
         }
 
         let (lo, lo_ascr, lo_inline) = self.lower_pattern_range_endpoint(lo_expr)?;
@@ -223,19 +222,14 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         // If we are handling a range with associated constants (e.g.
         // `Foo::<'a>::A..=Foo::B`), we need to put the ascriptions for the associated
         // constants somewhere. Have them on the range pattern.
-        for ascr in [lo_ascr, hi_ascr] {
-            if let Some(ascription) = ascr {
-                kind = PatKind::AscribeUserType {
-                    ascription,
-                    subpattern: Box::new(Pat { span, ty, kind }),
-                };
-            }
+        for ascription in [lo_ascr, hi_ascr].into_iter().flatten() {
+            kind = PatKind::AscribeUserType {
+                ascription,
+                subpattern: Box::new(Pat { span, ty, kind }),
+            };
         }
-        for inline_const in [lo_inline, hi_inline] {
-            if let Some(def) = inline_const {
-                kind =
-                    PatKind::InlineConstant { def, subpattern: Box::new(Pat { span, ty, kind }) };
-            }
+        for def in [lo_inline, hi_inline].into_iter().flatten() {
+            kind = PatKind::InlineConstant { def, subpattern: Box::new(Pat { span, ty, kind }) };
         }
         Ok(kind)
     }
@@ -262,6 +256,9 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 return self.lower_path(qpath, pat.hir_id, pat.span);
             }
 
+            hir::PatKind::Deref(subpattern) => {
+                PatKind::DerefPattern { subpattern: self.lower_pattern(subpattern) }
+            }
             hir::PatKind::Ref(subpattern, _) | hir::PatKind::Box(subpattern) => {
                 PatKind::Deref { subpattern: self.lower_pattern(subpattern) }
             }
@@ -283,26 +280,16 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                     span = span.with_hi(ident_span.hi());
                 }
 
-                let bm = *self
+                let mode = *self
                     .typeck_results
                     .pat_binding_modes()
                     .get(pat.hir_id)
                     .expect("missing binding mode");
-                let (mutability, mode) = match bm {
-                    ty::BindByValue(mutbl) => (mutbl, BindingMode::ByValue),
-                    ty::BindByReference(hir::Mutability::Mut) => (
-                        Mutability::Not,
-                        BindingMode::ByRef(BorrowKind::Mut { kind: mir::MutBorrowKind::Default }),
-                    ),
-                    ty::BindByReference(hir::Mutability::Not) => {
-                        (Mutability::Not, BindingMode::ByRef(BorrowKind::Shared))
-                    }
-                };
 
                 // A ref x pattern is the same node used for x, and as such it has
                 // x's type, which is &T, where we want T (the type being matched).
                 let var_ty = ty;
-                if let ty::BindByReference(_) = bm {
+                if let hir::ByRef::Yes(_) = mode.0 {
                     if let ty::Ref(_, rty, _) = ty.kind() {
                         ty = *rty;
                     } else {
@@ -311,7 +298,6 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 };
 
                 PatKind::Binding {
-                    mutability,
                     mode,
                     name: ident.name,
                     var: LocalVarId(id),
@@ -458,7 +444,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                     Res::Def(DefKind::ConstParam, _) => {
                         self.tcx.dcx().emit_err(ConstParamInPattern { span })
                     }
-                    Res::Def(DefKind::Static(_), _) => {
+                    Res::Def(DefKind::Static { .. }, _) => {
                         self.tcx.dcx().emit_err(StaticInPattern { span })
                     }
                     _ => self.tcx.dcx().emit_err(NonConstPath { span }),
@@ -529,12 +515,12 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         // Prefer valtrees over opaque constants.
         let const_value = self
             .tcx
-            .const_eval_global_id_for_typeck(param_env_reveal_all, cid, Some(span))
+            .const_eval_global_id_for_typeck(param_env_reveal_all, cid, span)
             .map(|val| match val {
                 Some(valtree) => mir::Const::Ty(ty::Const::new_value(self.tcx, valtree, ty)),
                 None => mir::Const::Val(
                     self.tcx
-                        .const_eval_global_id(param_env_reveal_all, cid, Some(span))
+                        .const_eval_global_id(param_env_reveal_all, cid, span)
                         .expect("const_eval_global_id_for_typeck should have already failed"),
                     ty,
                 ),
@@ -632,15 +618,14 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         // First try using a valtree in order to destructure the constant into a pattern.
         // FIXME: replace "try to do a thing, then fall back to another thing"
         // but something more principled, like a trait query checking whether this can be turned into a valtree.
-        if let Ok(Some(valtree)) =
-            self.tcx.const_eval_resolve_for_typeck(self.param_env, ct, Some(span))
+        if let Ok(Some(valtree)) = self.tcx.const_eval_resolve_for_typeck(self.param_env, ct, span)
         {
             let subpattern =
                 self.const_to_pat(Const::Ty(ty::Const::new_value(self.tcx, valtree, ty)), id, span);
             PatKind::InlineConstant { subpattern, def: def_id }
         } else {
             // If that fails, convert it to an opaque constant pattern.
-            match tcx.const_eval_resolve(self.param_env, uneval, Some(span)) {
+            match tcx.const_eval_resolve(self.param_env, uneval, span) {
                 Ok(val) => self.const_to_pat(mir::Const::Val(val, ty), id, span).kind,
                 Err(ErrorHandled::TooGeneric(_)) => {
                     // If we land here it means the const can't be evaluated because it's `TooGeneric`.

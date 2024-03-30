@@ -163,7 +163,7 @@ impl<T: ?Sized> Clone for PtrComponents<T> {
 /// It is a pointer to a vtable (virtual call table)
 /// that represents all the necessary information
 /// to manipulate the concrete type stored inside a trait object.
-/// The vtable notably it contains:
+/// The vtable notably contains:
 ///
 /// * type size
 /// * type alignment
@@ -175,6 +175,11 @@ impl<T: ?Sized> Clone for PtrComponents<T> {
 ///
 /// It is possible to name this struct with a type parameter that is not a `dyn` trait object
 /// (for example `DynMetadata<u64>`) but not to obtain a meaningful value of that struct.
+///
+/// Note that while this type implements `PartialEq`, comparing vtable pointers is unreliable:
+/// pointers to vtables of the same type for the same trait can compare inequal (because vtables are
+/// duplicated in multiple codegen units), and pointers to vtables of *different* types/traits can
+/// compare equal (since identical vtables can be deduplicated within a codegen unit).
 #[lang = "dyn_metadata"]
 pub struct DynMetadata<Dyn: ?Sized> {
     vtable_ptr: &'static VTable,
@@ -253,6 +258,7 @@ impl<Dyn: ?Sized> PartialEq for DynMetadata<Dyn> {
 
 impl<Dyn: ?Sized> Ord for DynMetadata<Dyn> {
     #[inline]
+    #[allow(ambiguous_wide_pointer_comparisons)]
     fn cmp(&self, other: &Self) -> crate::cmp::Ordering {
         (self.vtable_ptr as *const VTable).cmp(&(other.vtable_ptr as *const VTable))
     }

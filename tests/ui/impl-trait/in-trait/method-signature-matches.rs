@@ -1,7 +1,5 @@
-// edition: 2021
-// revisions: mismatch mismatch_async too_many too_few lt
-
-#![allow(incomplete_features)]
+//@ edition: 2021
+//@ revisions: mismatch mismatch_async too_many too_few lt
 
 #[cfg(mismatch)]
 trait Uwu {

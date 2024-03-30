@@ -41,12 +41,12 @@ impl<'tcx> LateLintPass<'tcx> for IgnoredUnitPatterns {
             return;
         }
 
-        match cx.tcx.hir().get_parent(pat.hir_id) {
-            Node::Param(param) if matches!(cx.tcx.hir().get_parent(param.hir_id), Node::Item(_)) => {
+        match cx.tcx.parent_hir_node(pat.hir_id) {
+            Node::Param(param) if matches!(cx.tcx.parent_hir_node(param.hir_id), Node::Item(_)) => {
                 // Ignore function parameters
                 return;
             },
-            Node::Local(local) if local.ty.is_some() => {
+            Node::LetStmt(local) if local.ty.is_some() => {
                 // Ignore let bindings with explicit type
                 return;
             },

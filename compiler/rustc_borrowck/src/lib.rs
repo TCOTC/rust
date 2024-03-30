@@ -4,8 +4,9 @@
 #![feature(rustdoc_internals)]
 #![doc(rust_logo)]
 #![feature(assert_matches)]
-#![feature(associated_type_bounds)]
+#![cfg_attr(bootstrap, feature(associated_type_bounds))]
 #![feature(box_patterns)]
+#![feature(control_flow_enum)]
 #![feature(let_chains)]
 #![feature(min_specialization)]
 #![feature(never_type)]
@@ -20,7 +21,7 @@ extern crate tracing;
 
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::graph::dominators::Dominators;
-use rustc_errors::DiagnosticBuilder;
+use rustc_errors::Diag;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::{BitSet, ChunkedBitSet};
@@ -125,10 +126,7 @@ fn mir_borrowck(tcx: TyCtxt<'_>, def: LocalDefId) -> &BorrowCheckResult<'_> {
         return tcx.arena.alloc(result);
     }
 
-    let hir_owner = tcx.local_def_id_to_hir_id(def).owner;
-
-    let infcx =
-        tcx.infer_ctxt().with_opaque_type_inference(DefiningAnchor::Bind(hir_owner.def_id)).build();
+    let infcx = tcx.infer_ctxt().with_opaque_type_inference(DefiningAnchor::bind(tcx, def)).build();
     let promoted: &IndexSlice<_, _> = &promoted.borrow();
     let opt_closure_req = do_mir_borrowck(&infcx, input_body, promoted, None).0;
     debug!("mir_borrowck done");
@@ -723,7 +721,7 @@ impl<'cx, 'tcx, R> rustc_mir_dataflow::ResultsVisitor<'cx, 'tcx, R> for MirBorro
                 operands,
                 options: _,
                 line_spans: _,
-                destination: _,
+                targets: _,
                 unwind: _,
             } => {
                 for op in operands {
@@ -749,7 +747,8 @@ impl<'cx, 'tcx, R> rustc_mir_dataflow::ResultsVisitor<'cx, 'tcx, R> for MirBorro
                         }
                         InlineAsmOperand::Const { value: _ }
                         | InlineAsmOperand::SymFn { value: _ }
-                        | InlineAsmOperand::SymStatic { def_id: _ } => {}
+                        | InlineAsmOperand::SymStatic { def_id: _ }
+                        | InlineAsmOperand::Label { target_index: _ } => {}
                     }
                 }
             }
@@ -1036,7 +1035,6 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
             self,
             self.infcx.tcx,
             self.body,
-            location,
             (sd, place_span.0),
             &borrow_set,
             |borrow_index| borrows_in_scope.contains(borrow_index),
@@ -1651,7 +1649,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     | ty::Str
                     | ty::Array(_, _)
                     | ty::Slice(_)
-                    | ty::RawPtr(_)
+                    | ty::RawPtr(_, _)
                     | ty::Ref(_, _, _)
                     | ty::FnDef(_, _)
                     | ty::FnPtr(_)
@@ -2174,7 +2172,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                 // report the error as an illegal reassignment
                 let init = &self.move_data.inits[init_index];
                 let assigned_span = init.span(self.body);
-                self.report_illegal_reassignment(location, (place, span), assigned_span, place);
+                self.report_illegal_reassignment((place, span), assigned_span, place);
             } else {
                 self.report_mutability_error(place, span, the_place_err, error_access, location)
             }
@@ -2286,8 +2284,8 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                                     }
                                 }
                             }
-                            ty::RawPtr(tnm) => {
-                                match tnm.mutbl {
+                            ty::RawPtr(_, mutbl) => {
+                                match mutbl {
                                     // `*const` raw pointers are not mutable
                                     hir::Mutability::Not => Err(place),
                                     // `*mut` raw pointers are always mutable, regardless of
@@ -2396,8 +2394,8 @@ mod diags {
     use super::*;
 
     enum BufferedDiag<'tcx> {
-        Error(DiagnosticBuilder<'tcx>),
-        NonError(DiagnosticBuilder<'tcx, ()>),
+        Error(Diag<'tcx>),
+        NonError(Diag<'tcx, ()>),
     }
 
     impl<'tcx> BufferedDiag<'tcx> {
@@ -2424,10 +2422,9 @@ mod diags {
         /// `BTreeMap` is used to preserve the order of insertions when iterating. This is necessary
         /// when errors in the map are being re-added to the error buffer so that errors with the
         /// same primary span come out in a consistent order.
-        buffered_move_errors:
-            BTreeMap<Vec<MoveOutIndex>, (PlaceRef<'tcx>, DiagnosticBuilder<'tcx>)>,
+        buffered_move_errors: BTreeMap<Vec<MoveOutIndex>, (PlaceRef<'tcx>, Diag<'tcx>)>,
 
-        buffered_mut_errors: FxIndexMap<Span, (DiagnosticBuilder<'tcx>, usize)>,
+        buffered_mut_errors: FxIndexMap<Span, (Diag<'tcx>, usize)>,
 
         /// Buffer of diagnostics to be reported. A mixture of error and non-error diagnostics.
         buffered_diags: Vec<BufferedDiag<'tcx>>,
@@ -2442,28 +2439,28 @@ mod diags {
             }
         }
 
-        pub fn buffer_error(&mut self, t: DiagnosticBuilder<'tcx>) {
-            self.buffered_diags.push(BufferedDiag::Error(t));
+        pub fn buffer_error(&mut self, diag: Diag<'tcx>) {
+            self.buffered_diags.push(BufferedDiag::Error(diag));
         }
 
-        pub fn buffer_non_error(&mut self, t: DiagnosticBuilder<'tcx, ()>) {
-            self.buffered_diags.push(BufferedDiag::NonError(t));
+        pub fn buffer_non_error(&mut self, diag: Diag<'tcx, ()>) {
+            self.buffered_diags.push(BufferedDiag::NonError(diag));
         }
     }
 
     impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
-        pub fn buffer_error(&mut self, t: DiagnosticBuilder<'tcx>) {
-            self.diags.buffer_error(t);
+        pub fn buffer_error(&mut self, diag: Diag<'tcx>) {
+            self.diags.buffer_error(diag);
         }
 
-        pub fn buffer_non_error(&mut self, t: DiagnosticBuilder<'tcx, ()>) {
-            self.diags.buffer_non_error(t);
+        pub fn buffer_non_error(&mut self, diag: Diag<'tcx, ()>) {
+            self.diags.buffer_non_error(diag);
         }
 
         pub fn buffer_move_error(
             &mut self,
             move_out_indices: Vec<MoveOutIndex>,
-            place_and_err: (PlaceRef<'tcx>, DiagnosticBuilder<'tcx>),
+            place_and_err: (PlaceRef<'tcx>, Diag<'tcx>),
         ) -> bool {
             if let Some((_, diag)) =
                 self.diags.buffered_move_errors.insert(move_out_indices, place_and_err)
@@ -2476,15 +2473,13 @@ mod diags {
             }
         }
 
-        pub fn get_buffered_mut_error(
-            &mut self,
-            span: Span,
-        ) -> Option<(DiagnosticBuilder<'tcx>, usize)> {
-            self.diags.buffered_mut_errors.remove(&span)
+        pub fn get_buffered_mut_error(&mut self, span: Span) -> Option<(Diag<'tcx>, usize)> {
+            // FIXME(#120456) - is `swap_remove` correct?
+            self.diags.buffered_mut_errors.swap_remove(&span)
         }
 
-        pub fn buffer_mut_error(&mut self, span: Span, t: DiagnosticBuilder<'tcx>, count: usize) {
-            self.diags.buffered_mut_errors.insert(span, (t, count));
+        pub fn buffer_mut_error(&mut self, span: Span, diag: Diag<'tcx>, count: usize) {
+            self.diags.buffered_mut_errors.insert(span, (diag, count));
         }
 
         pub fn emit_errors(&mut self) -> Option<ErrorGuaranteed> {
@@ -2497,6 +2492,8 @@ mod diags {
             }
             for (_, (mut diag, count)) in std::mem::take(&mut self.diags.buffered_mut_errors) {
                 if count > 10 {
+                    #[allow(rustc::diagnostic_outside_of_impl)]
+                    #[allow(rustc::untranslatable_diagnostic)]
                     diag.note(format!("...and {} other attempted mutable borrows", count - 10));
                 }
                 self.diags.buffered_diags.push(BufferedDiag::Error(diag));
@@ -2522,7 +2519,7 @@ mod diags {
         pub fn has_move_error(
             &self,
             move_out_indices: &[MoveOutIndex],
-        ) -> Option<&(PlaceRef<'tcx>, DiagnosticBuilder<'tcx>)> {
+        ) -> Option<&(PlaceRef<'tcx>, Diag<'tcx>)> {
             self.diags.buffered_move_errors.get(move_out_indices)
         }
     }

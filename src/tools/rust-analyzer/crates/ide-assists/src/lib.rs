@@ -60,11 +60,6 @@
 
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
-
 mod assist_config;
 mod assist_context;
 #[cfg(test)]
@@ -133,6 +128,7 @@ mod handlers {
     mod convert_tuple_struct_to_named_struct;
     mod convert_two_arm_bool_match_to_matches_macro;
     mod convert_while_to_loop;
+    mod destructure_struct_binding;
     mod destructure_tuple_binding;
     mod desugar_doc_comment;
     mod expand_glob_import;
@@ -142,6 +138,7 @@ mod handlers {
     mod extract_struct_from_enum_variant;
     mod extract_type_alias;
     mod extract_variable;
+    mod fill_record_pattern_fields;
     mod fix_visibility;
     mod flip_binexpr;
     mod flip_comma;
@@ -210,6 +207,7 @@ mod handlers {
     mod replace_turbofish_with_explicit_type;
     mod sort_items;
     mod split_import;
+    mod term_search;
     mod toggle_ignore;
     mod unmerge_match_arm;
     mod unmerge_use;
@@ -254,10 +252,12 @@ mod handlers {
             convert_while_to_loop::convert_while_to_loop,
             desugar_doc_comment::desugar_doc_comment,
             destructure_tuple_binding::destructure_tuple_binding,
+            destructure_struct_binding::destructure_struct_binding,
             expand_glob_import::expand_glob_import,
             extract_expressions_from_format_string::extract_expressions_from_format_string,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
             extract_type_alias::extract_type_alias,
+            fill_record_pattern_fields::fill_record_pattern_fields,
             fix_visibility::fix_visibility,
             flip_binexpr::flip_binexpr,
             flip_comma::flip_comma,
@@ -332,6 +332,7 @@ mod handlers {
             replace_arith_op::replace_arith_with_saturating,
             sort_items::sort_items,
             split_import::split_import,
+            term_search::term_search,
             toggle_ignore::toggle_ignore,
             unmerge_match_arm::unmerge_match_arm,
             unmerge_use::unmerge_use,

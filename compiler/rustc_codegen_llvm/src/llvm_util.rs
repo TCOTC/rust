@@ -5,6 +5,7 @@ use crate::errors::{
 };
 use crate::llvm;
 use libc::c_int;
+use rustc_codegen_ssa::base::wants_wasm_eh;
 use rustc_codegen_ssa::traits::PrintBackendInfo;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::small_c_str::SmallCStr;
@@ -48,7 +49,7 @@ unsafe fn configure_llvm(sess: &Session) {
     let mut llvm_c_strs = Vec::with_capacity(n_args + 1);
     let mut llvm_args = Vec::with_capacity(n_args + 1);
 
-    llvm::LLVMRustInstallFatalErrorHandler();
+    llvm::LLVMRustInstallErrorHandlers();
     // On Windows, an LLVM assertion will open an Abort/Retry/Ignore dialog
     // box for the purpose of launching a debugger. However, on CI this will
     // cause it to hang until it times out, which can take several hours.
@@ -96,6 +97,10 @@ unsafe fn configure_llvm(sess: &Session) {
             MergeFunctions::Aliases => {
                 add("-mergefunc-use-aliases", false);
             }
+        }
+
+        if wants_wasm_eh(sess) {
+            add("-wasm-enable-eh", false);
         }
 
         if sess.target.os == "emscripten" && sess.panic_strategy() == PanicStrategy::Unwind {
@@ -192,19 +197,22 @@ impl<'a> IntoIterator for LLVMFeature<'a> {
 // to LLVM or the feature detection code will walk past the end of the feature
 // array, leading to crashes.
 //
-// To find a list of LLVM's names, check llvm-project/llvm/include/llvm/Support/*TargetParser.def
-// where the * matches the architecture's name
-//
-// For targets not present in the above location, see llvm-project/llvm/lib/Target/{ARCH}/*.td
+// To find a list of LLVM's names, see llvm-project/llvm/lib/Target/{ARCH}/*.td
 // where `{ARCH}` is the architecture name. Look for instances of `SubtargetFeature`.
 //
-// Beware to not use the llvm github project for this, but check the git submodule
-// found in src/llvm-project
+// Check the current rustc fork of LLVM in the repo at https://github.com/rust-lang/llvm-project/.
+// The commit in use can be found via the `llvm-project` submodule in https://github.com/rust-lang/rust/tree/master/src
 // Though note that Rust can also be build with an external precompiled version of LLVM
 // which might lead to failures if the oldest tested / supported LLVM version
 // doesn't yet support the relevant intrinsics
 pub fn to_llvm_features<'a>(sess: &Session, s: &'a str) -> LLVMFeature<'a> {
-    let arch = if sess.target.arch == "x86_64" { "x86" } else { &*sess.target.arch };
+    let arch = if sess.target.arch == "x86_64" {
+        "x86"
+    } else if sess.target.arch == "arm64ec" {
+        "aarch64"
+    } else {
+        &*sess.target.arch
+    };
     match (arch, s) {
         ("x86", "sse4.2") => {
             LLVMFeature::with_dependency("sse4.2", TargetFeatureFoldStrength::EnableOnly("crc32"))
@@ -213,6 +221,7 @@ pub fn to_llvm_features<'a>(sess: &Session, s: &'a str) -> LLVMFeature<'a> {
         ("x86", "rdrand") => LLVMFeature::new("rdrnd"),
         ("x86", "bmi1") => LLVMFeature::new("bmi"),
         ("x86", "cmpxchg16b") => LLVMFeature::new("cx16"),
+        ("x86", "lahfsahf") => LLVMFeature::new("sahf"),
         ("aarch64", "rcpc2") => LLVMFeature::new("rcpc-immo"),
         ("aarch64", "dpb") => LLVMFeature::new("ccpp"),
         ("aarch64", "dpb2") => LLVMFeature::new("ccdp"),
@@ -264,6 +273,10 @@ pub fn to_llvm_features<'a>(sess: &Session, s: &'a str) -> LLVMFeature<'a> {
         // The unaligned-scalar-mem feature was renamed to fast-unaligned-access.
         ("riscv32" | "riscv64", "fast-unaligned-access") if get_version().0 <= 17 => {
             LLVMFeature::new("unaligned-scalar-mem")
+        }
+        // For LLVM 18, enable the evex512 target feature if a avx512 target feature is enabled.
+        ("x86", s) if get_version().0 >= 18 && s.starts_with("avx512") => {
+            LLVMFeature::with_dependency(s, TargetFeatureFoldStrength::EnableOnly("evex512"))
         }
         (_, s) => LLVMFeature::new(s),
     }
@@ -430,7 +443,7 @@ pub(crate) fn print(req: &PrintRequest, mut out: &mut dyn PrintBackendInfo, sess
                     &tm,
                     cpu_cstring.as_ptr(),
                     callback,
-                    &mut out as *mut &mut dyn PrintBackendInfo as *mut c_void,
+                    std::ptr::addr_of_mut!(out) as *mut c_void,
                 );
             }
         }
@@ -514,6 +527,10 @@ pub(crate) fn global_llvm_features(sess: &Session, diagnostics: bool) -> Vec<Str
             .filter(|v| !v.is_empty() && backend_feature_name(sess, v).is_some())
             .map(String::from),
     );
+
+    if wants_wasm_eh(sess) && sess.panic_strategy() == PanicStrategy::Unwind {
+        features.push("+exception-handling".into());
+    }
 
     // -Ctarget-features
     let supported_features = sess.target.supported_target_features();

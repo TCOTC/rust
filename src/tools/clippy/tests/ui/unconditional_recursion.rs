@@ -1,7 +1,11 @@
 //@no-rustfix
 
 #![warn(clippy::unconditional_recursion)]
-#![allow(clippy::partialeq_ne_impl, clippy::default_constructed_unit_structs)]
+#![allow(
+    clippy::partialeq_ne_impl,
+    clippy::default_constructed_unit_structs,
+    clippy::only_used_in_recursion
+)]
 
 enum Foo {
     A,
@@ -147,6 +151,7 @@ macro_rules! impl_partial_eq {
     ($ty:ident) => {
         impl PartialEq for $ty {
             fn eq(&self, other: &Self) -> bool {
+                //~^ ERROR: function cannot return without recursing
                 self == other
             }
         }
@@ -156,7 +161,6 @@ macro_rules! impl_partial_eq {
 struct S5;
 
 impl_partial_eq!(S5);
-//~^ ERROR: function cannot return without recursing
 
 struct S6 {
     field: String,
@@ -206,6 +210,7 @@ impl PartialEq for S8 {
 
 struct S9;
 
+#[allow(clippy::to_string_trait_impl)]
 impl std::string::ToString for S9 {
     fn to_string(&self) -> String {
         //~^ ERROR: function cannot return without recursing
@@ -215,6 +220,7 @@ impl std::string::ToString for S9 {
 
 struct S10;
 
+#[allow(clippy::to_string_trait_impl)]
 impl std::string::ToString for S10 {
     fn to_string(&self) -> String {
         //~^ ERROR: function cannot return without recursing
@@ -225,6 +231,7 @@ impl std::string::ToString for S10 {
 
 struct S11;
 
+#[allow(clippy::to_string_trait_impl)]
 impl std::string::ToString for S11 {
     fn to_string(&self) -> String {
         //~^ ERROR: function cannot return without recursing
@@ -285,6 +292,109 @@ impl PartialEq for S15<'_> {
         let mine = &self.field;
         let theirs = &other.field;
         mine.eq(theirs)
+    }
+}
+
+mod issue12154 {
+    struct MyBox<T>(T);
+
+    impl<T> std::ops::Deref for MyBox<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.0
+        }
+    }
+
+    impl<T: PartialEq> PartialEq for MyBox<T> {
+        fn eq(&self, other: &Self) -> bool {
+            (**self).eq(&**other)
+        }
+    }
+
+    // Not necessarily related to the issue but another FP from the http crate that was fixed with it:
+    // https://docs.rs/http/latest/src/http/header/name.rs.html#1424
+    // We used to simply peel refs from the LHS and RHS, so we couldn't differentiate
+    // between `PartialEq<T> for &T` and `PartialEq<&T> for T` impls.
+    #[derive(PartialEq)]
+    struct HeaderName;
+    impl<'a> PartialEq<&'a HeaderName> for HeaderName {
+        fn eq(&self, other: &&'a HeaderName) -> bool {
+            *self == **other
+        }
+    }
+
+    impl<'a> PartialEq<HeaderName> for &'a HeaderName {
+        fn eq(&self, other: &HeaderName) -> bool {
+            *other == *self
+        }
+    }
+
+    // Issue #12181 but also fixed by the same PR
+    struct Foo;
+
+    impl Foo {
+        fn as_str(&self) -> &str {
+            "Foo"
+        }
+    }
+
+    impl PartialEq for Foo {
+        fn eq(&self, other: &Self) -> bool {
+            self.as_str().eq(other.as_str())
+        }
+    }
+
+    impl<T> PartialEq<T> for Foo
+    where
+        for<'a> &'a str: PartialEq<T>,
+    {
+        fn eq(&self, other: &T) -> bool {
+            (&self.as_str()).eq(other)
+        }
+    }
+}
+
+// From::from -> Into::into -> From::from
+struct BadFromTy1<'a>(&'a ());
+struct BadIntoTy1<'b>(&'b ());
+impl<'a> From<BadFromTy1<'a>> for BadIntoTy1<'static> {
+    fn from(f: BadFromTy1<'a>) -> Self {
+        f.into()
+    }
+}
+
+// Using UFCS syntax
+struct BadFromTy2<'a>(&'a ());
+struct BadIntoTy2<'b>(&'b ());
+impl<'a> From<BadFromTy2<'a>> for BadIntoTy2<'static> {
+    fn from(f: BadFromTy2<'a>) -> Self {
+        Into::into(f)
+    }
+}
+
+// Different Into impl (<i16 as Into<i32>>), so no infinite recursion
+struct BadFromTy3;
+impl From<BadFromTy3> for i32 {
+    fn from(f: BadFromTy3) -> Self {
+        Into::into(1i16)
+    }
+}
+
+// A conditional return that ends the recursion
+struct BadFromTy4;
+impl From<BadFromTy4> for i32 {
+    fn from(f: BadFromTy4) -> Self {
+        if true {
+            return 42;
+        }
+        f.into()
+    }
+}
+
+// Types differ in refs, don't lint
+impl From<&BadFromTy4> for i32 {
+    fn from(f: &BadFromTy4) -> Self {
+        BadFromTy4.into()
     }
 }
 

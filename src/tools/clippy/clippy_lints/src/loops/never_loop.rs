@@ -137,7 +137,7 @@ fn stmt_to_expr<'tcx>(stmt: &Stmt<'tcx>) -> Option<(&'tcx Expr<'tcx>, Option<&'t
     match stmt.kind {
         StmtKind::Semi(e) | StmtKind::Expr(e) => Some((e, None)),
         // add the let...else expression (if present)
-        StmtKind::Local(local) => local.init.map(|init| (init, local.els)),
+        StmtKind::Let(local) => local.init.map(|init| (init, local.els)),
         StmtKind::Item(..) => None,
     }
 }
@@ -201,12 +201,12 @@ fn never_loop_expr<'tcx>(
                 })
             })
         },
-        ExprKind::Block(b, l) => {
-            if l.is_some() {
+        ExprKind::Block(b, _) => {
+            if b.targeted_by_break {
                 local_labels.push((b.hir_id, false));
             }
             let ret = never_loop_block(cx, b, local_labels, main_loop_id);
-            let jumped_to = l.is_some() && local_labels.pop().unwrap().1;
+            let jumped_to = b.targeted_by_break && local_labels.pop().unwrap().1;
             match ret {
                 NeverLoopResult::Diverging if jumped_to => NeverLoopResult::Normal,
                 _ => ret,
@@ -255,6 +255,7 @@ fn never_loop_expr<'tcx>(
             InlineAsmOperand::Const { .. } | InlineAsmOperand::SymFn { .. } | InlineAsmOperand::SymStatic { .. } => {
                 NeverLoopResult::Normal
             },
+            InlineAsmOperand::Label { block } => never_loop_block(cx, block, local_labels, main_loop_id),
         })),
         ExprKind::OffsetOf(_, _)
         | ExprKind::Yield(_, _)

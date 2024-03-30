@@ -13,7 +13,7 @@ use hir_def::{
         ArithOp, Array, BinaryOp, ClosureKind, Expr, ExprId, LabelId, Literal, Statement, UnaryOp,
     },
     lang_item::{LangItem, LangItemTarget},
-    path::{GenericArg, GenericArgs},
+    path::{GenericArg, GenericArgs, Path},
     BlockId, ConstParamId, FieldId, ItemContainerId, Lookup, TupleFieldId, TupleId,
 };
 use hir_expand::name::{name, Name};
@@ -23,6 +23,7 @@ use syntax::ast::RangeOp;
 use crate::{
     autoderef::{builtin_deref, deref_by_trait, Autoderef},
     consteval,
+    db::{InternedClosure, InternedCoroutine},
     infer::{
         coerce::{CoerceMany, CoercionCause},
         find_continuable,
@@ -253,13 +254,17 @@ impl InferenceContext<'_> {
                             .push(ret_ty.clone())
                             .build();
 
-                        let coroutine_id = self.db.intern_coroutine((self.owner, tgt_expr)).into();
+                        let coroutine_id = self
+                            .db
+                            .intern_coroutine(InternedCoroutine(self.owner, tgt_expr))
+                            .into();
                         let coroutine_ty = TyKind::Coroutine(coroutine_id, subst).intern(Interner);
 
                         (None, coroutine_ty, Some((resume_ty, yield_ty)))
                     }
                     ClosureKind::Closure | ClosureKind::Async => {
-                        let closure_id = self.db.intern_closure((self.owner, tgt_expr)).into();
+                        let closure_id =
+                            self.db.intern_closure(InternedClosure(self.owner, tgt_expr)).into();
                         let closure_ty = TyKind::Closure(
                             closure_id,
                             TyBuilder::subst_for_closure(self.db, self.owner, sig_ty.clone()),
@@ -307,15 +312,13 @@ impl InferenceContext<'_> {
             Expr::Call { callee, args, .. } => {
                 let callee_ty = self.infer_expr(*callee, &Expectation::none());
                 let mut derefs = Autoderef::new(&mut self.table, callee_ty.clone(), false);
-                let (res, derefed_callee) = 'b: {
-                    // manual loop to be able to access `derefs.table`
-                    while let Some((callee_deref_ty, _)) = derefs.next() {
-                        let res = derefs.table.callable_sig(&callee_deref_ty, args.len());
-                        if res.is_some() {
-                            break 'b (res, callee_deref_ty);
-                        }
+                let (res, derefed_callee) = loop {
+                    let Some((callee_deref_ty, _)) = derefs.next() else {
+                        break (None, callee_ty.clone());
+                    };
+                    if let Some(res) = derefs.table.callable_sig(&callee_deref_ty, args.len()) {
+                        break (Some(res), callee_deref_ty);
                     }
-                    (None, callee_ty.clone())
                 };
                 // if the function is unresolved, we use is_varargs=true to
                 // suppress the arg count diagnostic here
@@ -434,7 +437,17 @@ impl InferenceContext<'_> {
             }
             Expr::Path(p) => {
                 let g = self.resolver.update_to_inner_scope(self.db.upcast(), self.owner, tgt_expr);
-                let ty = self.infer_path(p, tgt_expr.into()).unwrap_or_else(|| self.err_ty());
+                let ty = match self.infer_path(p, tgt_expr.into()) {
+                    Some(ty) => ty,
+                    None => {
+                        if matches!(p, Path::Normal { mod_path, .. } if mod_path.is_ident()) {
+                            self.push_diagnostic(InferenceDiagnostic::UnresolvedIdent {
+                                expr: tgt_expr,
+                            });
+                        }
+                        self.err_ty()
+                    }
+                };
                 self.resolver.reset_to_guard(g);
                 ty
             }
@@ -497,6 +510,7 @@ impl InferenceContext<'_> {
                 self.result.standard_types.never.clone()
             }
             &Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
+            &Expr::Become { expr } => self.infer_expr_become(expr),
             Expr::Yield { expr } => {
                 if let Some((resume_ty, yield_ty)) = self.resume_yield_tys.clone() {
                     if let Some(expr) = expr {
@@ -641,7 +655,7 @@ impl InferenceContext<'_> {
                                 );
                             }
                         }
-                        if let Some(derefed) = builtin_deref(&mut self.table, &inner_ty, true) {
+                        if let Some(derefed) = builtin_deref(self.table.db, &inner_ty, true) {
                             self.resolve_ty_shallow(derefed)
                         } else {
                             deref_by_trait(&mut self.table, inner_ty)
@@ -758,7 +772,7 @@ impl InferenceContext<'_> {
                     let receiver_adjustments = method_resolution::resolve_indexing_op(
                         self.db,
                         self.table.trait_env.clone(),
-                        canonicalized.value,
+                        canonicalized,
                         index_trait,
                     );
                     let (self_ty, mut adj) = receiver_adjustments
@@ -1079,6 +1093,27 @@ impl InferenceContext<'_> {
         self.result.standard_types.never.clone()
     }
 
+    fn infer_expr_become(&mut self, expr: ExprId) -> Ty {
+        match &self.return_coercion {
+            Some(return_coercion) => {
+                let ret_ty = return_coercion.expected_ty();
+
+                let call_expr_ty =
+                    self.infer_expr_inner(expr, &Expectation::HasType(ret_ty.clone()));
+
+                // NB: this should *not* coerce.
+                //     tail calls don't support any coercions except lifetimes ones (like `&'static u8 -> &'a u8`).
+                self.unify(&call_expr_ty, &ret_ty);
+            }
+            None => {
+                // FIXME: diagnose `become` outside of functions
+                self.infer_expr_no_expect(expr);
+            }
+        }
+
+        self.result.standard_types.never.clone()
+    }
+
     fn infer_expr_box(&mut self, inner_expr: ExprId, expected: &Expectation) -> Ty {
         if let Some(box_id) = self.resolve_boxed_box() {
             let table = &mut self.table;
@@ -1362,6 +1397,7 @@ impl InferenceContext<'_> {
                                 );
                             }
                         }
+                        Statement::Item => (),
                     }
                 }
 
@@ -1521,7 +1557,7 @@ impl InferenceContext<'_> {
                 let canonicalized_receiver = self.canonicalize(receiver_ty.clone());
                 let resolved = method_resolution::lookup_method(
                     self.db,
-                    &canonicalized_receiver.value,
+                    &canonicalized_receiver,
                     self.table.trait_env.clone(),
                     self.get_traits_in_scope().as_ref().left_or_else(|&it| it),
                     VisibleFromModule::Filter(self.resolver.module()),
@@ -1570,7 +1606,7 @@ impl InferenceContext<'_> {
 
         let resolved = method_resolution::lookup_method(
             self.db,
-            &canonicalized_receiver.value,
+            &canonicalized_receiver,
             self.table.trait_env.clone(),
             self.get_traits_in_scope().as_ref().left_or_else(|&it| it),
             VisibleFromModule::Filter(self.resolver.module()),
@@ -1603,7 +1639,7 @@ impl InferenceContext<'_> {
                 };
 
                 let assoc_func_with_same_name = method_resolution::iterate_method_candidates(
-                    &canonicalized_receiver.value,
+                    &canonicalized_receiver,
                     self.db,
                     self.table.trait_env.clone(),
                     self.get_traits_in_scope().as_ref().left_or_else(|&it| it),

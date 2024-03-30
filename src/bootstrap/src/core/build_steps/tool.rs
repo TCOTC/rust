@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::core::build_steps::compile;
 use crate::core::build_steps::toolstate::ToolState;
+use crate::core::builder;
 use crate::core::builder::{Builder, Cargo as CargoCommand, RunConfig, ShouldRun, Step};
 use crate::core::config::TargetSelection;
 use crate::utils::channel::GitInfo;
@@ -14,7 +15,7 @@ use crate::Compiler;
 use crate::Mode;
 use crate::{gha, Kind};
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SourceType {
     InTree,
     Submodule,
@@ -126,7 +127,7 @@ impl Step for ToolBuild {
             }
             let cargo_out = builder.cargo_out(compiler, self.mode, target).join(exe(tool, target));
             let bin = builder.tools_dir(compiler).join(exe(tool, target));
-            builder.copy(&cargo_out, &bin);
+            builder.copy_link(&cargo_out, &bin);
             bin
         }
     }
@@ -142,7 +143,8 @@ pub fn prepare_tool_cargo(
     source_type: SourceType,
     extra_features: &[String],
 ) -> CargoCommand {
-    let mut cargo = builder.cargo(compiler, mode, source_type, target, command);
+    let mut cargo = builder::Cargo::new(builder, compiler, mode, source_type, target, command);
+
     let dir = builder.src.join(path);
     cargo.arg("--manifest-path").arg(dir.join("Cargo.toml"));
 
@@ -218,7 +220,7 @@ macro_rules! bootstrap_tool {
         $(,allow_features = $allow_features:expr)?
         ;
     )+) => {
-        #[derive(Copy, PartialEq, Eq, Clone)]
+        #[derive(PartialEq, Eq, Clone)]
         pub enum Tool {
             $(
                 $name,
@@ -239,7 +241,7 @@ macro_rules! bootstrap_tool {
         }
 
         $(
-            #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+            #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         pub struct $name {
             pub compiler: Compiler,
             pub target: TargetSelection,
@@ -313,7 +315,7 @@ bootstrap_tool!(
     CoverageDump, "src/tools/coverage-dump", "coverage-dump";
 );
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct ErrorIndex {
     pub compiler: Compiler,
 }
@@ -367,7 +369,7 @@ impl Step for ErrorIndex {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RemoteTestServer {
     pub compiler: Compiler,
     pub target: TargetSelection,
@@ -401,7 +403,7 @@ impl Step for RemoteTestServer {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct Rustdoc {
     /// This should only ever be 0 or 2.
     /// We sometimes want to reference the "bootstrap" rustdoc, which is why this option is here.
@@ -505,7 +507,7 @@ impl Step for Rustdoc {
             t!(fs::create_dir_all(&bindir));
             let bin_rustdoc = bindir.join(exe("rustdoc", target_compiler.host));
             let _ = fs::remove_file(&bin_rustdoc);
-            builder.copy(&tool_rustdoc, &bin_rustdoc);
+            builder.copy_link(&tool_rustdoc, &bin_rustdoc);
             bin_rustdoc
         } else {
             tool_rustdoc
@@ -513,7 +515,7 @@ impl Step for Rustdoc {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Cargo {
     pub compiler: Compiler,
     pub target: TargetSelection,
@@ -558,7 +560,7 @@ impl Step for Cargo {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LldWrapper {
     pub compiler: Compiler,
     pub target: TargetSelection,
@@ -587,7 +589,7 @@ impl Step for LldWrapper {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RustAnalyzer {
     pub compiler: Compiler,
     pub target: TargetSelection,
@@ -635,7 +637,7 @@ impl Step for RustAnalyzer {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RustAnalyzerProcMacroSrv {
     pub compiler: Compiler,
     pub target: TargetSelection,
@@ -684,9 +686,82 @@ impl Step for RustAnalyzerProcMacroSrv {
         // so that r-a can use it.
         let libexec_path = builder.sysroot(self.compiler).join("libexec");
         t!(fs::create_dir_all(&libexec_path));
-        builder.copy(&path, &libexec_path.join("rust-analyzer-proc-macro-srv"));
+        builder.copy_link(&path, &libexec_path.join("rust-analyzer-proc-macro-srv"));
 
         Some(path)
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct LlvmBitcodeLinker {
+    pub compiler: Compiler,
+    pub target: TargetSelection,
+    pub extra_features: Vec<String>,
+}
+
+impl Step for LlvmBitcodeLinker {
+    type Output = PathBuf;
+    const DEFAULT: bool = true;
+    const ONLY_HOSTS: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        let builder = run.builder;
+        run.path("src/tools/llvm-bitcode-linker").default_condition(
+            builder.config.extended
+                && builder
+                    .config
+                    .tools
+                    .as_ref()
+                    .map_or(builder.build.unstable_features(), |tools| {
+                        tools.iter().any(|tool| tool == "llvm-bitcode-linker")
+                    }),
+        )
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(LlvmBitcodeLinker {
+            compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.build),
+            extra_features: Vec::new(),
+            target: run.target,
+        });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> PathBuf {
+        let bin_name = "llvm-bitcode-linker";
+
+        builder.ensure(compile::Std::new(self.compiler, self.compiler.host));
+        builder.ensure(compile::Rustc::new(self.compiler, self.target));
+
+        let mut cargo = prepare_tool_cargo(
+            builder,
+            self.compiler,
+            Mode::ToolRustc,
+            self.target,
+            "build",
+            "src/tools/llvm-bitcode-linker",
+            SourceType::InTree,
+            &self.extra_features,
+        );
+
+        if builder.config.rustc_parallel {
+            cargo.rustflag("--cfg=parallel_compiler");
+        }
+
+        builder.run(&mut cargo.into());
+
+        let tool_out = builder
+            .cargo_out(self.compiler, Mode::ToolRustc, self.target)
+            .join(exe(bin_name, self.compiler.host));
+
+        if self.compiler.stage > 0 {
+            let bindir = builder.sysroot(self.compiler).join("bin");
+            t!(fs::create_dir_all(&bindir));
+            let bin_destination = bindir.join(exe(bin_name, self.compiler.host));
+            builder.copy_link(&tool_out, &bin_destination);
+            bin_destination
+        } else {
+            tool_out
+        }
     }
 }
 
@@ -763,7 +838,7 @@ macro_rules! tool_extended {
                     $(for add_bin in $add_bins_to_sysroot {
                         let bin_source = tools_out.join(exe(add_bin, $sel.target));
                         let bin_destination = bindir.join(exe(add_bin, $sel.compiler.host));
-                        $builder.copy(&bin_source, &bin_destination);
+                        $builder.copy_link(&bin_source, &bin_destination);
                     })?
 
                     let tool = bindir.join(exe($tool_name, $sel.compiler.host));
@@ -817,7 +892,7 @@ impl<'a> Builder<'a> {
         if compiler.host.is_msvc() {
             let curpaths = env::var_os("PATH").unwrap_or_default();
             let curpaths = env::split_paths(&curpaths).collect::<Vec<_>>();
-            for &(ref k, ref v) in self.cc.borrow()[&compiler.host].env() {
+            for (k, v) in self.cc.borrow()[&compiler.host].env() {
                 if k != "PATH" {
                     continue;
                 }

@@ -19,7 +19,7 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagno
         for source in d.local.sources(ctx.sema.db) {
             let Some(ast) = source.name() else { continue };
             // FIXME: macros
-            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_string());
+            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_owned());
         }
         let edit = edit_builder.finish();
         Some(vec![fix(
@@ -86,7 +86,7 @@ pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_diagnostics, check_fix};
+    use crate::tests::{check_diagnostics, check_diagnostics_with_disabled, check_fix};
 
     #[test]
     fn unused_mut_simple() {
@@ -413,7 +413,7 @@ fn main() {
 fn main() {
     return;
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
@@ -423,12 +423,12 @@ fn main() {
 fn main() {
     loop {}
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
         );
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 enum X {}
 fn g() -> X {
@@ -444,12 +444,13 @@ fn main(b: bool) {
         g();
     }
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
+            &["remove-unnecessary-else"],
         );
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 fn main(b: bool) {
     if b {
@@ -458,10 +459,11 @@ fn main(b: bool) {
         return;
     }
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
+            &["remove-unnecessary-else"],
         );
     }
 
@@ -787,7 +789,7 @@ fn f() {
                //^^ 💡 error: cannot mutate immutable variable `x`
     _ = (x, y);
     let x = Foo;
-      //^ warn: unused variable
+      //^ 💡 warn: unused variable
     let x = Foo;
     let y: &mut (i32, u8) = &mut x;
                           //^^^^^^ 💡 error: cannot mutate immutable variable `x`
@@ -815,7 +817,7 @@ fn f() {
 //- minicore: option
 fn f(_: i32) {}
 fn main() {
-    let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7));
+    let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7)) else { return };
              //^^^^^ 💡 warn: variable does not need to be mutable
     f(x);
 }

@@ -5,7 +5,7 @@ use project_model::{CargoConfig, RustLibSource};
 use rustc_hash::FxHashSet;
 
 use hir::{db::HirDatabase, Crate, HirFileIdExt, Module};
-use ide::{AssistResolveStrategy, DiagnosticsConfig, Severity};
+use ide::{AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, Severity};
 use ide_db::base_db::SourceDatabaseExt;
 use load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 
@@ -26,8 +26,9 @@ impl flags::Diagnostics {
             with_proc_macro_server,
             prefill_caches: false,
         };
-        let (host, _vfs, _proc_macro) =
+        let (db, _vfs, _proc_macro) =
             load_workspace_at(&self.path, &cargo_config, &load_cargo_config, &|_| {})?;
+        let host = AnalysisHost::with_database(db);
         let db = host.raw_database();
         let analysis = host.analysis();
 
@@ -45,7 +46,7 @@ impl flags::Diagnostics {
             let file_id = module.definition_source_file_id(db).original_file(db);
             if !visited_files.contains(&file_id) {
                 let crate_name =
-                    module.krate().display_name(db).as_deref().unwrap_or("unknown").to_string();
+                    module.krate().display_name(db).as_deref().unwrap_or("unknown").to_owned();
                 println!("processing crate: {crate_name}, module: {}", _vfs.file_path(file_id));
                 for diagnostic in analysis
                     .diagnostics(

@@ -13,8 +13,10 @@ const LICENSES: &[&str] = &[
     "0BSD OR MIT OR Apache-2.0",                           // adler license
     "0BSD",
     "Apache-2.0 / MIT",
+    "Apache-2.0 OR ISC OR MIT",
     "Apache-2.0 OR MIT",
     "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT", // wasi license
+    "Apache-2.0",
     "Apache-2.0/MIT",
     "BSD-2-Clause OR Apache-2.0 OR MIT",                   // zerocopy
     "ISC",
@@ -90,6 +92,8 @@ const EXCEPTIONS: ExceptionList = &[
     ("ryu", "Apache-2.0 OR BSL-1.0"), // BSL is not acceptble, but we use it under Apache-2.0                       // cargo/... (because of serde)
     ("self_cell", "Apache-2.0"),                             // rustc (fluent translations)
     ("snap", "BSD-3-Clause"),                                // rustc
+    ("wasm-encoder", "Apache-2.0 WITH LLVM-exception"),      // rustc
+    ("wasmparser", "Apache-2.0 WITH LLVM-exception"),        // rustc
     // tidy-alphabetical-end
 ];
 
@@ -204,8 +208,8 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "byteorder", // via ruzstd in object in thorin-dwp
     "cc",
     "cfg-if",
+    "cfg_aliases",
     "compiler_builtins",
-    "convert_case", // dependency of derive_more
     "cpufeatures",
     "crc32fast",
     "crossbeam-channel",
@@ -213,10 +217,12 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "crossbeam-epoch",
     "crossbeam-utils",
     "crypto-common",
+    "ctrlc",
     "darling",
     "darling_core",
     "darling_macro",
     "datafrog",
+    "deranged",
     "derivative",
     "derive_more",
     "derive_setters",
@@ -258,12 +264,12 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "indexmap",
     "intl-memoizer",
     "intl_pluralrules",
-    "is-terminal",
     "itertools",
     "itoa",
     "jemalloc-sys",
     "jobserver",
     "lazy_static",
+    "leb128",
     "libc",
     "libloading",
     "linux-raw-sys",
@@ -277,7 +283,9 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "memmap2",
     "memoffset",
     "miniz_oxide",
+    "nix",
     "nu-ansi-term",
+    "num-conv",
     "num_cpus",
     "object",
     "odht",
@@ -290,6 +298,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "pin-project-lite",
     "polonius-engine",
     "portable-atomic", // dependency for platforms doesn't support `AtomicU64` in std
+    "powerfmt",
     "ppv-lite86",
     "proc-macro-hack",
     "proc-macro2",
@@ -375,11 +384,14 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "valuable",
     "version_check",
     "wasi",
+    "wasm-encoder",
+    "wasmparser",
     "winapi",
     "winapi-i686-pc-windows-gnu",
     "winapi-util",
     "winapi-x86_64-pc-windows-gnu",
     "windows",
+    "windows-core",
     "windows-sys",
     "windows-targets",
     "windows_aarch64_gnullvm",
@@ -559,6 +571,21 @@ fn check_runtime_license_exceptions(
             if pkg.name == "fortanix-sgx-abi" && pkg.license.as_deref() == Some("MPL-2.0") {
                 continue;
             }
+
+            // This exception is due to the fact that the feature set of the
+            // `object` crate is different between rustc and libstd. In the
+            // standard library only a conservative set of features are enabled
+            // which notably does not include the `wasm` feature which pulls in
+            // this dependency. In the compiler, however, the `wasm` feature is
+            // enabled. This exception is intended to be here so long as the
+            // `EXCEPTIONS` above contains `wasmparser`, but once that goes away
+            // this can be removed.
+            if pkg.name == "wasmparser"
+                && pkg.license.as_deref() == Some("Apache-2.0 WITH LLVM-exception")
+            {
+                continue;
+            }
+
             tidy_error!(bad, "invalid license `{}` in `{}`", license, pkg.id);
         }
     }

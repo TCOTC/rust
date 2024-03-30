@@ -1,13 +1,12 @@
-use super::{AllocId, AllocRange, Pointer, Scalar};
+use super::{AllocId, AllocRange, ConstAllocation, Pointer, Scalar};
 
 use crate::error;
 use crate::mir::{ConstAlloc, ConstValue};
 use crate::ty::{layout, tls, Ty, TyCtxt, ValTree};
 
+use rustc_ast_ir::Mutability;
 use rustc_data_structures::sync::Lock;
-use rustc_errors::{
-    DiagnosticArgName, DiagnosticArgValue, DiagnosticMessage, ErrorGuaranteed, IntoDiagnosticArg,
-};
+use rustc_errors::{DiagArgName, DiagArgValue, DiagMessage, ErrorGuaranteed, IntoDiagArg};
 use rustc_macros::HashStable;
 use rustc_session::CtfeBacktrace;
 use rustc_span::{def_id::DefId, Span, DUMMY_SP};
@@ -83,6 +82,7 @@ impl Into<ErrorGuaranteed> for ReportedErrorInfo {
 TrivialTypeTraversalImpls! { ErrorHandled }
 
 pub type EvalToAllocationRawResult<'tcx> = Result<ConstAlloc<'tcx>, ErrorHandled>;
+pub type EvalStaticInitializerRawResult<'tcx> = Result<ConstAllocation<'tcx>, ErrorHandled>;
 pub type EvalToConstValueResult<'tcx> = Result<ConstValue<'tcx>, ErrorHandled>;
 /// `Ok(None)` indicates the constant was fine, but the valtree couldn't be constructed.
 /// This is needed in `thir::pattern::lower_inline_const`.
@@ -234,9 +234,9 @@ pub enum InvalidMetaKind {
     TooBig,
 }
 
-impl IntoDiagnosticArg for InvalidMetaKind {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        DiagnosticArgValue::Str(Cow::Borrowed(match self {
+impl IntoDiagArg for InvalidMetaKind {
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(match self {
             InvalidMetaKind::SliceTooBig => "slice_too_big",
             InvalidMetaKind::TooBig => "too_big",
         }))
@@ -266,18 +266,18 @@ pub struct Misalignment {
     pub required: Align,
 }
 
-macro_rules! impl_into_diagnostic_arg_through_debug {
+macro_rules! impl_into_diag_arg_through_debug {
     ($($ty:ty),*$(,)?) => {$(
-        impl IntoDiagnosticArg for $ty {
-            fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-                DiagnosticArgValue::Str(Cow::Owned(format!("{self:?}")))
+        impl IntoDiagArg for $ty {
+            fn into_diag_arg(self) -> DiagArgValue {
+                DiagArgValue::Str(Cow::Owned(format!("{self:?}")))
             }
         }
     )*}
 }
 
 // These types have nice `Debug` output so we can just use them in diagnostics.
-impl_into_diagnostic_arg_through_debug! {
+impl_into_diag_arg_through_debug! {
     AllocId,
     Pointer<AllocId>,
     AllocRange,
@@ -356,6 +356,8 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     UninhabitedEnumVariantWritten(VariantIdx),
     /// An uninhabited enum variant is projected.
     UninhabitedEnumVariantRead(VariantIdx),
+    /// Trying to set discriminant to the niched variant, but the value does not match.
+    InvalidNichedEnumVariantWritten { enum_ty: Ty<'tcx> },
     /// ABI-incompatible argument types.
     AbiMismatchArgument { caller_ty: Ty<'tcx>, callee_ty: Ty<'tcx> },
     /// ABI-incompatible return types.
@@ -364,15 +366,15 @@ pub enum UndefinedBehaviorInfo<'tcx> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum PointerKind {
-    Ref,
+    Ref(Mutability),
     Box,
 }
 
-impl IntoDiagnosticArg for PointerKind {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
-        DiagnosticArgValue::Str(
+impl IntoDiagArg for PointerKind {
+    fn into_diag_arg(self) -> DiagArgValue {
+        DiagArgValue::Str(
             match self {
-                Self::Ref => "ref",
+                Self::Ref(_) => "ref",
                 Self::Box => "box",
             }
             .into(),
@@ -405,7 +407,7 @@ impl From<PointerKind> for ExpectedKind {
     fn from(x: PointerKind) -> ExpectedKind {
         match x {
             PointerKind::Box => ExpectedKind::Box,
-            PointerKind::Ref => ExpectedKind::Reference,
+            PointerKind::Ref(_) => ExpectedKind::Reference,
         }
     }
 }
@@ -416,7 +418,8 @@ pub enum ValidationErrorKind<'tcx> {
     PartialPointer,
     PtrToUninhabited { ptr_kind: PointerKind, ty: Ty<'tcx> },
     PtrToStatic { ptr_kind: PointerKind },
-    MutableRefInConst,
+    ConstRefToMutable,
+    ConstRefToExtern,
     MutableRefToImmutable,
     UnsafeCellInImmutable,
     NullFnPtr,
@@ -466,7 +469,7 @@ pub enum UnsupportedOpInfo {
     /// Accessing thread local statics
     ThreadLocalStatic(DefId),
     /// Accessing an unsupported extern static.
-    ReadExternStatic(DefId),
+    ExternStatic(DefId),
 }
 
 /// Error information for when the program exhausted the resources granted to it
@@ -479,15 +482,17 @@ pub enum ResourceExhaustionInfo {
     MemoryExhausted,
     /// The address space (of the target) is full.
     AddressSpaceFull,
+    /// The compiler got an interrupt signal (a user ran out of patience).
+    Interrupted,
 }
 
 /// A trait for machine-specific errors (or other "machine stop" conditions).
 pub trait MachineStopType: Any + fmt::Debug + Send {
     /// The diagnostic message for this error
-    fn diagnostic_message(&self) -> DiagnosticMessage;
+    fn diagnostic_message(&self) -> DiagMessage;
     /// Add diagnostic arguments by passing name and value pairs to `adder`, which are passed to
     /// fluent for formatting the translated diagnostic message.
-    fn add_args(self: Box<Self>, adder: &mut dyn FnMut(DiagnosticArgName, DiagnosticArgValue));
+    fn add_args(self: Box<Self>, adder: &mut dyn FnMut(DiagArgName, DiagArgValue));
 }
 
 impl dyn MachineStopType {

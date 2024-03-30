@@ -1,5 +1,6 @@
 //! Reading of the rustc metadata for rlibs and dylibs
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -7,7 +8,7 @@ use std::path::Path;
 use object::write::{self, StandardSegment, Symbol, SymbolSection};
 use object::{
     elf, pe, xcoff, Architecture, BinaryFormat, Endianness, FileFlags, Object, ObjectSection,
-    ObjectSymbol, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+    ObjectSymbol, SectionFlags, SectionKind, SubArchitecture, SymbolFlags, SymbolKind, SymbolScope,
 };
 
 use rustc_data_structures::memmap::Mmap;
@@ -181,37 +182,40 @@ pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static
         Endian::Little => Endianness::Little,
         Endian::Big => Endianness::Big,
     };
-    let architecture = match &sess.target.arch[..] {
-        "arm" => Architecture::Arm,
-        "aarch64" => {
+    let (architecture, sub_architecture) = match &sess.target.arch[..] {
+        "arm" => (Architecture::Arm, None),
+        "aarch64" => (
             if sess.target.pointer_width == 32 {
                 Architecture::Aarch64_Ilp32
             } else {
                 Architecture::Aarch64
-            }
-        }
-        "x86" => Architecture::I386,
-        "s390x" => Architecture::S390x,
-        "mips" | "mips32r6" => Architecture::Mips,
-        "mips64" | "mips64r6" => Architecture::Mips64,
-        "x86_64" => {
+            },
+            None,
+        ),
+        "x86" => (Architecture::I386, None),
+        "s390x" => (Architecture::S390x, None),
+        "mips" | "mips32r6" => (Architecture::Mips, None),
+        "mips64" | "mips64r6" => (Architecture::Mips64, None),
+        "x86_64" => (
             if sess.target.pointer_width == 32 {
                 Architecture::X86_64_X32
             } else {
                 Architecture::X86_64
-            }
-        }
-        "powerpc" => Architecture::PowerPc,
-        "powerpc64" => Architecture::PowerPc64,
-        "riscv32" => Architecture::Riscv32,
-        "riscv64" => Architecture::Riscv64,
-        "sparc64" => Architecture::Sparc64,
-        "avr" => Architecture::Avr,
-        "msp430" => Architecture::Msp430,
-        "hexagon" => Architecture::Hexagon,
-        "bpf" => Architecture::Bpf,
-        "loongarch64" => Architecture::LoongArch64,
-        "csky" => Architecture::Csky,
+            },
+            None,
+        ),
+        "powerpc" => (Architecture::PowerPc, None),
+        "powerpc64" => (Architecture::PowerPc64, None),
+        "riscv32" => (Architecture::Riscv32, None),
+        "riscv64" => (Architecture::Riscv64, None),
+        "sparc64" => (Architecture::Sparc64, None),
+        "avr" => (Architecture::Avr, None),
+        "msp430" => (Architecture::Msp430, None),
+        "hexagon" => (Architecture::Hexagon, None),
+        "bpf" => (Architecture::Bpf, None),
+        "loongarch64" => (Architecture::LoongArch64, None),
+        "csky" => (Architecture::Csky, None),
+        "arm64ec" => (Architecture::Aarch64, Some(SubArchitecture::Arm64EC)),
         // Unsupported architecture.
         _ => return None,
     };
@@ -226,6 +230,7 @@ pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static
     };
 
     let mut file = write::Object::new(binary_format, architecture, endianness);
+    file.set_sub_architecture(sub_architecture);
     if sess.target.is_like_osx {
         if macho_is_arm64e(&sess.target) {
             file.set_macho_cpu_subtype(object::macho::CPU_SUBTYPE_ARM64E);
@@ -334,7 +339,7 @@ pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static
                 "ilp32s" | "lp64s" => e_flags |= elf::EF_LARCH_ABI_SOFT_FLOAT,
                 "ilp32f" | "lp64f" => e_flags |= elf::EF_LARCH_ABI_SINGLE_FLOAT,
                 "ilp32d" | "lp64d" => e_flags |= elf::EF_LARCH_ABI_DOUBLE_FLOAT,
-                _ => bug!("unknown RISC-V ABI name"),
+                _ => bug!("unknown LoongArch ABI name"),
             }
 
             e_flags
@@ -420,10 +425,9 @@ pub enum MetadataPosition {
 ///   it's not in an allowlist of otherwise well known dwarf section names to
 ///   go into the final artifact.
 ///
-/// * WebAssembly - we actually don't have any container format for this
-///   target. WebAssembly doesn't support the `dylib` crate type anyway so
-///   there's no need for us to support this at this time. Consequently the
-///   metadata bytes are simply stored as-is into an rlib.
+/// * WebAssembly - this uses wasm files themselves as the object file format
+///   so an empty file with no linking metadata but a single custom section is
+///   created holding our metadata.
 ///
 /// * COFF - Windows-like targets create an object with a section that has
 ///   the `IMAGE_SCN_LNK_REMOVE` flag set which ensures that if the linker
@@ -434,26 +438,20 @@ pub enum MetadataPosition {
 ///   automatically removed from the final output.
 pub fn create_wrapper_file(
     sess: &Session,
-    section_name: Vec<u8>,
+    section_name: String,
     data: &[u8],
 ) -> (Vec<u8>, MetadataPosition) {
     let Some(mut file) = create_object_file(sess) else {
-        // This is used to handle all "other" targets. This includes targets
-        // in two categories:
-        //
-        // * Some targets don't have support in the `object` crate just yet
-        //   to write an object file. These targets are likely to get filled
-        //   out over time.
-        //
-        // * Targets like WebAssembly don't support dylibs, so the purpose
-        //   of putting metadata in object files, to support linking rlibs
-        //   into dylibs, is moot.
-        //
-        // In both of these cases it means that linking into dylibs will
-        // not be supported by rustc. This doesn't matter for targets like
-        // WebAssembly and for targets not supported by the `object` crate
-        // yet it means that work will need to be done in the `object` crate
-        // to add a case above.
+        if sess.target.is_like_wasm {
+            return (
+                create_metadata_file_for_wasm(sess, data, &section_name),
+                MetadataPosition::First,
+            );
+        }
+
+        // Targets using this branch don't have support implemented here yet or
+        // they're not yet implemented in the `object` crate and will likely
+        // fill out this module over time.
         return (data.to_vec(), MetadataPosition::Last);
     };
     let section = if file.format() == BinaryFormat::Xcoff {
@@ -461,7 +459,7 @@ pub fn create_wrapper_file(
     } else {
         file.add_section(
             file.segment_name(StandardSegment::Debug).to_vec(),
-            section_name,
+            section_name.into_bytes(),
             SectionKind::Debug,
         )
     };
@@ -532,6 +530,9 @@ pub fn create_compressed_metadata_file(
     packed_metadata.extend(metadata.raw_data());
 
     let Some(mut file) = create_object_file(sess) else {
+        if sess.target.is_like_wasm {
+            return create_metadata_file_for_wasm(sess, &packed_metadata, ".rustc");
+        }
         return packed_metadata.to_vec();
     };
     if file.format() == BinaryFormat::Xcoff {
@@ -623,4 +624,48 @@ pub fn create_compressed_metadata_file_for_xcoff(
     });
     file.append_section_data(section, data, 1);
     file.write().unwrap()
+}
+
+/// Creates a simple WebAssembly object file, which is itself a wasm module,
+/// that contains a custom section of the name `section_name` with contents
+/// `data`.
+///
+/// NB: the `object` crate does not yet have support for writing the wasm
+/// object file format. In lieu of that the `wasm-encoder` crate is used to
+/// build a wasm file by hand.
+///
+/// The wasm object file format is defined at
+/// <https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md>
+/// and mainly consists of a `linking` custom section. In this case the custom
+/// section there is empty except for a version marker indicating what format
+/// it's in.
+///
+/// The main purpose of this is to contain a custom section with `section_name`,
+/// which is then appended after `linking`.
+///
+/// As a further detail the object needs to have a 64-bit memory if `wasm64` is
+/// the target or otherwise it's interpreted as a 32-bit object which is
+/// incompatible with 64-bit ones.
+pub fn create_metadata_file_for_wasm(sess: &Session, data: &[u8], section_name: &str) -> Vec<u8> {
+    assert!(sess.target.is_like_wasm);
+    let mut module = wasm_encoder::Module::new();
+    let mut imports = wasm_encoder::ImportSection::new();
+
+    if sess.target.pointer_width == 64 {
+        imports.import(
+            "env",
+            "__linear_memory",
+            wasm_encoder::MemoryType { minimum: 0, maximum: None, memory64: true, shared: false },
+        );
+    }
+
+    if imports.len() > 0 {
+        module.section(&imports);
+    }
+    module.section(&wasm_encoder::CustomSection {
+        name: "linking".into(),
+        data: Cow::Borrowed(&[2]),
+    });
+    module.section(&wasm_encoder::CustomSection { name: section_name.into(), data: data.into() });
+    module.finish()
 }

@@ -29,11 +29,12 @@
 //! item id (`item_id`) in case of impl trait or path resolution id (`path_id`) otherwise.
 //!
 //! Since we do not have a proper way to obtain function type information by path resolution
-//! in AST, we mark each function parameter type as `InferDelegation` and inherit it in `AstConv`.
+//! in AST, we mark each function parameter type as `InferDelegation` and inherit it during
+//! HIR ty lowering.
 //!
 //! Similarly generics, predicates and header are set to the "default" values.
 //! In case of discrepancy with callee function the `NotSupportedDelegation` error will
-//! also be emitted in `AstConv`.
+//! also be emitted during HIR ty lowering.
 
 use crate::{ImplTraitPosition, ResolverAstLoweringExt};
 
@@ -103,12 +104,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
         span: Span,
     ) -> Result<DefId, ErrorGuaranteed> {
         let sig_id = if self.is_in_trait_impl { item_id } else { path_id };
-        let sig_id = self
-            .resolver
-            .get_partial_res(sig_id)
-            .map(|r| r.expect_full_res().opt_def_id())
-            .unwrap_or(None);
-
+        let sig_id =
+            self.resolver.get_partial_res(sig_id).and_then(|r| r.expect_full_res().opt_def_id());
         sig_id.ok_or_else(|| {
             self.tcx
                 .dcx()
@@ -133,12 +130,12 @@ impl<'hir> LoweringContext<'_, 'hir> {
     ) -> &'hir hir::FnDecl<'hir> {
         let args_count = if let Some(local_sig_id) = sig_id.as_local() {
             // Map may be filled incorrectly due to recursive delegation.
-            // Error will be emmited later in astconv.
+            // Error will be emitted later during HIR ty lowering.
             self.resolver.fn_parameter_counts.get(&local_sig_id).cloned().unwrap_or_default()
         } else {
             self.tcx.fn_arg_names(sig_id).len()
         };
-        let inputs = self.arena.alloc_from_iter((0..args_count).into_iter().map(|arg| hir::Ty {
+        let inputs = self.arena.alloc_from_iter((0..args_count).map(|arg| hir::Ty {
             hir_id: self.next_id(),
             kind: hir::TyKind::InferDelegation(sig_id, hir::InferDelegationKind::Input(arg)),
             span: self.lower_span(param_span),

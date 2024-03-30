@@ -420,7 +420,7 @@ impl<'a> Parser<'a> {
                         type_err.cancel();
 
                         let body_sp = pred_lo.to(snapshot.prev_token.span);
-                        let map = self.sess.source_map();
+                        let map = self.psess.source_map();
 
                         self.dcx().emit_err(WhereClauseBeforeTupleStructBody {
                             span: where_sp,
@@ -481,7 +481,7 @@ impl<'a> Parser<'a> {
             }))
         } else {
             self.maybe_recover_bounds_doubled_colon(&ty)?;
-            self.unexpected()
+            self.unexpected_any()
         }
     }
 

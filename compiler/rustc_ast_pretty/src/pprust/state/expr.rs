@@ -1,6 +1,6 @@
 use crate::pp::Breaks::Inconsistent;
 use crate::pprust::state::{AnnNode, PrintState, State, INDENT_UNIT};
-use ast::ForLoopKind;
+use ast::{ForLoopKind, MatchKind};
 use itertools::{Itertools, Position};
 use rustc_ast::ptr::P;
 use rustc_ast::token;
@@ -75,7 +75,7 @@ pub(crate) struct FixupContext {
 }
 
 /// The default amount of fixing is minimal fixing. Fixups should be turned on
-/// in a targetted fashion where needed.
+/// in a targeted fashion where needed.
 impl Default for FixupContext {
     fn default() -> Self {
         FixupContext {
@@ -589,12 +589,22 @@ impl<'a> State<'a> {
                 self.word_nbsp("loop");
                 self.print_block_with_attrs(blk, attrs);
             }
-            ast::ExprKind::Match(expr, arms) => {
+            ast::ExprKind::Match(expr, arms, match_kind) => {
                 self.cbox(0);
                 self.ibox(0);
-                self.word_nbsp("match");
-                self.print_expr_as_cond(expr);
-                self.space();
+
+                match match_kind {
+                    MatchKind::Prefix => {
+                        self.word_nbsp("match");
+                        self.print_expr_as_cond(expr);
+                        self.space();
+                    }
+                    MatchKind::Postfix => {
+                        self.print_expr_as_cond(expr);
+                        self.word_nbsp(".match");
+                    }
+                }
+
                 self.bopen();
                 self.print_inner_attributes_no_trailing_hardbreak(attrs);
                 for arm in arms {
@@ -893,10 +903,15 @@ impl<'a> State<'a> {
                 self.word_nbsp("try");
                 self.print_block_with_attrs(blk, attrs)
             }
-            ast::ExprKind::Err => {
+            ast::ExprKind::Err(_) => {
                 self.popen();
                 self.word("/*ERROR*/");
                 self.pclose()
+            }
+            ast::ExprKind::Dummy => {
+                self.popen();
+                self.word("/*DUMMY*/");
+                self.pclose();
             }
         }
 

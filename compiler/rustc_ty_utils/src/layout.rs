@@ -10,6 +10,7 @@ use rustc_middle::ty::layout::{
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, AdtDef, EarlyBinder, GenericArgsRef, Ty, TyCtxt, TypeVisitableExt};
 use rustc_session::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
+use rustc_span::sym;
 use rustc_span::symbol::Symbol;
 use rustc_target::abi::*;
 
@@ -90,8 +91,7 @@ fn univariant_uninterned<'tcx>(
     let dl = cx.data_layout();
     let pack = repr.pack;
     if pack.is_some() && repr.align.is_some() {
-        cx.tcx.dcx().delayed_bug("struct cannot be packed and aligned");
-        return Err(cx.tcx.arena.alloc(LayoutError::Unknown(ty)));
+        cx.tcx.dcx().bug("struct cannot be packed and aligned");
     }
 
     cx.univariant(dl, fields, repr, kind).ok_or_else(|| error(cx, LayoutError::SizeOverflow(ty)))
@@ -142,8 +142,10 @@ fn layout_of_uncached<'tcx>(
         ty::Int(ity) => scalar(Int(Integer::from_int_ty(dl, ity), true)),
         ty::Uint(ity) => scalar(Int(Integer::from_uint_ty(dl, ity), false)),
         ty::Float(fty) => scalar(match fty {
+            ty::FloatTy::F16 => F16,
             ty::FloatTy::F32 => F32,
             ty::FloatTy::F64 => F64,
+            ty::FloatTy::F128 => F128,
         }),
         ty::FnPtr(_) => {
             let mut ptr = scalar_unit(Pointer(dl.instruction_address_space));
@@ -155,7 +157,7 @@ fn layout_of_uncached<'tcx>(
         ty::Never => tcx.mk_layout(cx.layout_of_never_type()),
 
         // Potentially-wide pointers.
-        ty::Ref(_, pointee, _) | ty::RawPtr(ty::TypeAndMut { ty: pointee, .. }) => {
+        ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => {
             let mut data_ptr = scalar_unit(Pointer(AddressSpace::DATA));
             if !ty.is_unsafe_ptr() {
                 data_ptr.valid_range_mut().start = 1;
@@ -741,9 +743,9 @@ fn coroutine_layout<'tcx>(
 ) -> Result<Layout<'tcx>, &'tcx LayoutError<'tcx>> {
     use SavedLocalEligibility::*;
     let tcx = cx.tcx;
-    let subst_field = |ty: Ty<'tcx>| EarlyBinder::bind(ty).instantiate(tcx, args);
+    let instantiate_field = |ty: Ty<'tcx>| EarlyBinder::bind(ty).instantiate(tcx, args);
 
-    let Some(info) = tcx.coroutine_layout(def_id) else {
+    let Some(info) = tcx.coroutine_layout(def_id, args.as_coroutine().kind_ty()) else {
         return Err(error(cx, LayoutError::Unknown(ty)));
     };
     let (ineligible_locals, assignments) = coroutine_saved_local_eligibility(info);
@@ -763,7 +765,7 @@ fn coroutine_layout<'tcx>(
     let tag_layout = cx.tcx.mk_layout(LayoutS::scalar(cx, tag));
 
     let promoted_layouts = ineligible_locals.iter().map(|local| {
-        let field_ty = subst_field(info.field_tys[local].ty);
+        let field_ty = instantiate_field(info.field_tys[local].ty);
         let uninit_ty = Ty::new_maybe_uninit(tcx, field_ty);
         Ok(cx.spanned_layout_of(uninit_ty, info.field_tys[local].source_info.span)?.layout)
     });
@@ -838,7 +840,7 @@ fn coroutine_layout<'tcx>(
                     Ineligible(_) => false,
                 })
                 .map(|local| {
-                    let field_ty = subst_field(info.field_tys[*local].ty);
+                    let field_ty = instantiate_field(info.field_tys[*local].ty);
                     Ty::new_maybe_uninit(tcx, field_ty)
                 });
 
@@ -1006,6 +1008,7 @@ fn variant_info_for_adt<'tcx>(
                     offset: offset.bytes(),
                     size: field_layout.size.bytes(),
                     align: field_layout.align.abi.bytes(),
+                    type_name: None,
                 }
             })
             .collect();
@@ -1069,7 +1072,7 @@ fn variant_info_for_coroutine<'tcx>(
         return (vec![], None);
     };
 
-    let coroutine = cx.tcx.optimized_mir(def_id).coroutine_layout().unwrap();
+    let coroutine = cx.tcx.coroutine_layout(def_id, args.as_coroutine().kind_ty()).unwrap();
     let upvar_names = cx.tcx.closure_saved_names_of_captured_variables(def_id);
 
     let mut upvars_size = Size::ZERO;
@@ -1089,6 +1092,7 @@ fn variant_info_for_coroutine<'tcx>(
                 offset: offset.bytes(),
                 size: field_layout.size.bytes(),
                 align: field_layout.align.abi.bytes(),
+                type_name: None,
             }
         })
         .collect();
@@ -1103,19 +1107,24 @@ fn variant_info_for_coroutine<'tcx>(
                 .iter()
                 .enumerate()
                 .map(|(field_idx, local)| {
+                    let field_name = coroutine.field_names[*local];
                     let field_layout = variant_layout.field(cx, field_idx);
                     let offset = variant_layout.fields.offset(field_idx);
                     // The struct is as large as the last field's end
                     variant_size = variant_size.max(offset + field_layout.size);
                     FieldInfo {
                         kind: FieldKind::CoroutineLocal,
-                        name: coroutine.field_names[*local].unwrap_or(Symbol::intern(&format!(
+                        name: field_name.unwrap_or(Symbol::intern(&format!(
                             ".coroutine_field{}",
                             local.as_usize()
                         ))),
                         offset: offset.bytes(),
                         size: field_layout.size.bytes(),
                         align: field_layout.align.abi.bytes(),
+                        // Include the type name if there is no field name, or if the name is the
+                        // __awaitee placeholder symbol which means a child future being `.await`ed.
+                        type_name: (field_name.is_none() || field_name == Some(sym::__awaitee))
+                            .then(|| Symbol::intern(&field_layout.ty.to_string())),
                     }
                 })
                 .chain(upvar_fields.iter().copied())

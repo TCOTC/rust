@@ -16,6 +16,7 @@ use ide::{
     ReferenceCategory, Runnable, RunnableKind, SingleResolve, SourceChange, TextEdit,
 };
 use ide_db::SymbolKind;
+use itertools::Itertools;
 use lsp_server::ErrorCode;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
@@ -38,6 +39,7 @@ use crate::{
     config::{Config, RustfmtConfig, WorkspaceSymbolConfig},
     diff::diff,
     global_state::{GlobalState, GlobalStateSnapshot},
+    hack_recover_crate_name,
     line_index::LineEndings,
     lsp::{
         from_proto, to_proto,
@@ -52,17 +54,17 @@ use crate::{
 
 pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> anyhow::Result<()> {
     state.proc_macro_clients = Arc::from_iter([]);
-    state.proc_macro_changed = false;
+    state.build_deps_changed = false;
 
-    state.fetch_workspaces_queue.request_op("reload workspace request".to_string(), false);
+    state.fetch_workspaces_queue.request_op("reload workspace request".to_owned(), false);
     Ok(())
 }
 
 pub(crate) fn handle_proc_macros_rebuild(state: &mut GlobalState, _: ()) -> anyhow::Result<()> {
     state.proc_macro_clients = Arc::from_iter([]);
-    state.proc_macro_changed = false;
+    state.build_deps_changed = false;
 
-    state.fetch_build_data_queue.request_op("rebuild proc macros request".to_string(), ());
+    state.fetch_build_data_queue.request_op("rebuild proc macros request".to_owned(), ());
     Ok(())
 }
 
@@ -189,6 +191,70 @@ pub(crate) fn handle_view_item_tree(
     let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
     let res = snap.analysis.view_item_tree(file_id)?;
     Ok(res)
+}
+
+pub(crate) fn handle_run_test(
+    state: &mut GlobalState,
+    params: lsp_ext::RunTestParams,
+) -> anyhow::Result<()> {
+    if let Some(_session) = state.test_run_session.take() {
+        state.send_notification::<lsp_ext::EndRunTest>(());
+    }
+    // We detect the lowest common ansector of all included tests, and
+    // run it. We ignore excluded tests for now, the client will handle
+    // it for us.
+    let lca = match params.include {
+        Some(tests) => tests
+            .into_iter()
+            .reduce(|x, y| {
+                let mut common_prefix = "".to_owned();
+                for (xc, yc) in x.chars().zip(y.chars()) {
+                    if xc != yc {
+                        break;
+                    }
+                    common_prefix.push(xc);
+                }
+                common_prefix
+            })
+            .unwrap_or_default(),
+        None => "".to_owned(),
+    };
+    let handle = if lca.is_empty() {
+        flycheck::CargoTestHandle::new(None)
+    } else if let Some((_, path)) = lca.split_once("::") {
+        flycheck::CargoTestHandle::new(Some(path))
+    } else {
+        flycheck::CargoTestHandle::new(None)
+    };
+    state.test_run_session = Some(handle?);
+    Ok(())
+}
+
+pub(crate) fn handle_discover_test(
+    snap: GlobalStateSnapshot,
+    params: lsp_ext::DiscoverTestParams,
+) -> anyhow::Result<lsp_ext::DiscoverTestResults> {
+    let _p = tracing::span!(tracing::Level::INFO, "handle_discover_test").entered();
+    let (tests, scope) = match params.test_id {
+        Some(id) => {
+            let crate_id = id.split_once("::").map(|it| it.0).unwrap_or(&id);
+            (snap.analysis.discover_tests_in_crate_by_test_id(crate_id)?, vec![crate_id.to_owned()])
+        }
+        None => (snap.analysis.discover_test_roots()?, vec![]),
+    };
+    for t in &tests {
+        hack_recover_crate_name::insert_name(t.id.clone());
+    }
+    Ok(lsp_ext::DiscoverTestResults {
+        tests: tests
+            .into_iter()
+            .map(|t| {
+                let line_index = t.file.and_then(|f| snap.file_line_index(f).ok());
+                to_proto::test_item(&snap, t, line_index.as_ref())
+            })
+            .collect(),
+        scope,
+    })
 }
 
 pub(crate) fn handle_view_crate_graph(
@@ -562,7 +628,7 @@ pub(crate) fn handle_will_rename_files(
                 (Some(p1), Some(p2)) if p1 == p2 => {
                     if from_path.is_dir() {
                         // add '/' to end of url -- from `file://path/to/folder` to `file://path/to/folder/`
-                        let mut old_folder_name = from_path.file_stem()?.to_str()?.to_string();
+                        let mut old_folder_name = from_path.file_stem()?.to_str()?.to_owned();
                         old_folder_name.push('/');
                         let from_with_trailing_slash = from.join(&old_folder_name).ok()?;
 
@@ -570,7 +636,7 @@ pub(crate) fn handle_will_rename_files(
                         let new_file_name = to_path.file_name()?.to_str()?;
                         Some((
                             snap.url_to_file_id(&imitate_from_url).ok()?,
-                            new_file_name.to_string(),
+                            new_file_name.to_owned(),
                         ))
                     } else {
                         let old_name = from_path.file_stem()?.to_str()?;
@@ -578,7 +644,7 @@ pub(crate) fn handle_will_rename_files(
                         match (old_name, new_name) {
                             ("mod", _) => None,
                             (_, "mod") => None,
-                            _ => Some((snap.url_to_file_id(&from).ok()?, new_name.to_string())),
+                            _ => Some((snap.url_to_file_id(&from).ok()?, new_name.to_owned())),
                         }
                     }
                 }
@@ -799,13 +865,13 @@ pub(crate) fn handle_runnables(
         None => {
             if !snap.config.linked_or_discovered_projects().is_empty() {
                 res.push(lsp_ext::Runnable {
-                    label: "cargo check --workspace".to_string(),
+                    label: "cargo check --workspace".to_owned(),
                     location: None,
                     kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::CargoRunnable {
                         workspace_root: None,
                         override_cargo: config.override_cargo,
-                        cargo_args: vec!["check".to_string(), "--workspace".to_string()],
+                        cargo_args: vec!["check".to_owned(), "--workspace".to_owned()],
                         cargo_extra_args: config.cargo_extra_args,
                         executable_args: Vec::new(),
                         expect_test: None,
@@ -879,7 +945,7 @@ pub(crate) fn handle_completion_resolve(
 
     if !all_edits_are_disjoint(&original_completion, &[]) {
         return Err(invalid_params_error(
-            "Received a completion with overlapping edits, this is not LSP-compliant".to_string(),
+            "Received a completion with overlapping edits, this is not LSP-compliant".to_owned(),
         )
         .into());
     }
@@ -1017,10 +1083,8 @@ pub(crate) fn handle_rename(
     let _p = tracing::span!(tracing::Level::INFO, "handle_rename").entered();
     let position = from_proto::file_position(&snap, params.text_document_position)?;
 
-    let mut change = snap
-        .analysis
-        .rename(position, &params.new_name, snap.config.rename())?
-        .map_err(to_proto::rename_error)?;
+    let mut change =
+        snap.analysis.rename(position, &params.new_name)?.map_err(to_proto::rename_error)?;
 
     // this is kind of a hack to prevent double edits from happening when moving files
     // When a module gets renamed by renaming the mod declaration this causes the file to move
@@ -1057,9 +1121,8 @@ pub(crate) fn handle_references(
     let exclude_imports = snap.config.find_all_refs_exclude_imports();
     let exclude_tests = snap.config.find_all_refs_exclude_tests();
 
-    let refs = match snap.analysis.find_all_refs(position, None)? {
-        None => return Ok(None),
-        Some(refs) => refs,
+    let Some(refs) = snap.analysis.find_all_refs(position, None)? else {
+        return Ok(None);
     };
 
     let include_declaration = params.context.include_declaration;
@@ -1086,6 +1149,7 @@ pub(crate) fn handle_references(
                 })
                 .chain(decl)
         })
+        .unique()
         .filter_map(|frange| to_proto::location(&snap, frange).ok())
         .collect();
 
@@ -1191,7 +1255,7 @@ pub(crate) fn handle_code_action_resolve(
     let _p = tracing::span!(tracing::Level::INFO, "handle_code_action_resolve").entered();
     let params = match code_action.data.take() {
         Some(it) => it,
-        None => return Err(invalid_params_error("code action without data".to_string()).into()),
+        None => return Err(invalid_params_error("code action without data".to_owned()).into()),
     };
 
     let file_id = from_proto::file_id(&snap, &params.code_action_params.text_document.uri)?;
@@ -1270,7 +1334,7 @@ fn parse_action_id(action_id: &str) -> anyhow::Result<(usize, SingleResolve), St
             };
             Ok((index, SingleResolve { assist_id: assist_id_string.to_string(), assist_kind }))
         }
-        _ => Err("Action id contains incorrect number of segments".to_string()),
+        _ => Err("Action id contains incorrect number of segments".to_owned()),
     }
 }
 
@@ -1804,10 +1868,10 @@ fn show_ref_command_link(
                 .into_iter()
                 .flat_map(|res| res.references)
                 .flat_map(|(file_id, ranges)| {
-                    ranges.into_iter().filter_map(move |(range, _)| {
-                        to_proto::location(snap, FileRange { file_id, range }).ok()
-                    })
+                    ranges.into_iter().map(move |(range, _)| FileRange { file_id, range })
                 })
+                .unique()
+                .filter_map(|range| to_proto::location(snap, range).ok())
                 .collect();
             let title = to_proto::reference_title(locations.len());
             let command = to_proto::command::show_references(title, &uri, position, locations);
@@ -1937,7 +2001,8 @@ fn run_rustfmt(
 
     let mut command = match snap.config.rustfmt() {
         RustfmtConfig::Rustfmt { extra_args, enable_range_formatting } => {
-            let mut cmd = process::Command::new(toolchain::rustfmt());
+            // FIXME: Set RUSTUP_TOOLCHAIN
+            let mut cmd = process::Command::new(toolchain::Tool::Rustfmt.path());
             cmd.envs(snap.config.extra_env());
             cmd.args(extra_args);
 
@@ -2097,7 +2162,7 @@ pub(crate) fn fetch_dependency_list(
         .into_iter()
         .filter_map(|it| {
             let root_file_path = state.file_id_to_file_path(it.root_file_id);
-            crate_path(root_file_path).and_then(to_url).map(|path| CrateInfoResult {
+            crate_path(&root_file_path).and_then(to_url).map(|path| CrateInfoResult {
                 name: it.name,
                 version: it.version,
                 path,
@@ -2118,7 +2183,7 @@ pub(crate) fn fetch_dependency_list(
 /// An `Option` value representing the path to the directory of the crate with the given
 /// name, if such a crate is found. If no crate with the given name is found, this function
 /// returns `None`.
-fn crate_path(root_file_path: VfsPath) -> Option<VfsPath> {
+fn crate_path(root_file_path: &VfsPath) -> Option<VfsPath> {
     let mut current_dir = root_file_path.parent();
     while let Some(path) = current_dir {
         let cargo_toml_path = path.join("../Cargo.toml")?;

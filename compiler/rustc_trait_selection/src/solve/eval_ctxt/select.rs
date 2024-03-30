@@ -17,14 +17,8 @@ use crate::solve::inspect::ProofTreeBuilder;
 use crate::traits::StructurallyNormalizeExt;
 use crate::traits::TraitEngineExt;
 
-pub trait InferCtxtSelectExt<'tcx> {
-    fn select_in_new_trait_solver(
-        &self,
-        obligation: &PolyTraitObligation<'tcx>,
-    ) -> SelectionResult<'tcx, Selection<'tcx>>;
-}
-
-impl<'tcx> InferCtxtSelectExt<'tcx> for InferCtxt<'tcx> {
+#[extension(pub trait InferCtxtSelectExt<'tcx>)]
+impl<'tcx> InferCtxt<'tcx> {
     fn select_in_new_trait_solver(
         &self,
         obligation: &PolyTraitObligation<'tcx>,
@@ -64,44 +58,27 @@ impl<'tcx> InferCtxtSelectExt<'tcx> for InferCtxt<'tcx> {
                 }
 
                 let candidate = candidates.pop().unwrap();
-                let (certainty, nested_goals) = ecx
+                let (normalization_nested_goals, certainty) = ecx
                     .instantiate_and_apply_query_response(
                         trait_goal.param_env,
                         orig_values,
                         candidate.result,
-                    )
-                    .map_err(|_| SelectionError::Unimplemented)?;
-
-                Ok(Some((candidate, certainty, nested_goals)))
+                    );
+                assert!(normalization_nested_goals.is_empty());
+                Ok(Some((candidate, certainty)))
             });
 
-            let (candidate, certainty, nested_goals) = match result {
-                Ok(Some((candidate, certainty, nested_goals))) => {
-                    (candidate, certainty, nested_goals)
-                }
+            let (candidate, certainty) = match result {
+                Ok(Some(result)) => result,
                 Ok(None) => return Ok(None),
                 Err(e) => return Err(e),
             };
-
-            let nested_obligations: Vec<_> = nested_goals
-                .into_iter()
-                .map(|goal| {
-                    Obligation::new(
-                        self.tcx,
-                        ObligationCause::dummy(),
-                        goal.param_env,
-                        goal.predicate,
-                    )
-                })
-                .collect();
 
             let goal = self.resolve_vars_if_possible(trait_goal);
             match (certainty, candidate.source) {
                 // Rematching the implementation will instantiate the same nested goals that
                 // would have caused the ambiguity, so we can still make progress here regardless.
-                (_, CandidateSource::Impl(def_id)) => {
-                    rematch_impl(self, goal, def_id, nested_obligations)
-                }
+                (_, CandidateSource::Impl(def_id)) => rematch_impl(self, goal, def_id),
 
                 // If an unsize goal is ambiguous, then we can manually rematch it to make
                 // selection progress for coercion during HIR typeck. If it is *not* ambiguous,
@@ -114,20 +91,20 @@ impl<'tcx> InferCtxtSelectExt<'tcx> for InferCtxt<'tcx> {
                 | (Certainty::Yes, CandidateSource::BuiltinImpl(src @ BuiltinImplSource::Misc))
                     if self.tcx.lang_items().unsize_trait() == Some(goal.predicate.def_id()) =>
                 {
-                    rematch_unsize(self, goal, nested_obligations, src, certainty)
+                    rematch_unsize(self, goal, src, certainty)
                 }
 
                 // Technically some builtin impls have nested obligations, but if
                 // `Certainty::Yes`, then they should've all been verified and don't
                 // need re-checking.
                 (Certainty::Yes, CandidateSource::BuiltinImpl(src)) => {
-                    Ok(Some(ImplSource::Builtin(src, nested_obligations)))
+                    Ok(Some(ImplSource::Builtin(src, vec![])))
                 }
 
                 // It's fine not to do anything to rematch these, since there are no
                 // nested obligations.
                 (Certainty::Yes, CandidateSource::ParamEnv(_) | CandidateSource::AliasBound) => {
-                    Ok(Some(ImplSource::Param(nested_obligations)))
+                    Ok(Some(ImplSource::Param(vec![])))
                 }
 
                 (Certainty::Maybe(_), _) => Ok(None),
@@ -198,19 +175,16 @@ fn rematch_impl<'tcx>(
     infcx: &InferCtxt<'tcx>,
     goal: Goal<'tcx, ty::TraitPredicate<'tcx>>,
     impl_def_id: DefId,
-    mut nested: Vec<PredicateObligation<'tcx>>,
 ) -> SelectionResult<'tcx, Selection<'tcx>> {
     let args = infcx.fresh_args_for_item(DUMMY_SP, impl_def_id);
     let impl_trait_ref =
         infcx.tcx.impl_trait_ref(impl_def_id).unwrap().instantiate(infcx.tcx, args);
 
-    nested.extend(
-        infcx
-            .at(&ObligationCause::dummy(), goal.param_env)
-            .eq(DefineOpaqueTypes::No, goal.predicate.trait_ref, impl_trait_ref)
-            .map_err(|_| SelectionError::Unimplemented)?
-            .into_obligations(),
-    );
+    let mut nested = infcx
+        .at(&ObligationCause::dummy(), goal.param_env)
+        .eq(DefineOpaqueTypes::No, goal.predicate.trait_ref, impl_trait_ref)
+        .map_err(|_| SelectionError::Unimplemented)?
+        .into_obligations();
 
     nested.extend(
         infcx.tcx.predicates_of(impl_def_id).instantiate(infcx.tcx, args).into_iter().map(
@@ -227,11 +201,11 @@ fn rematch_impl<'tcx>(
 fn rematch_unsize<'tcx>(
     infcx: &InferCtxt<'tcx>,
     goal: Goal<'tcx, ty::TraitPredicate<'tcx>>,
-    mut nested: Vec<PredicateObligation<'tcx>>,
     source: BuiltinImplSource,
     certainty: Certainty,
 ) -> SelectionResult<'tcx, Selection<'tcx>> {
     let tcx = infcx.tcx;
+    let mut nested = vec![];
     let a_ty = structurally_normalize(goal.predicate.self_ty(), infcx, goal.param_env, &mut nested);
     let b_ty = structurally_normalize(
         goal.predicate.trait_ref.args.type_at(1),
@@ -312,8 +286,8 @@ fn rematch_unsize<'tcx>(
             let a_tail_ty = tail_field_ty.instantiate(tcx, a_args);
             let b_tail_ty = tail_field_ty.instantiate(tcx, b_args);
 
-            // Substitute just the unsizing params from B into A. The type after
-            // this substitution must be equal to B. This is so we don't unsize
+            // Instantiate just the unsizing params from B into A. The type after
+            // this instantiation must be equal to B. This is so we don't unsize
             // unrelated type parameters.
             let new_a_args = tcx.mk_args_from_iter(
                 a_args
@@ -349,7 +323,7 @@ fn rematch_unsize<'tcx>(
             let (a_last_ty, a_rest_tys) = a_tys.split_last().unwrap();
             let b_last_ty = b_tys.last().unwrap();
 
-            // Substitute just the tail field of B., and require that they're equal.
+            // Instantiate just the tail field of B., and require that they're equal.
             let unsized_a_ty =
                 Ty::new_tup_from_iter(tcx, a_rest_tys.iter().chain([b_last_ty]).copied());
             nested.extend(

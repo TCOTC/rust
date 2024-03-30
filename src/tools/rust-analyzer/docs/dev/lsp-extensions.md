@@ -1,5 +1,5 @@
 <!---
-lsp/ext.rs hash: dff0b009e82ef06a
+lsp/ext.rs hash: 61f485497d6e8e88
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -385,6 +385,137 @@ rust-analyzer supports only one `kind`, `"cargo"`. The `args` for `"cargo"` look
 }
 ```
 
+## Test explorer
+
+**Experimental Client Capability:** `{ "testExplorer": boolean }`
+
+If this capability is set, the `experimental/discoveredTests` notification will be sent from the
+server to the client.
+
+**Method:** `experimental/discoverTest`
+
+**Request:** `DiscoverTestParams`
+
+```typescript
+interface DiscoverTestParams {
+    // The test that we need to resolve its children. If not present,
+    // the response should return top level tests.
+    testId?: string | undefined;
+}
+```
+
+**Response:** `DiscoverTestResults`
+
+```typescript
+interface TestItem {
+    // A unique identifier for the test
+    id: string;
+    // The file containing this test
+    textDocument?: lc.TextDocumentIdentifier | undefined;
+    // The range in the file containing this test
+    range?: lc.Range | undefined;
+    // A human readable name for this test
+    label: string;
+    // The kind of this test item. Based on the kind,
+	// an icon is chosen by the editor. 
+    kind: "package" | "module" | "test";
+    // True if this test may have children not available eagerly
+    canResolveChildren: boolean;
+    // The id of the parent test in the test tree. If not present, this test
+    // is a top level test.
+    parent?: string | undefined;
+    // The information useful for running the test. The client can use `runTest`
+    // request for simple execution, but for more complex execution forms
+    // like debugging, this field is useful.
+    // Note that this field includes some information about label and location as well, but
+    // those exist just for keeping things in sync with other methods of running runnables
+    // (for example using one consistent name in the vscode's launch.json) so for any propose
+    // other than running tests this field should not be used.
+    runnable?: Runnable | undefined;
+};
+
+interface DiscoverTestResults {
+    // The discovered tests.
+    tests: TestItem[];
+    // For each test which its id is in this list, the response
+    // contains all tests that are children of this test, and
+    // client should remove old tests not included in the response.
+    scope: string[];
+}
+```
+
+**Method:** `experimental/discoveredTests`
+
+**Notification:** `DiscoverTestResults`
+
+This notification is sent from the server to the client when the
+server detect changes in the existing tests. The `DiscoverTestResults` is
+the same as the one in `experimental/discoverTest` response.
+
+**Method:** `experimental/runTest`
+
+**Request:** `RunTestParams`
+
+```typescript
+interface RunTestParams {
+    // Id of the tests to be run. If a test is included, all of its children are included implicitly. If
+    // this property is undefined, then the server should simply run all tests.
+    include?: string[] | undefined;
+    // An array of test ids the user has marked as excluded from the test included in this run; exclusions
+    // should apply after inclusions.
+    // May be omitted if no exclusions were requested. Server should not run excluded tests or
+    // any children of excluded tests.
+    exclude?: string[] | undefined;
+}
+```
+
+**Response:** `void`
+
+**Method:** `experimental/endRunTest`
+
+**Notification:**
+
+This notification is sent from the server to the client when the current running
+session is finished. The server should not send any run notification
+after this.
+
+**Method:** `experimental/abortRunTest`
+
+**Notification:**
+
+This notification is sent from the client to the server when the user is no longer
+interested in the test results. The server should clean up its resources and send
+a `experimental/endRunTest` when is done.
+
+**Method:** `experimental/changeTestState`
+
+**Notification:** `ChangeTestStateParams`
+
+```typescript
+type TestState = { tag: "passed" } 
+    | {
+        tag: "failed"; 
+        // The standard error of the test, containing the panic message. Clients should
+        // render it similar to a terminal, and e.g. handle ansi colors.
+        message: string;
+    }
+    | { tag: "started" }
+    | { tag: "enqueued" }
+    | { tag: "skipped" };
+
+interface ChangeTestStateParams {
+    testId: string;
+    state: TestState;
+}
+```
+
+**Method:** `experimental/appendOutputToRunTest`
+
+**Notification:** `string`
+
+This notification is used for reporting messages independent of any single test and related to the run session
+in general, e.g. cargo compiling progress messages or warnings.
+
 ## Open External Documentation
 
 This request is sent from the client to the server to obtain web and local URL(s) for documentation related to the symbol under the cursor, if available.
@@ -444,6 +575,25 @@ Reloads project information (that is, re-executes `cargo metadata`).
 **Response:** `null`
 
 Rebuilds build scripts and proc-macros, and runs the build scripts to reseed the build data.
+
+## Unindexed Project
+
+**Experimental Client Capability:** `{ "unindexedProject": boolean }`
+
+**Method:** `rust-analyzer/unindexedProject`
+
+**Notification:**
+
+```typescript
+interface UnindexedProjectParams {
+    /// A list of documents that rust-analyzer has determined are not indexed.
+    textDocuments: lc.TextDocumentIdentifier[]
+}
+```
+
+This notification is sent from the server to the client. The client is expected
+to determine the appropriate owners of `textDocuments` and update `linkedProjects`
+if an owner can be determined successfully.
 
 ## Server Status
 

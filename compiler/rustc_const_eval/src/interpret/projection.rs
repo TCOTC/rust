@@ -149,6 +149,8 @@ where
             "`field` projection called on a slice -- call `index` projection instead"
         );
         let offset = base.layout().fields.offset(field);
+        // Computing the layout does normalization, so we get a normalized type out of this
+        // even if the field type is non-normalized (possible e.g. via associated types).
         let field_layout = base.layout().field(self, field);
 
         // Offset may need adjustment for unsized fields.
@@ -355,7 +357,7 @@ where
             Deref => self.deref_pointer(&base.to_op(self)?)?.into(),
             Index(local) => {
                 let layout = self.layout_of(self.tcx.types.usize)?;
-                let n = self.local_to_op(self.frame(), local, Some(layout))?;
+                let n = self.local_to_op(local, Some(layout))?;
                 let n = self.read_target_usize(&n)?;
                 self.project_index(base, n)?
             }

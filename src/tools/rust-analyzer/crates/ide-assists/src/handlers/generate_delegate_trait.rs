@@ -16,7 +16,8 @@ use syntax::{
     ast::{
         self,
         edit::{self, AstNodeEdit},
-        make, AssocItem, GenericArgList, GenericParamList, HasGenericParams, HasName,
+        edit_in_place::AttrsOwnerEdit,
+        make, AssocItem, GenericArgList, GenericParamList, HasAttrs, HasGenericParams, HasName,
         HasTypeBounds, HasVisibility as astHasVisibility, Path, WherePred,
     },
     ted::{self, Position},
@@ -116,7 +117,7 @@ impl Field {
     ) -> Option<Field> {
         let db = ctx.sema.db;
 
-        let module = ctx.sema.to_module_def(ctx.file_id())?;
+        let module = ctx.sema.file_to_module_def(ctx.file_id())?;
 
         let (name, range, ty) = match f {
             Either::Left(f) => {
@@ -502,9 +503,7 @@ fn generate_args_for_impl(
     trait_params: &Option<GenericParamList>,
     old_trait_args: &FxHashSet<String>,
 ) -> Option<ast::GenericArgList> {
-    let Some(old_impl_args) = old_impl_gpl.map(|gpl| gpl.to_generic_args().generic_args()) else {
-        return None;
-    };
+    let old_impl_args = old_impl_gpl.map(|gpl| gpl.to_generic_args().generic_args())?;
     // Create pairs of the args of `self_ty` and corresponding `field_ty` to
     // form the substitution list
     let mut arg_substs = FxHashMap::default();
@@ -621,7 +620,8 @@ fn process_assoc_item(
     qual_path_ty: ast::Path,
     base_name: &str,
 ) -> Option<ast::AssocItem> {
-    match item {
+    let attrs = item.attrs();
+    let assoc = match item {
         AssocItem::Const(c) => const_assoc_item(c, qual_path_ty),
         AssocItem::Fn(f) => func_assoc_item(f, qual_path_ty, base_name),
         AssocItem::MacroCall(_) => {
@@ -630,7 +630,18 @@ fn process_assoc_item(
             None
         }
         AssocItem::TypeAlias(ta) => ty_assoc_item(ta, qual_path_ty),
+    };
+    if let Some(assoc) = &assoc {
+        attrs.for_each(|attr| {
+            assoc.add_attr(attr.clone());
+            // fix indentations
+            if let Some(tok) = attr.syntax().next_sibling_or_token() {
+                let pos = Position::after(tok);
+                ted::insert(pos, make::tokens::whitespace("    "));
+            }
+        })
     }
+    assoc
 }
 
 fn const_assoc_item(item: syntax::ast::Const, qual_path_ty: ast::Path) -> Option<AssocItem> {
@@ -958,7 +969,8 @@ where
 impl<T> AnotherTrait for S<T>
 where
     T: AnotherTrait,
-{}"#,
+{
+}"#,
         );
     }
 
@@ -1448,7 +1460,8 @@ where
 impl<T> AnotherTrait for S<T>
 where
     T: AnotherTrait,
-{}"#,
+{
+}"#,
         );
     }
 
@@ -1702,5 +1715,66 @@ impl some_module::SomeTrait for B {
     }
 }"#,
         )
+    }
+
+    #[test]
+    fn test_fn_with_attrs() {
+        check_assist(
+            generate_delegate_trait,
+            r#"
+struct A;
+
+trait T {
+    #[cfg(test)]
+    fn f(&self, a: u32);
+    #[cfg(not(test))]
+    fn f(&self, a: bool);
+}
+
+impl T for A {
+    #[cfg(test)]
+    fn f(&self, a: u32) {}
+    #[cfg(not(test))]
+    fn f(&self, a: bool) {}
+}
+
+struct B {
+    a$0: A,
+}
+"#,
+            r#"
+struct A;
+
+trait T {
+    #[cfg(test)]
+    fn f(&self, a: u32);
+    #[cfg(not(test))]
+    fn f(&self, a: bool);
+}
+
+impl T for A {
+    #[cfg(test)]
+    fn f(&self, a: u32) {}
+    #[cfg(not(test))]
+    fn f(&self, a: bool) {}
+}
+
+struct B {
+    a: A,
+}
+
+impl T for B {
+    #[cfg(test)]
+    fn f(&self, a: u32) {
+        <A as T>::f(&self.a, a)
+    }
+
+    #[cfg(not(test))]
+    fn f(&self, a: bool) {
+        <A as T>::f(&self.a, a)
+    }
+}
+"#,
+        );
     }
 }

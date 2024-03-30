@@ -1,6 +1,5 @@
-// unit-test: DataflowConstProp
-// compile-flags: -Zmir-enable-passes=+GVN,+Inline
-// ignore-debug assertions change the output MIR
+//@ unit-test: DataflowConstProp
+//@ compile-flags: -Zmir-enable-passes=+GVN,+Inline
 // EMIT_MIR_FOR_EACH_BIT_WIDTH
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
@@ -16,14 +15,11 @@ struct A {
 // CHECK-LABEL: fn main(
 fn main() {
     // ConstProp will create a constant of type `Box<[bool]>`.
-    // FIXME: it is not yet a constant.
-
     // Verify that `DataflowConstProp` does not ICE trying to dereference it directly.
 
     // CHECK: debug a => [[a:_.*]];
     // We may check other inlined functions as well...
 
-    // CHECK: {{_.*}} = Box::<[bool]>(
-    // FIXME: should be `{{_.*}} = const Box::<[bool]>`
+    // CHECK: {{_.*}} = const Box::<[bool]>(
     let a: A = A { foo: Box::default() };
 }

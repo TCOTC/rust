@@ -446,6 +446,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 NullOp::SizeOf => {}
                 NullOp::AlignOf => {}
                 NullOp::OffsetOf(_) => {}
+                NullOp::UbChecks => {}
             },
 
             Rvalue::ShallowInitBox(_, _) => return Err(Unpromotable),
@@ -463,7 +464,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 let op = *op;
                 let lhs_ty = lhs.ty(self.body, self.tcx);
 
-                if let ty::RawPtr(_) | ty::FnPtr(..) = lhs_ty.kind() {
+                if let ty::RawPtr(_, _) | ty::FnPtr(..) = lhs_ty.kind() {
                     // Raw and fn pointer operations are not allowed inside consts and thus not promotable.
                     assert!(matches!(
                         op,
@@ -481,16 +482,39 @@ impl<'tcx> Validator<'_, 'tcx> {
                 match op {
                     BinOp::Div | BinOp::Rem => {
                         if lhs_ty.is_integral() {
+                            let sz = lhs_ty.primitive_size(self.tcx);
                             // Integer division: the RHS must be a non-zero const.
-                            let const_val = match rhs {
+                            let rhs_val = match rhs {
                                 Operand::Constant(c) => {
-                                    c.const_.try_eval_bits(self.tcx, self.param_env)
+                                    c.const_.try_eval_scalar_int(self.tcx, self.param_env)
                                 }
                                 _ => None,
                             };
-                            match const_val {
+                            match rhs_val.map(|x| x.try_to_uint(sz).unwrap()) {
+                                // for the zero test, int vs uint does not matter
                                 Some(x) if x != 0 => {}        // okay
                                 _ => return Err(Unpromotable), // value not known or 0 -- not okay
+                            }
+                            // Furthermore, for signed divison, we also have to exclude `int::MIN / -1`.
+                            if lhs_ty.is_signed() {
+                                match rhs_val.map(|x| x.try_to_int(sz).unwrap()) {
+                                    Some(-1) | None => {
+                                        // The RHS is -1 or unknown, so we have to be careful.
+                                        // But is the LHS int::MIN?
+                                        let lhs_val = match lhs {
+                                            Operand::Constant(c) => c
+                                                .const_
+                                                .try_eval_scalar_int(self.tcx, self.param_env),
+                                            _ => None,
+                                        };
+                                        let lhs_min = sz.signed_int_min();
+                                        match lhs_val.map(|x| x.try_to_int(sz).unwrap()) {
+                                            Some(x) if x != lhs_min => {}  // okay
+                                            _ => return Err(Unpromotable), // value not known or int::MIN -- not okay
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -796,11 +820,8 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             let ty = local_decls[place.local].ty;
             let span = statement.source_info.span;
 
-            let ref_ty = Ty::new_ref(
-                tcx,
-                tcx.lifetimes.re_erased,
-                ty::TypeAndMut { ty, mutbl: borrow_kind.to_mutbl_lossy() },
-            );
+            let ref_ty =
+                Ty::new_ref(tcx, tcx.lifetimes.re_erased, ty, borrow_kind.to_mutbl_lossy());
 
             let mut projection = vec![PlaceElem::Deref];
             projection.extend(place.projection);

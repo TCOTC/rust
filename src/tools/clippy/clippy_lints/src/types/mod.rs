@@ -12,7 +12,7 @@ mod vec_box;
 use rustc_hir as hir;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{
-    Body, FnDecl, FnRetTy, GenericArg, ImplItem, ImplItemKind, Item, ItemKind, Local, MutTy, QPath, TraitItem,
+    Body, FnDecl, FnRetTy, GenericArg, ImplItem, ImplItemKind, Item, ItemKind, LetStmt, MutTy, QPath, TraitItem,
     TraitItemKind, TyKind,
 };
 use rustc_lint::{LateContext, LateLintPass};
@@ -321,7 +321,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
         _: Span,
         def_id: LocalDefId,
     ) {
-        let is_in_trait_impl = if let Some(hir::Node::Item(item)) = cx.tcx.opt_hir_node_by_def_id(
+        let is_in_trait_impl = if let hir::Node::Item(item) = cx.tcx.hir_node_by_def_id(
             cx.tcx
                 .hir()
                 .get_parent_item(cx.tcx.local_def_id_to_hir_id(def_id))
@@ -366,9 +366,9 @@ impl<'tcx> LateLintPass<'tcx> for Types {
     fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx ImplItem<'tcx>) {
         match item.kind {
             ImplItemKind::Const(ty, _) => {
-                let is_in_trait_impl = if let Some(hir::Node::Item(item)) = cx
+                let is_in_trait_impl = if let hir::Node::Item(item) = cx
                     .tcx
-                    .opt_hir_node_by_def_id(cx.tcx.hir().get_parent_item(item.hir_id()).def_id)
+                    .hir_node_by_def_id(cx.tcx.hir().get_parent_item(item.hir_id()).def_id)
                 {
                     matches!(item.kind, ItemKind::Impl(hir::Impl { of_trait: Some(_), .. }))
                 } else {
@@ -392,6 +392,10 @@ impl<'tcx> LateLintPass<'tcx> for Types {
     }
 
     fn check_field_def(&mut self, cx: &LateContext<'tcx>, field: &hir::FieldDef<'tcx>) {
+        if field.span.from_expansion() {
+            return;
+        }
+
         let is_exported = cx.effective_visibilities.is_exported(field.def_id);
 
         self.check_ty(
@@ -421,7 +425,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
         }
     }
 
-    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &Local<'tcx>) {
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &LetStmt<'tcx>) {
         if let Some(ty) = local.ty {
             self.check_ty(
                 cx,

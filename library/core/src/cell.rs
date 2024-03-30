@@ -237,9 +237,8 @@
 
 use crate::cmp::Ordering;
 use crate::fmt::{self, Debug, Display};
-use crate::intrinsics::is_nonoverlapping;
 use crate::marker::{PhantomData, Unsize};
-use crate::mem;
+use crate::mem::{self, size_of};
 use crate::ops::{CoerceUnsized, Deref, DerefMut, DispatchFromDyn};
 use crate::ptr::{self, NonNull};
 
@@ -435,11 +434,20 @@ impl<T> Cell<T> {
     #[inline]
     #[stable(feature = "move_cell", since = "1.17.0")]
     pub fn swap(&self, other: &Self) {
+        // This function documents that it *will* panic, and intrinsics::is_nonoverlapping doesn't
+        // do the check in const, so trying to use it here would be inviting unnecessary fragility.
+        fn is_nonoverlapping<T>(src: *const T, dst: *const T) -> bool {
+            let src_usize = src.addr();
+            let dst_usize = dst.addr();
+            let diff = src_usize.abs_diff(dst_usize);
+            diff >= size_of::<T>()
+        }
+
         if ptr::eq(self, other) {
             // Swapping wouldn't change anything.
             return;
         }
-        if !is_nonoverlapping(self, other, 1) {
+        if !is_nonoverlapping(self, other) {
             // See <https://github.com/rust-lang/rust/issues/80778> for why we need to stop here.
             panic!("`Cell::swap` on overlapping non-identical `Cell`s");
         }
@@ -467,6 +475,7 @@ impl<T> Cell<T> {
     /// ```
     #[inline]
     #[stable(feature = "move_cell", since = "1.17.0")]
+    #[rustc_confusables("swap")]
     pub fn replace(&self, val: T) -> T {
         // SAFETY: This can cause data races if called from a separate thread,
         // but `Cell` is `!Sync` so this won't happen.
@@ -858,6 +867,7 @@ impl<T> RefCell<T> {
     #[inline]
     #[stable(feature = "refcell_replace", since = "1.24.0")]
     #[track_caller]
+    #[rustc_confusables("swap")]
     pub fn replace(&self, t: T) -> T {
         mem::replace(&mut *self.borrow_mut(), t)
     }

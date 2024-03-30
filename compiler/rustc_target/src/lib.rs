@@ -9,16 +9,13 @@
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
+#![feature(min_exhaustive_patterns)]
 #![feature(rustdoc_internals)]
 #![feature(assert_matches)]
-#![feature(exhaustive_patterns)]
 #![feature(iter_intersperse)]
 #![feature(let_chains)]
-#![feature(min_specialization)]
 #![feature(rustc_attrs)]
 #![feature(step_trait)]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 #![allow(internal_features)]
 
 use std::path::{Path, PathBuf};

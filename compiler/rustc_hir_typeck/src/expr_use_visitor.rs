@@ -142,7 +142,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
             let param_ty = return_if_err!(self.mc.pat_ty_adjusted(param.pat));
             debug!("consume_body: param_ty = {:?}", param_ty);
 
-            let param_place = self.mc.cat_rvalue(param.hir_id, param.pat.span, param_ty);
+            let param_place = self.mc.cat_rvalue(param.hir_id, param_ty);
 
             self.walk_irrefutable_pat(&param_place, param.pat);
         }
@@ -245,7 +245,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                 }
             }
 
-            hir::ExprKind::Let(hir::Let { pat, init, .. }) => {
+            hir::ExprKind::Let(hir::LetExpr { pat, init, .. }) => {
                 self.walk_local(init, pat, None, |t| t.borrow_expr(init, ty::ImmBorrow))
             }
 
@@ -293,6 +293,9 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                         | hir::InlineAsmOperand::Const { .. }
                         | hir::InlineAsmOperand::SymFn { .. }
                         | hir::InlineAsmOperand::SymStatic { .. } => {}
+                        hir::InlineAsmOperand::Label { block } => {
+                            self.walk_block(block);
+                        }
                     }
                 }
             }
@@ -368,11 +371,11 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
 
     fn walk_stmt(&mut self, stmt: &hir::Stmt<'_>) {
         match stmt.kind {
-            hir::StmtKind::Local(hir::Local { pat, init: Some(expr), els, .. }) => {
+            hir::StmtKind::Let(hir::LetStmt { pat, init: Some(expr), els, .. }) => {
                 self.walk_local(expr, pat, *els, |_| {})
             }
 
-            hir::StmtKind::Local(_) => {}
+            hir::StmtKind::Let(_) => {}
 
             hir::StmtKind::Item(_) => {
                 // We don't visit nested items in this visitor,
@@ -460,6 +463,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                     }
                     PatKind::Or(_)
                     | PatKind::Box(_)
+                    | PatKind::Deref(_)
                     | PatKind::Ref(..)
                     | PatKind::Wild
                     | PatKind::Err(_) => {
@@ -735,12 +739,12 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                     // In a cases of pattern like `let pat = upvar`, don't use the span
                     // of the pattern, as this just looks confusing, instead use the span
                     // of the discriminant.
-                    match bm {
-                        ty::BindByReference(m) => {
+                    match bm.0 {
+                        hir::ByRef::Yes(m) => {
                             let bk = ty::BorrowKind::from_mutbl(m);
                             delegate.borrow(place, discr_place.hir_id, bk);
                         }
-                        ty::BindByValue(..) => {
+                        hir::ByRef::No => {
                             debug!("walk_pat binding consuming pat");
                             delegate_consume(mc, *delegate, place, discr_place.hir_id);
                         }
